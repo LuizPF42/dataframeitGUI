@@ -77,7 +77,7 @@ O Supabase não responde CORS fora de supabase.com na API de gerenciamento nem n
 
 ## Publicação
 
-Workflow `.github/workflows/static-pages.yml`: testes do modo estático, `npm run build:static` (site, Edge Function e schema) e deploy no Pages com o base path do repositório. Variáveis opcionais do repositório: `STATIC_SETUP_FUNCTION_URL`, `STATIC_SETUP_ANON_KEY`, `STATIC_SUPABASE_OAUTH_CLIENT_ID`, `STATIC_DATAFRAMEIT_WHEEL`.
+Workflow `.github/workflows/static-pages.yml`: testes do modo estático, `npm run build:static` (site, Edge Function e schema) e deploy no Pages com o base path do repositório. Variáveis opcionais do repositório: `STATIC_SETUP_FUNCTION_URL`, `STATIC_SETUP_ANON_KEY`, `STATIC_SUPABASE_OAUTH_CLIENT_ID`, `STATIC_DATAFRAMEIT_REPO` + `STATIC_DATAFRAMEIT_REF` (o workflow gera a wheel com `adataframeit` dessa branch e a serve em `py/`, na mesma origem do site, enquanto a versão não sai no PyPI) ou `STATIC_DATAFRAMEIT_WHEEL` (wheel já publicada; precisa de CORS, e asset de release do GitHub não manda).
 
 ## Desenvolvimento
 

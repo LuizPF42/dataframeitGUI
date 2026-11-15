@@ -10,8 +10,14 @@ name: Modo estático (GitHub Pages)
 #   STATIC_SETUP_FUNCTION_URL, STATIC_SETUP_ANON_KEY,
 #   STATIC_SUPABASE_OAUTH_CLIENT_ID  — assistente automático (sem elas, o
 #                                      assistente mostra o passo a passo manual)
-#   STATIC_DATAFRAMEIT_WHEEL         — wheel do dataframeit com adataframeit,
-#                                      enquanto a versão não está no PyPI
+#   STATIC_DATAFRAMEIT_REPO,
+#   STATIC_DATAFRAMEIT_REF           — repositório ("dono/dataframeit") e branch
+#                                      de onde gerar a wheel com adataframeit,
+#                                      servida pelo próprio site, enquanto a
+#                                      versão não está no PyPI
+#   STATIC_DATAFRAMEIT_WHEEL         — alternativa: caminho ou URL de uma wheel
+#                                      já publicada (precisa de CORS liberado;
+#                                      asset de release do GitHub não serve)
 
 on:
   push:
@@ -47,6 +53,28 @@ jobs:
         run: npx vitest run src/static src/lib/__tests__/supabase-admin-boundary.test.ts
       - id: pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      # Wheel do dataframeit servida da mesma origem do site: o worker Pyodide
+      # a busca com fetch, e asset de release do GitHub não manda CORS.
+      - if: vars.STATIC_DATAFRAMEIT_REPO != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.STATIC_DATAFRAMEIT_REPO }}
+          ref: ${{ vars.STATIC_DATAFRAMEIT_REF }}
+          path: dataframeit-src
+          persist-credentials: false
+      - if: vars.STATIC_DATAFRAMEIT_REPO != ''
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.9.18"
+          enable-cache: false
+      - id: wheel
+        name: Wheel do dataframeit
+        if: vars.STATIC_DATAFRAMEIT_REPO != ''
+        working-directory: dataframeit-src
+        run: |
+          uv build --wheel --out-dir "$RUNNER_TEMP/py"
+          wheel=$(basename "$RUNNER_TEMP"/py/dataframeit-*.whl)
+          echo "path=py/$wheel" >> "$GITHUB_OUTPUT"
       - name: Build (site, Edge Function e schema)
         env:
           # usuario.github.io/<repositorio>/ → base "/<repositorio>"
@@ -54,8 +82,11 @@ jobs:
           VITE_SETUP_FUNCTION_URL: ${{ vars.STATIC_SETUP_FUNCTION_URL }}
           VITE_SETUP_ANON_KEY: ${{ vars.STATIC_SETUP_ANON_KEY }}
           VITE_SUPABASE_OAUTH_CLIENT_ID: ${{ vars.STATIC_SUPABASE_OAUTH_CLIENT_ID }}
-          VITE_DATAFRAMEIT_WHEEL: ${{ vars.STATIC_DATAFRAMEIT_WHEEL }}
+          VITE_DATAFRAMEIT_WHEEL: ${{ steps.wheel.outputs.path || vars.STATIC_DATAFRAMEIT_WHEEL }}
         run: npm run build:static
+      - name: Copiar a wheel para o site
+        if: steps.wheel.outputs.path != ''
+        run: mkdir -p out/py && cp "$RUNNER_TEMP"/py/dataframeit-*.whl out/py/
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: frontend/out
