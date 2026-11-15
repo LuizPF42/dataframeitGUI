@@ -259,7 +259,10 @@ def _build_field_dict(
     field_name: str, field_info, *, generate_missing_ids: bool = False
 ) -> dict:
     """Reconstitui o dict de metadata de `PydanticField` para um campo compilado."""
-    annotation = field_info.annotation
+    # Desembrulhado uma vez aqui: o `Optional` de campo condicional não carrega
+    # nada (obrigatoriedade e visibilidade vêm do `json_schema_extra`), e cada
+    # leitor da anotação abaixo teria de lembrar de tirá-lo (#525).
+    annotation = _unwrap_optional(field_info.annotation)
     parsed_type, parsed_options = _parse_annotation(annotation)
     extra = extract_json_schema_extra(field_info)
 
@@ -787,6 +790,20 @@ def _safe_literal(node: ast.AST):
         raise SchemaError("Valor não literal no schema") from e
 
 
+def _unwrap_optional(annotation: type) -> type:
+    """`Optional[X]` -> `X`; qualquer outra anotação volta como está.
+
+    Campo com condição de visibilidade sai do gerador como `Optional[...]`
+    (`fieldAnnotation` em schema-utils.ts), inclusive o composto
+    `Optional[_<nome>_fields]`.
+    """
+    if get_origin(annotation) is typing.Union:
+        non_none = [a for a in get_args(annotation) if a is not type(None)]
+        if len(non_none) == 1:
+            return non_none[0]
+    return annotation
+
+
 def _parse_annotation(annotation: type) -> tuple[str, list[str] | None]:
     """Parse a type annotation into (type, options)."""
     origin = get_origin(annotation)
@@ -807,12 +824,6 @@ def _parse_annotation(annotation: type) -> tuple[str, list[str] | None]:
     # str -> text
     if annotation is str:
         return "text", None
-
-    # Optional[X] -> unwrap
-    if origin is typing.Union:
-        non_none = [a for a in args if a is not type(None)]
-        if len(non_none) == 1:
-            return _parse_annotation(non_none[0])
 
     # Nested BaseModel -> composite text field
     from pydantic import BaseModel
