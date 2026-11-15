@@ -146,15 +146,76 @@ export const pydanticFieldsSchema =
 // Nome de campo e de subcampo. Exportado porque o nome também entra como
 // caminho JSON em queries do PostgREST (value-equivalence-query.ts).
 export const PYTHON_IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
-const isStrictDunder = (name: string): boolean =>
-  name.startsWith("__") && name.endsWith("__");
 
-export type PydanticFieldNameIssue = "invalid" | "reserved" | null;
+// Nomes que casam com PYTHON_IDENTIFIER mas com que o código gerado não
+// compila, como campo e como subcampo. É o conjunto exato que
+// `compile_pydantic` recusa: `backend/tests/test_field_names.py` confere, pelo
+// arquivo `reserved_field_names.json`, que o backend recusa estes nomes e
+// aceita todos os outros candidatos (palavras-chave leves do Python e atributos
+// do `BaseModel`), então uma versão nova do Python ou do Pydantic que reserve
+// mais um nome reprova lá (#525).
+//
+// Palavra reservada do Python: `class: str` é erro de sintaxe. As palavras-
+// chave leves (`match`, `case`, `type`) compilam e ficam de fora.
+export const PYTHON_KEYWORDS: readonly string[] = Object.freeze([
+  "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
+  "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
+  "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+  "return", "try", "while", "with", "yield",
+]);
+// Membros do `BaseModel` que o Pydantic recusa como nome de campo. Os demais
+// atributos dele (`json`, `copy`, `model_fields`...) só geram aviso.
+export const PYDANTIC_RESERVED_NAMES: readonly string[] = Object.freeze([
+  "model_config", "model_dump", "model_dump_json", "model_validate",
+  "model_validate_json", "model_validate_strings",
+]);
+const RESERVED_NAMES = new Map<string, PydanticFieldNameIssue>([
+  ...PYTHON_KEYWORDS.map((name) => [name, "keyword"] as const),
+  ...PYDANTIC_RESERVED_NAMES.map((name) => [name, "pydantic"] as const),
+]);
+
+// "private": o Pydantic recusa nome com `_` inicial, o que inclui os dunders
+// (`__class__`) que a allowlist do compilador também barra por segurança.
+export type PydanticFieldNameIssue =
+  | "invalid"
+  | "private"
+  | "keyword"
+  | "pydantic"
+  | null;
 
 export function pydanticFieldNameIssue(name: string): PydanticFieldNameIssue {
   if (!name || !PYTHON_IDENTIFIER.test(name)) return "invalid";
-  if (isStrictDunder(name)) return "reserved";
-  return null;
+  if (name.startsWith("_")) return "private";
+  return RESERVED_NAMES.get(name) ?? null;
+}
+
+// Complemento de "nome ..." / "subcampo "x" ..." nas mensagens de validação e
+// no aviso do FieldCard.
+export const RESERVED_NAME_REASON = {
+  private: 'não pode começar com "_" (o Pydantic não aceita)',
+  keyword: "é palavra reservada do Python",
+  pydantic: "é reservado pelo Pydantic",
+} as const satisfies Record<Exclude<PydanticFieldNameIssue, "invalid" | null>, string>;
+
+// O que é espaço em branco nas bordas de um texto do schema: o `str.strip()` do
+// Python, que é como `compile_pydantic` apara `help_text` e
+// `justification_prompt` ao ler o código de volta (P7: o Pydantic é a fonte de
+// verdade). O `trim()` do JS discorda dele nos dois sentidos — não remove
+// `\x1c`–`\x1f` nem `\x85`, e remove `\ufeff`, que o Python mantém —, e com
+// um desses na borda o texto gravado e o recuperado divergiam, a ponto de o
+// sufixo ". Instrucoes:" se acumular na description a cada recuperação (#525).
+// A lista é a de `str.isspace()`, a mesma no Python 3.11 e 3.12.
+const PYTHON_WHITESPACE =
+  /[\t\n\v\f\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
+
+// Laço em vez de `replace(/^[...]+|[...]+$/)`: a âncora de fim faz a regex
+// recomeçar em cada posição de uma sequência de brancos interna.
+export function stripLikePython(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && PYTHON_WHITESPACE.test(text[start])) start += 1;
+  while (end > start && PYTHON_WHITESPACE.test(text[end - 1])) end -= 1;
+  return text.slice(start, end);
 }
 
 type AddFieldIssue = (message: string, path?: PropertyKey[]) => void;
@@ -170,13 +231,10 @@ function validateFieldIdentity(
       `${label}: nome inválido (use letras minúsculas, números e _)`,
       ["name"],
     );
-  } else if (nameIssue === "reserved") {
-    issue(
-      `${label}: nome não pode começar e terminar com "__" (reservado pelo Python)`,
-      ["name"],
-    );
+  } else if (nameIssue) {
+    issue(`${label}: nome ${RESERVED_NAME_REASON[nameIssue]}`, ["name"]);
   }
-  if (!field.description.trim()) {
+  if (!stripLikePython(field.description)) {
     issue(`${label}: descrição não pode ser vazia`, ["description"]);
   }
 }
@@ -189,14 +247,15 @@ function validateSubfields(
   const keys = new Set<string>();
   field.subfields?.forEach((subfield, index) => {
     const path = ["subfields", index, "key"];
-    if (!subfield.key || !PYTHON_IDENTIFIER.test(subfield.key)) {
+    const keyIssue = pydanticFieldNameIssue(subfield.key);
+    if (keyIssue === "invalid") {
       issue(
         `${label}: subcampo ${index + 1} tem chave inválida "${subfield.key}"`,
         path,
       );
-    } else if (isStrictDunder(subfield.key)) {
+    } else if (keyIssue) {
       issue(
-        `${label}: subcampo "${subfield.key}" não pode começar e terminar com "__" (reservado pelo Python)`,
+        `${label}: subcampo "${subfield.key}" ${RESERVED_NAME_REASON[keyIssue]}`,
         path,
       );
     }
@@ -204,7 +263,7 @@ function validateSubfields(
       issue(`${label}: subcampo "${subfield.key}" duplicado`, path);
     }
     keys.add(subfield.key);
-    if (!subfield.label.trim()) {
+    if (!stripLikePython(subfield.label)) {
       issue(
         `${label}: subcampo ${index + 1} tem label vazio`,
         ["subfields", index, "label"],
@@ -222,11 +281,78 @@ function validateOptions(
   if (isChoice && !field.options?.length) {
     issue(`${label}: campo de escolha precisa de pelo menos uma opção`, ["options"]);
   }
+  // Repetida é barrada porque `Literal["x", "x"]` vira `Literal["x"]` no
+  // Python e a opção some na recuperação; a comparação é depois de aparar,
+  // porque "x" e "x " são a mesma opção para quem lê a tela (#525).
+  const seen = new Set<string>();
   field.options?.forEach((option, index) => {
-    if (!option.trim()) {
+    const text = stripLikePython(option);
+    if (!text) {
       issue(`${label}: opção ${index + 1} está vazia`, ["options", index]);
+    } else if (seen.has(text)) {
+      issue(`${label}: opção "${text}" duplicada`, ["options", index]);
     }
+    seen.add(text);
   });
+}
+
+// `help_text` e `justification_prompt` saem aparados no código e voltam
+// aparados de `compile_pydantic` (`stripLikePython`, acima): gravados com
+// branco na borda, ou só com branco, o campo recuperado era diferente do salvo
+// e a recuperação acusava mudança. O editor os apara ao sair do campo; a
+// validação barra o que chega ao save sem passar por ele, em vez de reescrever
+// o texto: validar nunca reescreve o que a tela mostra (#525).
+const TRIMMED_TEXTS = [
+  ["help_text", "das instruções"],
+  ["justification_prompt", "do prompt de justificativa"],
+] as const;
+
+function validateTrimmedTexts(
+  field: PydanticField,
+  label: string,
+  issue: AddFieldIssue,
+): void {
+  for (const [key, of] of TRIMMED_TEXTS) {
+    const text = field[key];
+    if (text === undefined) continue;
+    const stripped = stripLikePython(text);
+    if (!stripped) {
+      issue(`${label}: texto ${of} está em branco`, [key]);
+    } else if (stripped !== text) {
+      issue(`${label}: espaço em branco no início ou no fim ${of}`, [key]);
+    }
+  }
+}
+
+// Texto que o banco não grava: `pydantic_fields` é `jsonb`, que recusa
+// `\u0000` e surrogate isolado, e este também quebra o `compile()` do Python.
+// Sem esta regra o save passava na validação e falhava na RPC (#525).
+function isStorableText(text: string): boolean {
+  return !text.includes("\0") && text.isWellFormed();
+}
+
+// Varre todas as strings do campo, e não uma lista de propriedades: o limite
+// é do documento jsonb inteiro, então vale também para valores de `condition`
+// e para propriedade de texto que entrar depois.
+function validateStorableTexts(
+  value: unknown,
+  path: PropertyKey[],
+  label: string,
+  issue: AddFieldIssue,
+): void {
+  if (typeof value === "string") {
+    if (!isStorableText(value)) {
+      issue(
+        `${label}: texto com caractere inválido (nulo ou surrogate isolado)`,
+        path,
+      );
+    }
+  } else if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      const childKey = Array.isArray(value) ? Number(key) : key;
+      validateStorableTexts(child, [...path, childKey], label, issue);
+    }
+  }
 }
 
 function conditionValues(condition: FieldCondition): ConditionScalar[] {
@@ -314,6 +440,8 @@ const saveablePydanticFieldsSchema = pydanticFieldsSchema.superRefine(
       validateFieldIdentity(field, label, issue);
       validateSubfields(field, label, issue);
       validateOptions(field, label, issue);
+      validateTrimmedTexts(field, label, issue);
+      validateStorableTexts(field, [], label, issue);
       validateCondition(field, fieldByName, label, issue);
       if (!fieldByName.has(field.name)) fieldByName.set(field.name, field);
     }
