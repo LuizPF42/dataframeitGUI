@@ -23,62 +23,41 @@ interface AssignmentTableProps {
 }
 
 type CellState = {
-  cod?: OptimisticAssignment;
-  comp?: OptimisticAssignment;
+  cod?: Assignment;
+  comp?: Assignment;
 };
 
 type OptimisticAction = { docId: string; userId: string };
 
 /**
- * Linha otimista cujo status só o servidor decide: a codificação criada pelo
- * ciclo nasce `concluido` se o pesquisador já codificou o documento (#538), e
- * a tabela não tem como saber. A célula mostra "salvando" em vez de afirmar
- * "pendente" até o `revalidatePath` trazer a linha real (#551).
+ * As linhas são sempre as do servidor; `savingKey` marca a célula cujo passo
+ * do ciclo só o servidor decide. A codificação criada nasce `concluido` se o
+ * pesquisador já codificou o documento (#538), e a promoção a comparação de
+ * quem codificou pede a confirmação do coordenador sem gravar nada (#880). A
+ * tabela não tem como saber nenhum dos dois: a célula mostra "salvando", sem
+ * afirmar "pendente" nem "R", até o `revalidatePath` trazer a linha real
+ * (#551), e o rodapé segue contando só linhas reais.
  */
-type OptimisticAssignment = Assignment & { statusUnknown?: true };
+type OptimisticState = { rows: Assignment[]; savingKey: string | null };
+
+const cellKey = (docId: string, userId: string) => `${docId}:${userId}`;
 
 /**
- * Calcula a próxima lista de assignments após um ciclo na célula (docId, userId).
- * vazio → codificacao → comparacao → vazio
- * Bloqueia se houver assignment não-pendente.
+ * Próximo estado após um ciclo na célula, pelo mesmo planner da action. Só a
+ * remoção é otimista; criação e promoção marcam a célula como salvando, e a
+ * célula travada (ou a autocomparação, que pede confirmação) fica como está.
  */
 function cycleOptimistic(
-  current: OptimisticAssignment[],
-  projectId: string,
-  docId: string,
-  userId: string,
-): OptimisticAssignment[] {
-  const related = current.filter(
-    (a) => a.document_id === docId && a.user_id === userId,
-  );
-  const others = current.filter(
-    (a) => !(a.document_id === docId && a.user_id === userId),
-  );
-
-  // Bloquear se algum assignment não-pendente existe
-  if (related.some((a) => a.status !== "pendente")) return current;
-
-  const hasCod = related.some((a) => a.type === "codificacao");
-  const hasComp = related.some((a) => a.type === "comparacao");
-
-  const stub = (type: "codificacao" | "comparacao"): OptimisticAssignment => ({
-    id: `optimistic-${type}-${docId}-${userId}`,
-    project_id: projectId,
-    document_id: docId,
-    user_id: userId,
-    status: "pendente",
-    type,
-    batch_id: null,
-    completed_at: null,
-    round_id: "optimistic",
-  });
-
-  if (!hasCod && !hasComp) return [...others, { ...stub("codificacao"), statusUnknown: true }];
-  // A promoção só troca o tipo da codificação pendente: segue pendente.
-  if (hasCod && !hasComp) return [...others, stub("comparacao")];
-  if (hasComp && !hasCod) return others;
-  // ambos (sorteio): voltar para vazio
-  return others;
+  current: OptimisticState,
+  { docId, userId }: OptimisticAction,
+): OptimisticState {
+  const inCell = (a: Assignment) => a.document_id === docId && a.user_id === userId;
+  const step = planAssignmentCycle(current.rows.filter(inCell));
+  if (step.kind === "insertCoding" || step.kind === "promote") {
+    return { ...current, savingKey: cellKey(docId, userId) };
+  }
+  if (step.kind === "delete") return { ...current, rows: current.rows.filter((a) => !inCell(a)) };
+  return current;
 }
 
 const docLabel = (doc: AssignmentTableProps["documents"][number]) =>
@@ -89,18 +68,14 @@ const researcherName = (r: AssignmentTableProps["researchers"][number]) =>
 export function AssignmentTable({ projectId, documents, researchers, assignments, readOnly = false }: AssignmentTableProps) {
   const [isPending, startTransition] = useTransition();
 
-  const [optimisticAssignments, applyOptimistic] = useOptimistic<
-    OptimisticAssignment[],
+  const [{ rows: optimisticAssignments, savingKey }, applyOptimistic] = useOptimistic<
+    OptimisticState,
     OptimisticAction
-  >(
-    assignments,
-    (current, action) =>
-      cycleOptimistic(current, projectId, action.docId, action.userId),
-  );
+  >({ rows: assignments, savingKey: null }, cycleOptimistic);
 
   const cellMap = new Map<string, CellState>();
   for (const a of optimisticAssignments) {
-    const key = `${a.document_id}:${a.user_id}`;
+    const key = cellKey(a.document_id, a.user_id);
     const entry = cellMap.get(key) || {};
     if (a.type === "codificacao") entry.cod = a;
     else entry.comp = a;
@@ -146,14 +121,15 @@ export function AssignmentTable({ projectId, documents, researchers, assignments
               <tr key={doc.id} className="border-b">
                 <td className="px-3 py-1.5 font-mono text-xs">{docLabel(doc)}</td>
                 {researchers.map((r) => {
-                  const state = cellMap.get(`${doc.id}:${r.user_id}`) || {};
+                  const key = cellKey(doc.id, r.user_id);
+                  const state = cellMap.get(key) || {};
                   const { cod, comp } = state;
                   const hasAny = !!(cod || comp);
 
                   // Prioridade para status visual: concluído > em_andamento > pendente
                   const statusOrder = { concluido: 3, em_andamento: 2, pendente: 1 } as const;
-                  const dominant = [cod, comp]
-                    .filter((a): a is Assignment => !!a)
+                  const cellRows = [cod, comp].filter((a): a is Assignment => !!a);
+                  const dominant = cellRows
                     .reduce<Assignment | undefined>(
                       (best, a) =>
                         !best ||
@@ -163,14 +139,14 @@ export function AssignmentTable({ projectId, documents, researchers, assignments
                       undefined,
                     );
                   const status = dominant?.status;
-                  // Codificação recém-criada: o status ainda é do servidor.
-                  const saving = cod?.statusUnknown === true;
+                  // Criação ou promoção em curso: o desfecho ainda é do servidor.
+                  const saving = savingKey === key;
 
                   const isNonRemovable = status === "concluido" || status === "em_andamento";
                   // Codificação entregue ainda aceita a comparação da própria
                   // codificação, mediante confirmação — o mesmo planner da action.
                   const canAddSelfComparison =
-                    planAssignmentCycle([cod, comp].filter((a): a is Assignment => !!a)).kind ===
+                    planAssignmentCycle(cellRows).kind ===
                       "selfComparisonBesideDone" && !docsInComparison.has(doc.id);
                   const isLocked = readOnly || isPending || (isNonRemovable && !canAddSelfComparison);
 
@@ -191,7 +167,7 @@ export function AssignmentTable({ projectId, documents, researchers, assignments
 
                   // Badge de tipo (C / R / C·R)
                   const badgeText =
-                    cod && comp ? "C·R" : cod ? "C" : comp ? "R" : null;
+                    cod && comp ? "C·R" : cod || saving ? "C" : comp ? "R" : null;
 
                   const statusIcon =
                     status === "concluido" ? "✓" : status === "em_andamento" ? "…" : null;
@@ -215,10 +191,10 @@ export function AssignmentTable({ projectId, documents, researchers, assignments
                         isLocked && "cursor-default",
                       )}
                       aria-label={
-                        !hasAny
+                        saving
+                          ? "Salvando a atribuição…"
+                          : !hasAny
                           ? "Atribuir codificação"
-                          : saving
-                          ? "Salvando a atribuição de codificação…"
                           : canAddSelfComparison
                           ? "Codificação concluída (clique para atribuir a comparação da própria codificação)"
                           : cod && !comp
@@ -245,7 +221,8 @@ export function AssignmentTable({ projectId, documents, researchers, assignments
                   );
 
                   const tooltipParts: string[] = [];
-                  if (cod) tooltipParts.push(`Codificação (${saving ? "salvando…" : cod.status})`);
+                  if (saving) tooltipParts.push("Codificação (salvando…)");
+                  else if (cod) tooltipParts.push(`Codificação (${cod.status})`);
                   if (comp) tooltipParts.push(`Comparação (${comp.status})`);
                   if (comp?.self_comparison_approved_by) tooltipParts.push("Autocomparação liberada pelo coordenador");
 
@@ -273,11 +250,7 @@ export function AssignmentTable({ projectId, documents, researchers, assignments
             <tr className="bg-muted/30">
               <td className="px-3 py-1.5 font-medium">Total</td>
               {researchers.map((r) => {
-                // Sem a linha ainda sem status: contá-la como não concluída
-                // afirmaria o "pendente" que a célula deixou de afirmar.
-                const forUser = optimisticAssignments.filter(
-                  (a) => a.user_id === r.user_id && !a.statusUnknown,
-                );
+                const forUser = optimisticAssignments.filter((a) => a.user_id === r.user_id);
                 const codTotal = forUser.filter((a) => a.type === "codificacao").length;
                 const codDone = forUser.filter(
                   (a) => a.type === "codificacao" && a.status === "concluido",
