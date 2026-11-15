@@ -1,15 +1,24 @@
 // @vitest-environment jsdom
-import { describe, it, expect, afterEach, beforeAll } from "vitest";
+import { describe, it, expect, afterEach, beforeAll, beforeEach, vi } from "vitest";
 import { warmUpJsdom } from "@/test-utils/jsdom-warm-up";
-import { render, screen, cleanup, within } from "@testing-library/react";
-import { CodingDraftBanner } from "@/components/coding/CodingDraftBanner";
+import { act, render, screen, cleanup, within } from "@testing-library/react";
+import {
+  CodingDraftBanner,
+  LIVE_REGION_SETTLE_MS,
+} from "@/components/coding/CodingDraftBanner";
 import type { CodingDraftRecovery } from "@/lib/coding-draft";
 import type { PydanticField } from "@/lib/types";
 
 // Exigido pela regra test-jsdom-warm-up (eslint-rules/test-jsdom-warm-up.mjs).
 beforeAll(() => warmUpJsdom(), 30_000);
 
-afterEach(cleanup);
+// Timers falsos: a região live só aceita a primeira oferta depois de assentar
+// (`LIVE_REGION_SETTLE_MS`), e o teste controla esse relógio.
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 const FIELDS: PydanticField[] = [
   { id: "00000000-0000-4000-8000-000000000001", name: "q1", type: "text", options: null, description: "Diagnóstico" },
@@ -36,16 +45,25 @@ const resumable: CodingDraftRecovery = {
   changedFields: ["q1"],
 };
 
+const NONE: CodingDraftRecovery = { kind: "none" };
+
+function mount(initial: CodingDraftRecovery) {
+  const base = { fields: FIELDS, onRestore: () => {}, onDiscard: () => {}, now: Date.now() };
+  const { rerender } = render(<CodingDraftBanner recovery={initial} {...base} />);
+  return (next: CodingDraftRecovery) =>
+    rerender(<CodingDraftBanner recovery={next} {...base} />);
+}
+
+function settle() {
+  act(() => {
+    vi.advanceTimersByTime(LIVE_REGION_SETTLE_MS);
+  });
+}
+
+// A região live, já assentada, com a oferta dentro.
 function show(recovery: CodingDraftRecovery) {
-  render(
-    <CodingDraftBanner
-      recovery={recovery}
-      fields={FIELDS}
-      onRestore={() => {}}
-      onDiscard={() => {}}
-      now={Date.now()}
-    />,
-  );
+  mount(recovery);
+  settle();
   return screen.getByRole("status");
 }
 
@@ -80,5 +98,63 @@ describe("CodingDraftBanner — o que a região live anuncia", () => {
     show(diverged);
     expect(screen.getByRole("button", { name: "Retomar rascunho" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Descartar" })).toBeTruthy();
+  });
+});
+
+// O leitor de tela anuncia o que MUDA numa região live que já existia; uma
+// região inserida já populada costuma ser lida como conteúdo estático (#635).
+// Afirmar só que a região contém a frase não discrimina nada — isso já valia
+// quando a faixa devolvia `null` sem oferta. O que separa os dois mundos é a
+// região existir, vazia, ANTES de a oferta chegar, e ser o MESMO nó depois.
+describe("CodingDraftBanner — a chegada da oferta é anunciada", () => {
+  // Mutação vermelha: voltar a devolver `null` sem oferta. A região deixa de
+  // existir antes da chegada e este teste cai.
+  it("a região já está montada, vazia, quando ainda não há oferta", () => {
+    mount(NONE);
+    expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  it("na transição none → resumable, a região que se preenche é a que já existia", () => {
+    const update = mount(NONE);
+    const before = screen.getByRole("status");
+    settle();
+    update(resumable);
+    const after = screen.getByRole("status");
+    expect(after).toBe(before);
+    expect(after.textContent).toMatch(/alterações não enviadas/);
+  });
+
+  // A oferta chega no primeiro effect após o mount. Preencher a região no
+  // mesmo frame em que ela nasce é, para o leitor, nascer populada. Mutação
+  // vermelha: anunciar `offer` em vez de `announced`.
+  it("a primeira oferta só entra na região depois de ela assentar; a faixa visível não espera", () => {
+    mount(resumable);
+    const live = screen.getByRole("status");
+    expect(live.textContent).toBe("");
+    expect(screen.getByRole("button", { name: "Retomar rascunho" })).toBeTruthy();
+    settle();
+    expect(live.textContent).toMatch(/alterações não enviadas/);
+  });
+
+  // A frase vive duas vezes no DOM, mas só uma vez na árvore de acessibilidade:
+  // a cópia visível é `aria-hidden`, senão o leitor a leria duas vezes. E a
+  // cópia visível não é uma segunda região live.
+  it("a cópia visível não é região live nem é lida pelo leitor", () => {
+    const live = show(diverged);
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    const copies = screen.getAllByText(/foi salvo depois/);
+    expect(copies).toHaveLength(2);
+    const visible = copies.find((el) => !live.contains(el));
+    expect(visible?.closest("[aria-hidden='true']")).not.toBeNull();
+  });
+
+  it("descartada a oferta, a região esvazia e continua montada", () => {
+    const update = mount(diverged);
+    settle();
+    const live = screen.getByRole("status");
+    update(NONE);
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live.textContent).toBe("");
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });

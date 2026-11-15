@@ -25,12 +25,16 @@ import { BrowseCodingView } from "./BrowseCodingView";
 import { useAssignedCoding } from "./useAssignedCoding";
 import { useBrowseCoding } from "./useBrowseCoding";
 import type { OutOfScopeConfig } from "./QuestionsPanel";
+import type { CodingDraftRecovery } from "@/lib/coding-draft";
 
 /** Quantos textos de doc atribuído ficam em cache por sessão. Espelha o
  *  `MAX_CACHED_DOCS` do modo Explorar: a fila é percorrida em sequência, então
  *  um teto baixo cobre o ir-e-voltar entre vizinhos sem reter o texto integral
  *  da fila inteira no heap — 145 docs a ~16 KB na maior fila medida. */
 const MAX_CACHED_ASSIGNED_TEXTS = 5;
+
+/** O que a faixa de rascunho recebe em fullscreen, onde ela não se aplica. */
+const NO_RECOVERY: CodingDraftRecovery = { kind: "none" };
 import type {
   PydanticField,
   AssignedDoc,
@@ -523,28 +527,29 @@ function CodingPageInner({
           views: a oferta de recuperação e o aviso de que a cópia local não está
           funcionando. Nenhuma das duas se aplica em fullscreen, onde o header
           também não aparece. */}
+      {/* Um único indicador para os dois modos, junto das faixas do rascunho:
+          permanente enquanto houver pendência, some quando o envio é
+          confirmado. Fica aqui — e não dentro do painel de perguntas — porque o
+          sinal é da PÁGINA (o documento aberto), e porque duplicá-lo por modo
+          obrigava cada view a repassá-lo. */}
+      {!isFullscreen && activeDocUnsent && (
+        <div className="flex items-center gap-2 border-b px-4 py-1.5">
+          <UnsentChangesBadge visible />
+        </div>
+      )}
+      {/* Em fullscreen a faixa fica sem oferta, mas montada: sair do
+          fullscreen é uma chegada, e a região live dela tem de existir antes
+          (#635). */}
+      <CodingDraftBanner
+        recovery={isFullscreen ? NO_RECOVERY : drafts.recovery}
+        fields={fields}
+        onRestore={handleRestoreDraft}
+        onDiscard={handleDiscardDraft}
+      />
       {!isFullscreen && (
-        <>
-          {/* Um único indicador para os dois modos, junto das faixas do
-              rascunho: permanente enquanto houver pendência, some quando o envio
-              é confirmado. Fica aqui — e não dentro do painel de perguntas —
-              porque o sinal é da PÁGINA (o documento aberto), e porque duplicá-lo
-              por modo obrigava cada view a repassá-lo. */}
-          {activeDocUnsent && (
-            <div className="flex items-center gap-2 border-b px-4 py-1.5">
-              <UnsentChangesBadge visible />
-            </div>
-          )}
-          <CodingDraftBanner
-            recovery={drafts.recovery}
-            fields={fields}
-            onRestore={handleRestoreDraft}
-            onDiscard={handleDiscardDraft}
-          />
-          <CodingDraftUnavailableBanner
-            visible={!drafts.storageAvailable && activeDocUnsent}
-          />
-        </>
+        <CodingDraftUnavailableBanner
+          visible={!drafts.storageAvailable && activeDocUnsent}
+        />
       )}
 
       {mode === "assigned" && (
