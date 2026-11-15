@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useAuth } from "@clerk/nextjs";
+import { useSessionToken } from "@/lib/identity/client";
 import { fetchFastAPI, requireSupabaseToken } from "@/lib/api";
 
 /**
@@ -24,7 +24,7 @@ export function usePromptPreview(
   previewLoading: boolean;
   previewError: string | null;
 } {
-  const { getToken } = useAuth();
+  const getToken = useSessionToken();
   const [previewPrompt, setPreviewPrompt] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);

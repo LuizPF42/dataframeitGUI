@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useAuth } from "@clerk/nextjs";
+import { useSessionToken } from "@/lib/identity/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { toast } from "sonner";
@@ -49,7 +49,7 @@ export function RunCard({
     selectedDocumentIds: [],
   });
   const [isStartingRun, setIsStartingRun] = useState(false);
-  const { getToken } = useAuth();
+  const getToken = useSessionToken();
 
   const { mode: filterMode, sampleSize, maxResponseCount, selectedDocumentIds } =
     filter;

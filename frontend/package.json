@@ -8,6 +8,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:static": "vite build --config vite.static.config.mts && node scripts/static/build-edge-actions.mjs",
+    "dev:static": "vite --config vite.static.config.mts",
     "start": "next start",
     "lint": "eslint",
     "lint:types": "eslint --config eslint.config.typed.mjs",
@@ -53,6 +55,7 @@
     "test:db:self-comparison": "npm run test:db:psql -- supabase/tests/self_comparison_exception.test.sql",
     "test:db:schema-revision-rpcs": "npm run test:db:psql -- supabase/tests/schema_revision_rpcs.test.sql",
     "test:db:psql": "bash scripts/run-sql-test.sh",
+    "test:db:embedded": "cd scripts/db-embedded && node db.mjs build ../../supabase/migrations && node db.mjs test ../../supabase/tests/*.test.sql",
     "test:db:llm-runs-contract": "bash scripts/run-backend-integration.sh",
     "test:watch": "vitest",
     "test:e2e": "playwright test",

@@ -1,5 +1,5 @@
 import { createSupabaseServer } from "@/lib/supabase/server";
-import { createSupabaseAdmin } from "@/lib/supabase/admin";
+import { readIdentityAccessRows } from "@/lib/identity/access-rows";
 import { getProjectAccessContext } from "@/lib/auth";
 import { requirePageAuthUser } from "@/lib/page-auth";
 import { scanComparisonBacklog } from "@/lib/auto-comparison";
@@ -18,7 +18,6 @@ import {
 } from "@/components/members/member-list-utils";
 import { notFound } from "next/navigation";
 
-type AdminClient = ReturnType<typeof createSupabaseAdmin>;
 type ServerClient = Awaited<ReturnType<typeof createSupabaseServer>>;
 type MemberQueryRow = ProjectMember & { profiles: Profile };
 type EmailLinkQueryRow = MemberEmailLink & {
@@ -30,7 +29,6 @@ function isUserId(value: string | null): value is string {
 }
 
 async function loadClerkMappings(
-  admin: AdminClient,
   members: readonly MemberQueryRow[],
   links: readonly EmailLinkQueryRow[],
 ): Promise<Map<string, ClerkMappingAccessState>> {
@@ -42,10 +40,7 @@ async function loadClerkMappings(
   ];
   if (identityUserIds.length === 0) return new Map();
 
-  const { data, error } = await admin
-    .from("clerk_user_mapping")
-    .select("supabase_user_id, access_sync_version, clerk_deleted")
-    .in("supabase_user_id", identityUserIds);
+  const { data, error } = await readIdentityAccessRows(identityUserIds);
   if (error) throw new Error(error.message);
   return clerkMappingAccessStatesByUserId(data);
 }
@@ -148,9 +143,8 @@ export default async function MembersPage({
   const orphanedReviews = reviewsResult.count;
   const emailLinks = (linksResult.data ?? []) as unknown as EmailLinkQueryRow[];
   const project = projectResult.data;
-  const admin = createSupabaseAdmin();
   const [mappingsByUserId, orphanedComparisons] = await Promise.all([
-    loadClerkMappings(admin, members, emailLinks),
+    loadClerkMappings(members, emailLinks),
     countOrphanedComparisons(supabase, id, project?.automation_mode),
   ]);
   const emailLinkViews = buildEmailLinkViews(emailLinks, mappingsByUserId);

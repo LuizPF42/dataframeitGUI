@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { useAuth } from "@clerk/nextjs";
+import { useSessionToken } from "@/lib/identity/client";
 import { toast } from "sonner";
 import { fetchFastAPI, requireSupabaseToken } from "@/lib/api";
 import { getScrollBehavior } from "@/lib/scroll";
@@ -130,7 +130,7 @@ export function useLlmRunProgress(
 ) {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const { refresh } = useRouter();
-  const { getToken } = useAuth();
+  const getToken = useSessionToken();
   const { activeJobId } = state;
 
   // Lidos sempre atualizados dentro do loop de polling sem re-disparar o effect

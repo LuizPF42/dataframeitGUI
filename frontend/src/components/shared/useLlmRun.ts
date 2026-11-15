@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { useAuth } from "@clerk/nextjs";
+import { useSessionToken } from "@/lib/identity/client";
 import { fetchFastAPI, requireSupabaseToken } from "@/lib/api";
 import { toast } from "sonner";
 
@@ -28,7 +28,7 @@ export function useLlmRun({
   impersonating = false,
   onComplete,
 }: UseLlmRunParams): { running: boolean; run: () => Promise<void> } {
-  const { getToken } = useAuth();
+  const getToken = useSessionToken();
   const [running, setRunning] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cancelledRef = useRef(false);

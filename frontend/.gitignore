@@ -58,3 +58,8 @@ next-env.d.ts
 # propria - senao cai neste ignore e fica destravado do git sem aviso.
 /scripts/*.mjs
 /scripts/*.ts
+
+# Postgres local sem Docker (scripts/db-embedded)
+/scripts/db-embedded/data/
+/scripts/db-embedded/pg.log
+/scripts/db-embedded/node_modules/

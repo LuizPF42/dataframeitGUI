@@ -1,5 +1,7 @@
 import { createSupabaseServer } from "@/lib/supabase/server";
 import { createSupabaseAdmin } from "@/lib/supabase/admin";
+import { readIdentityAccessRows } from "@/lib/identity/access-rows";
+import { STATIC_MODE } from "@/lib/runtime-mode";
 import { getProjectAccessContext } from "@/lib/auth";
 import { requirePageAuthUser } from "@/lib/page-auth";
 import { requireResolvedProjectAccess } from "@/lib/project-access";
@@ -23,8 +25,11 @@ import {
 // 5 min — um documento excluído seguiria aparecendo como atribuível. A query
 // lê três colunas com filtro indexado por project_id; não cachear custa menos
 // que servir dado errado.
+//
+// No modo estático não existe service role no navegador: a leitura sai com o
+// JWT do coordenador, que a policy "Members view documents" já cobre.
 async function listAssignableDocuments(projectId: string) {
-  const supabase = createSupabaseAdmin();
+  const supabase = STATIC_MODE ? await createSupabaseServer() : createSupabaseAdmin();
   const { data, error } = await supabase
     .from("documents")
     .select("id, external_id, title")
@@ -72,12 +77,7 @@ async function getMembers(
   for (const link of links) {
     if (link.linked_user_id) identityUserIds.add(link.linked_user_id);
   }
-  const mappingResult = identityUserIds.size
-    ? await createSupabaseAdmin()
-        .from("clerk_user_mapping")
-        .select("supabase_user_id, access_sync_version, clerk_deleted")
-        .in("supabase_user_id", [...identityUserIds])
-    : { data: [], error: null };
+  const mappingResult = await readIdentityAccessRows([...identityUserIds]);
   return {
     members,
     links,

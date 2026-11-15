@@ -8,7 +8,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
-import { useClerk } from "@clerk/nextjs";
+import { useSignOut } from "@/lib/identity/client";
 import { toast } from "sonner";
 
 interface UserMenuProps {
@@ -17,7 +17,7 @@ interface UserMenuProps {
 }
 
 export function UserMenu({ email, firstName }: UserMenuProps) {
-  const { signOut } = useClerk();
+  const signOut = useSignOut();
 
   const handleLogout = () => {
     signOut({ redirectUrl: "/auth/login" }).catch(() => {

@@ -14,6 +14,11 @@ const SRC_ROOT = path.resolve(process.cwd(), "src");
 const FRONTEND_ROOT = path.resolve(process.cwd());
 const REPO_ROOT = path.resolve(FRONTEND_ROOT, "..");
 const ADMIN_FILE = path.join(SRC_ROOT, "lib/supabase/admin.ts");
+// Código do modo estático (GitHub Pages + Edge Function). Não faz parte do
+// runtime Next: tem fronteira própria, verificada no bloco do fim do arquivo.
+const STATIC_ROOT = path.join(SRC_ROOT, "static");
+const EDGE_ROOT = path.join(STATIC_ROOT, "edge");
+const isStaticModeFile = (file: string) => file.startsWith(STATIC_ROOT + path.sep);
 const SOURCE_EXTENSIONS = [
   ".ts",
   ".tsx",
@@ -56,11 +61,18 @@ const EXPECTED_RUNTIME_IMPORTERS = [
   "actions/field-reviews.ts",
   "actions/members.ts",
   "app/(app)/projects/[id]/analyze/assignments/page.tsx",
-  "app/(app)/projects/[id]/config/members/page.tsx",
-  "lib/auth.ts",
   "lib/auto-comparison.ts",
   "lib/auto-review-reconciler.ts",
   "lib/clerk-sync.ts",
+  // Estado do vínculo Clerk (`clerk_user_mapping`) das contas que as páginas de
+  // membros e de atribuições já leram pela RLS; antes lido inline nelas.
+  "lib/identity/access-rows.ts",
+  // Emissor Clerk da identidade (antes dentro de lib/auth.ts): bootstrap em
+  // `clerk_user_mapping` e `master_users`, deny-by-default para o cliente.
+  "lib/identity/server.ts",
+  // Pré-registro de membro sem conta (Auth Admin `createUser`), extraído de
+  // lib/clerk-sync.ts para servir também ao modo estático.
+  "lib/preregistration.ts",
   // Propagação pós-commit da equivalência de valor: reconcilia e ressincroniza
   // os documentos do projeto com os mesmos valores; a RLS de quem clicou não
   // alcança assignments de peers nem a fila de reconciliação, e a mudança já
@@ -372,7 +384,7 @@ beforeAll(async () => {
 describe("fronteira do Supabase admin client", () => {
   // Grafo e contagem saem da coleta, que não tem timeout: o percurso da AST de
   // todo `src/` dentro de um caso chegou a 1,7 s com a suíte sob carga.
-  const files = sourceFiles(SRC_ROOT);
+  const files = sourceFiles(SRC_ROOT).filter((file) => !isStaticModeFile(file));
   const graph = importGraph(files);
   const adminFactoryCalls = countAdminFactoryCalls(files);
 
@@ -459,8 +471,10 @@ describe("fronteira do Supabase admin client", () => {
     // todas as leituras do retry continuam no client autenticado. O
     // reconciliador interno acrescenta o uso necessário para drenar a outbox.
     // A #545 acrescenta 1: o sync documento-wide pós-unmark precisa alcançar
-    // assignments de peers, fora da RLS do chamador.
-    expect(adminFactoryCalls).toBe(20);
+    // assignments de peers, fora da RLS do chamador. A leitura do vínculo Clerk
+    // das páginas de membros e de atribuições passou a ser uma só, em
+    // `lib/identity/access-rows.ts` (-1).
+    expect(adminFactoryCalls).toBe(19);
   });
 
   it("varre o que o git enxerga e deixa de fora o ignorado", () => {
@@ -522,5 +536,23 @@ describe("fronteira do Supabase admin client", () => {
     );
 
     expect(secretReaders.map(relative)).toEqual(["lib/supabase/admin.ts"]);
+  });
+});
+
+describe("fronteira da service role no modo estático", () => {
+  const staticFiles = sourceFiles(SRC_ROOT).filter(isStaticModeFile);
+  const secretName = ["SUPABASE", "SERVICE", "ROLE", "KEY"].join("_");
+
+  it("lê o secret só no cliente admin da Edge Function", () => {
+    const readers = staticFiles.filter((file) => fs.readFileSync(file, "utf8").includes(secretName));
+    expect(readers.map((file) => path.relative(SRC_ROOT, file).split(path.sep).join("/"))).toEqual([
+      "static/edge/supabase-admin.ts",
+    ]);
+  });
+
+  it("importa o admin client apenas dentro da Edge Function", () => {
+    const graph = importGraph(staticFiles);
+    const importers = staticFiles.filter((file) => graph.get(file)?.includes(ADMIN_FILE));
+    expect(importers.every((file) => file.startsWith(EDGE_ROOT + path.sep))).toBe(true);
   });
 });
