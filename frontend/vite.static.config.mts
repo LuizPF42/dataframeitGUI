@@ -133,5 +133,6 @@ export default defineConfig(({ mode }) => ({
     chunkSizeWarningLimit: 2000,
     target: "es2022",
   },
-  server: { port: 5173 },
+  // `backend/services/*.py` entra no worker Pyodide como texto (`?raw`).
+  server: { port: 5173, fs: { allow: [path.resolve(frontendDir, "..")] } },
 }));

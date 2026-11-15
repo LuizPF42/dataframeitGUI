@@ -24,6 +24,9 @@ export function sourceAliasPlugin(srcDir, aliases = ANALYSIS_ALIASES) {
   return {
     name: "source-alias",
     setup(build) {
+      // Importações de texto do Vite (`?raw`, código Python do worker) não
+      // carregam código JS: ficam fora do grafo.
+      build.onResolve({ filter: /\?(raw|url|worker)$/ }, (args) => ({ path: args.path, external: true }));
       build.onResolve({ filter: /.*/ }, (args) => {
         const target = aliases[args.path];
         return target ? { path: path.join(frontendDir, target) } : undefined;

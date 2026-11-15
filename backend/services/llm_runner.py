@@ -26,7 +26,6 @@ import pandas as pd
 # sys.modules["dataframeit"] por um SimpleNamespace sem submódulos: resolver a
 # tupla em import-time do módulo mantém esses testes válidos sem que eles
 # precisem conhecer este import.
-from dataframeit.errors import RECOVERABLE_ERRORS
 from supabase import PostgrestAPIError
 
 from services.auto_review_reconciliation import wake_auto_review_reconciliation_sync
@@ -1114,10 +1113,41 @@ _PROBE_DOC_ID = "__schema_probe__"
 _PROBE_TEXT = "Documento de teste."
 
 
+# Padrões de falha passageira (timeout, rate limit, 5xx, conexão). Vinham da
+# constante `RECOVERABLE_ERRORS` do dataframeit, que saiu da biblioteca: lá o
+# erro sem padrão conhecido já é recuperável por default. A pergunta deste
+# módulo é mais estreita — "o provider declarou falha passageira?" — e exige
+# casamento explícito, por isso a lista mora aqui.
+_TRANSIENT_ERROR_PATTERNS = (
+    # Timeouts e deadlines
+    "DeadlineExceeded",
+    "Timeout",
+    "TimeoutError",
+    "ReadTimeout",
+    "ConnectTimeout",
+    # Rate limits
+    "RateLimitError",
+    "ResourceExhausted",
+    "TooManyRequests",
+    "429",
+    # Erros de servidor temporários
+    "ServiceUnavailable",
+    "InternalServerError",
+    "500",
+    "502",
+    "503",
+    "504",
+    # Erros de conexão
+    "ConnectionError",
+    "ConnectionReset",
+    "SSLError",
+)
+
+
 def _is_transient(message: str) -> bool:
     """O provider declarou falha passageira (429, timeout, 5xx)?
 
-    Consulta `RECOVERABLE_ERRORS` para a pergunta que essa tupla de fato
+    Consulta `_TRANSIENT_ERROR_PATTERNS` para a pergunta que essa tupla de fato
     responde — "isto é transitório?" — e exige casamento **explícito**. O
     default do `is_recoverable_error` é otimista: erro que não casa com lista
     nenhuma é tratado como recuperável, e foi por aí que a recusa de schema
@@ -1129,7 +1159,7 @@ def _is_transient(message: str) -> bool:
     a run inteira por uma falha que costuma passar sozinha.
     """
     lowered = message.lower()
-    return any(pattern.lower() in lowered for pattern in RECOVERABLE_ERRORS)
+    return any(pattern.lower() in lowered for pattern in _TRANSIENT_ERROR_PATTERNS)
 
 
 def _field_group_key(model_class, name: str) -> str:

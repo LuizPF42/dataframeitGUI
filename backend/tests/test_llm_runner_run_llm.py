@@ -1805,7 +1805,7 @@ _MODEL_NOT_FOUND = (
     "found for API version v1beta"
 )
 # Falha passageira que o dataframeit já tentou de novo e desistiu. Casa
-# explicitamente com RECOVERABLE_ERRORS ('ResourceExhausted', '429'), e é esse
+# explicitamente com _TRANSIENT_ERROR_PATTERNS ('ResourceExhausted', '429'), e é esse
 # casamento — não o prefixo — que a distingue da recusa de schema em
 # _SCHEMA_RECUSADO, que carrega o mesmo prefixo e não casa com lista nenhuma.
 _RATE_LIMIT_EXHAUSTED = (
@@ -2182,7 +2182,7 @@ def test_run_llm_sucesso_apos_retry_fica_fora_dos_erros_do_provider(monkeypatch)
 
 def test_run_llm_sucesso_apos_retry_na_sonda_nao_conta_como_recusa(monkeypatch):
     # Mesma confusão, agora na sonda: aqui ela é pior, porque "Sucesso após 1
-    # retry(s)" não casa com RECOVERABLE_ERRORS e portanto nem a porta de
+    # retry(s)" não casa com _TRANSIENT_ERROR_PATTERNS e portanto nem a porta de
     # transitório o barra. A bisseção leria "não cabe" a cada nível e mataria
     # no piso uma run que o provider nunca recusou.
     #

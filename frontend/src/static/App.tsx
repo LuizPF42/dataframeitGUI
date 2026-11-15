@@ -5,6 +5,7 @@
 import { lazy, Suspense, useSyncExternalStore } from "react";
 import { Toaster } from "@/components/ui/sonner";
 import { MobileWarning } from "@/components/shell/MobileWarning";
+import { LlmActivityBanner, ProviderKeyDialog } from "@/static/llm/LlmBrowserUi";
 import { readConnection } from "@/static/runtime/connection";
 import { getSnapshot, navigate, subscribe } from "@/static/runtime/navigation";
 import { RouteView } from "@/static/runtime/RouteView";
@@ -47,6 +48,8 @@ export function App() {
     <>
       <MobileWarning />
       <Screen />
+      <ProviderKeyDialog />
+      <LlmActivityBanner />
       <Toaster />
     </>
   );
