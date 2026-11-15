@@ -4,7 +4,6 @@ import { useCallback } from "react";
 import { toast } from "sonner";
 import {
   submitVerdict,
-  markCompareDocReviewed,
   type ResponseSnapshotEntry,
 } from "@/actions/reviews";
 import {
@@ -48,7 +47,6 @@ export interface CompareVerdicts {
     gabaritoId: string,
     verdictDisplay: string,
   ) => Promise<void>;
-  handleMarkReviewed: () => Promise<void>;
   handleUnmarkPair: (pairId: string) => Promise<void>;
 }
 
@@ -165,6 +163,9 @@ function compareWriteGate(
   if (readOnly) return { ok: false, reason: "read-only" };
   if (currentDoc === undefined) return { ok: false, reason: "no-doc" };
   if (currentFieldName.length === 0) return { ok: false, reason: "no-field" };
+  // Defesa da fronteira de escrita, não ramo de fluxo: com campo, ele é
+  // sempre divergente (ver `useCompareNavigation`), e sem campo `no-field` já
+  // recusou acima. Só dispara se um caminho novo fugir dessa fila (#616).
   if (!isCurrentFieldDivergent) return { ok: false, reason: "not-divergent" };
   if (
     !verdictOriginMatches(origin, {
@@ -195,8 +196,8 @@ function rejectCompareWrite(
 }
 
 /**
- * Handlers de submissão de veredito (regular e por equivalência) + marcar
- * revisado / desfazer equivalência. Extraído de `ComparePage` para tirar ~140
+ * Handlers de submissão de veredito (regular e por equivalência) + desfazer
+ * equivalência. Extraído de `ComparePage` para tirar ~140
  * linhas do container (`no-giant-component`). A escrita otimista vai por
  * `recordReview` (overrides); o avanço de campo por `goNextField` (que já faz
  * o clamp de limite).
@@ -392,18 +393,6 @@ export function useCompareVerdicts({
     ],
   );
 
-  const handleMarkReviewed = useCallback(async () => {
-    if (readOnly || !currentDoc) return;
-    const saved = await actionSucceeded(
-      markCompareDocReviewed(projectId, currentDoc.id),
-      "Failed to mark compare doc reviewed",
-      { projectId, documentId: currentDoc.id },
-      "Não foi possível marcar o documento como revisado. Tente novamente.",
-    );
-    if (!saved) return;
-    toast.success("Documento marcado como revisado.");
-  }, [readOnly, projectId, currentDoc]);
-
   const handleUnmarkPair = useCallback(
     async (pairId: string) => {
       if (readOnly) return;
@@ -422,7 +411,6 @@ export function useCompareVerdicts({
   return {
     handleVerdict,
     handleConfirmEquivalent,
-    handleMarkReviewed,
     handleUnmarkPair,
   };
 }
