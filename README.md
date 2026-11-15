@@ -207,6 +207,16 @@ Rotacione quando a chave puder ter vazado, e não por rotina. Hoje ela só serve
 | `LLM_RATE_LIMIT_REQUESTS` | Backend (`fly.toml [env]`) | Máximo compartilhado de disparos LLM por usuário efetivo e projeto em cada janela (default: `5`) |
 | `LLM_RATE_LIMIT_WINDOW_SECONDS` | Backend (`fly.toml [env]`) | Duração da janela atômica no Postgres, em segundos (default: `60`) |
 
+## Modo estático (GitHub Pages)
+
+Modo alternativo, para grupos que preferem não depender de servidor: o site é publicado no GitHub Pages e cada grupo usa um projeto Supabase próprio, criado pelo assistente em `/nova-nuvem`. O LLM roda no navegador do coordenador, com a chave dele. Usa o mesmo código das páginas e actions deste repositório; o modo hospedado acima não muda. Arquitetura, segurança e limites em [`docs/STATIC_MODE.md`](docs/STATIC_MODE.md).
+
+```bash
+cd frontend
+npm run dev:static     # http://localhost:5173
+npm run build:static   # gera out/ para o Pages
+```
+
 ## Estrutura do Projeto
 
 ```
