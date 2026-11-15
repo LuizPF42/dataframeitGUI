@@ -18,11 +18,11 @@ import { navigate } from "@/static/runtime/navigation";
 import { createBrowserClient } from "@/static/runtime/supabase";
 import { AuthShell } from "@/static/screens/AuthShell";
 
-export type ConnectionCheck =
+type ConnectionCheck =
   | { ok: true }
   | { ok: false; reason: "unreachable" | "schema-missing" | "not-native" };
 
-export async function checkConnection(connection: Connection): Promise<ConnectionCheck> {
+async function checkConnection(connection: Connection): Promise<ConnectionCheck> {
   try {
     const { data, error } = await createBrowserClient(connection).rpc("native_auth_enabled");
     if (error) {

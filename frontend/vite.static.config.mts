@@ -132,6 +132,15 @@ export default defineConfig(({ mode }) => ({
     sourcemap: true,
     chunkSizeWarningLimit: 2000,
     target: "es2022",
+    rollupOptions: {
+      onwarn(warning, warn) {
+        // "use client"/"use server" são diretivas do Next; num SPA não há
+        // fronteira servidor/cliente a preservar, e o aviso se repetiria por
+        // componente.
+        if (warning.code === "MODULE_LEVEL_DIRECTIVE") return;
+        warn(warning);
+      },
+    },
   },
   // `backend/services/*.py` entra no worker Pyodide como texto (`?raw`).
   server: { port: 5173, fs: { allow: [path.resolve(frontendDir, "..")] } },

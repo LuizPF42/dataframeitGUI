@@ -3,33 +3,14 @@
 // atendidas pelo backend que roda no próprio navegador, num Web Worker com
 // Pyodide (`./backend`). Não há servidor: a chave de LLM é do coordenador e a
 // escrita no banco sai com o JWT dele.
+//
+// `ApiError` e `requireSupabaseToken` são os do modo hospedado (import
+// relativo, que a troca de `@/lib/api` não alcança): mesmo contrato de erro.
 
+import { ApiError } from "../../lib/api";
 import { dispatchBackendRequest } from "@/static/llm/backend";
 
-class MissingAuthTokenError extends Error {
-  constructor() {
-    super("Sessão indisponível. Faça login novamente.");
-    this.name = "MissingAuthTokenError";
-  }
-}
-
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
-type GetToken = () => Promise<string | null>;
-
-export async function requireSupabaseToken(getToken: GetToken): Promise<string> {
-  const token = await getToken();
-  if (!token) throw new MissingAuthTokenError();
-  return token;
-}
+export { ApiError, requireSupabaseToken } from "../../lib/api";
 
 export async function fetchFastAPI<T>(
   path: string,

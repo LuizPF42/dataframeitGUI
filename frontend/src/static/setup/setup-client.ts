@@ -22,11 +22,11 @@ export function siteRoot(): string {
   return `${window.location.origin}${basePath}`;
 }
 
-export function setupRedirectUri(): string {
+function setupRedirectUri(): string {
   return `${siteRoot()}/nova-nuvem`;
 }
 
-export class SetupError extends Error {
+class SetupError extends Error {
   constructor(
     message: string,
     readonly status: number,

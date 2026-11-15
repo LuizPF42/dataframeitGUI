@@ -49,14 +49,6 @@ export function saveConnection(connection: Connection): void {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(connection));
 }
 
-export function clearConnection(): void {
-  try {
-    window.localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // Armazenamento bloqueado: não há o que limpar.
-  }
-}
-
 /** Lê `#url=…&key=…&nome=…` do link para a equipe. */
 export function parseTeamLink(hash: string): Connection | null {
   const params = new URLSearchParams(hash.replace(/^#/, ""));
@@ -73,6 +65,3 @@ export function buildTeamLink(siteUrl: string, connection: Connection): string {
   return `${siteUrl.replace(/\/$/, "")}/conectar#${params.toString()}`;
 }
 
-export function isBuildConnection(): boolean {
-  return fromBuild() !== null;
-}

@@ -156,7 +156,7 @@ function statusFromState(state: Record<string, unknown>) {
 }
 
 /** Mesmo formato de `_status_from_row` (llm_runner.py), para rodadas de outra aba. */
-export function statusFromRow(row: Record<string, unknown>) {
+function statusFromRow(row: Record<string, unknown>) {
   return {
     status: row.status ?? "error",
     phase: row.phase ?? "error",
@@ -195,7 +195,7 @@ async function jobStatus(jobId: string): Promise<BackendResult> {
 }
 
 // ---------------------------------------------------------------- rodadas
-export function supportsJspi(): boolean {
+function supportsJspi(): boolean {
   return typeof (WebAssembly as unknown as { Suspending?: unknown }).Suspending === "function";
 }
 

@@ -8,14 +8,14 @@ import { readConnection, type Connection } from "@/static/runtime/connection";
 let client: SupabaseClient | null = null;
 let clientFor: string | null = null;
 
-export class NotConnectedError extends Error {
+class NotConnectedError extends Error {
   constructor() {
     super("Este navegador ainda não está conectado à nuvem do grupo.");
     this.name = "NotConnectedError";
   }
 }
 
-export function projectRefOf(url: string): string {
+function projectRefOf(url: string): string {
   try {
     return new URL(url).hostname.split(".")[0] ?? "local";
   } catch {

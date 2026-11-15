@@ -4,7 +4,7 @@
 // resolução de dependências falha por pinos incompatíveis com os pacotes do
 // próprio Pyodide (uuid-utils, tenacity), por isso a lista é explícita.
 
-export const PYODIDE_VERSION = "314.0.7";
+const PYODIDE_VERSION = "314.0.7";
 export const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
 
 /** Pacotes compilados que vêm do repositório do próprio Pyodide. */

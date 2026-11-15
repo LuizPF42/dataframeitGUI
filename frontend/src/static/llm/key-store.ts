@@ -24,7 +24,7 @@ export function isProviderId(value: unknown): value is ProviderId {
   return value === "google_genai" || value === "openai" || value === "anthropic";
 }
 
-export function readStoredKey(provider: ProviderId): string | null {
+function readStoredKey(provider: ProviderId): string | null {
   const inMemory = memory.get(provider);
   if (inMemory) return inMemory;
   try {
@@ -34,22 +34,13 @@ export function readStoredKey(provider: ProviderId): string | null {
   }
 }
 
-export function storeKey(provider: ProviderId, key: string, remember: boolean): void {
+function storeKey(provider: ProviderId, key: string, remember: boolean): void {
   memory.set(provider, key);
   try {
     if (remember) window.localStorage.setItem(STORAGE_PREFIX + provider, key);
     else window.localStorage.removeItem(STORAGE_PREFIX + provider);
   } catch {
     // Armazenamento bloqueado: a chave vale só nesta aba.
-  }
-}
-
-export function forgetKey(provider: ProviderId): void {
-  memory.delete(provider);
-  try {
-    window.localStorage.removeItem(STORAGE_PREFIX + provider);
-  } catch {
-    // nada a remover
   }
 }
 

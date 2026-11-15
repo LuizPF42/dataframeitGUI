@@ -6,7 +6,7 @@
 // `frontend/`. `target` diz em qual runtime a troca vale.
 
 /** Trocas comuns ao navegador e à Edge Function. */
-export const SHARED_ALIASES = {
+const SHARED_ALIASES = {
   "@/lib/runtime-mode": "src/static/runtime-mode.ts",
   "next/navigation": "src/static/shims/next-navigation.ts",
   "next/cache": "src/static/shims/next-cache.ts",

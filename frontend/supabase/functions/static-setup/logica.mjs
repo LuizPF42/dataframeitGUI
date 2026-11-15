@@ -21,22 +21,22 @@
 // fetch falso.
 
 const API = "https://api.supabase.com";
-export const SETUP_REGIONS = [
+const SETUP_REGIONS = [
   "sa-east-1", "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1",
   "eu-west-1", "eu-west-2", "eu-west-3", "eu-north-1", "eu-central-1", "eu-central-2",
   "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ap-northeast-2", "ap-east-1",
 ];
 const REF_RE = /^[a-z0-9]{20}$/;
 const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-export const SQL_MAX = 2 * 1024 * 1024;
-export const CODE_MAX = 2 * 1024 * 1024;
-export const ACTIONS_FUNCTION_SLUG = "actions";
+const SQL_MAX = 2 * 1024 * 1024;
+const CODE_MAX = 2 * 1024 * 1024;
+const ACTIONS_FUNCTION_SLUG = "actions";
 
 /** Consultas fixas de leitura (a página não manda SQL para estas). */
-export const APPLIED_MIGRATIONS_SQL =
+const APPLIED_MIGRATIONS_SQL =
   "SELECT coalesce(json_agg(version ORDER BY version), '[]'::json) AS versions " +
   "FROM supabase_migrations.schema_migrations";
-export const VERIFY_SQL = `
+const VERIFY_SQL = `
 SELECT json_build_object(
   'native_auth', public.native_auth_enabled(),
   'tables_without_rls', (
@@ -50,8 +50,8 @@ SELECT json_build_object(
 ) AS report`;
 
 /** E-mail do código de acesso (OTP de 6 dígitos, não link mágico). */
-export const OTP_SUBJECT = "Seu código de acesso ao dataframeit";
-export const OTP_TEMPLATE =
+const OTP_SUBJECT = "Seu código de acesso ao dataframeit";
+const OTP_TEMPLATE =
   "<h2>Código de acesso</h2>" +
   "<p>Use este código para entrar no dataframeit:</p>" +
   '<p style="font-size:24px;letter-spacing:4px"><strong>{{ .Token }}</strong></p>' +
