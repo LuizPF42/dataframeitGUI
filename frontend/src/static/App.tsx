@@ -9,6 +9,7 @@ import { LlmActivityBanner, ProviderKeyDialog } from "@/static/llm/LlmBrowserUi"
 import { readConnection } from "@/static/runtime/connection";
 import { getSnapshot, navigate, subscribe } from "@/static/runtime/navigation";
 import { RouteView } from "@/static/runtime/RouteView";
+import { AccessProblemScreen } from "@/static/screens/AccessProblemScreen";
 import { ConnectScreen } from "@/static/screens/ConnectScreen";
 import { LoginScreen } from "@/static/screens/LoginScreen";
 
@@ -36,10 +37,7 @@ function Screen() {
     return null;
   }
   if (pathname === "/auth/login") return <LoginScreen />;
-  if (pathname === "/auth/post-login") {
-    queueMicrotask(() => navigate("/dashboard", { replace: true }));
-    return null;
-  }
+  if (pathname === "/auth/post-login") return <AccessProblemScreen />;
   return <RouteView />;
 }
 

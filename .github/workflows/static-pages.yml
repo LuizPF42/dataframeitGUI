@@ -1,0 +1,76 @@
+name: Modo estático (GitHub Pages)
+
+# Publica o modo estático: site em out/, mais o schema.sql consolidado
+# (out/schema) e a Edge Function `actions` (out/edge), que o assistente
+# "Criar a nuvem do grupo" lê do próprio site. O modo hospedado (Fly) não é
+# afetado: este workflow só roda na branch do modo estático ou por pedido.
+#
+# Variáveis do repositório (Settings → Secrets and variables → Variables),
+# todas opcionais:
+#   STATIC_SETUP_FUNCTION_URL, STATIC_SETUP_ANON_KEY,
+#   STATIC_SUPABASE_OAUTH_CLIENT_ID  — assistente automático (sem elas, o
+#                                      assistente mostra o passo a passo manual)
+#   STATIC_DATAFRAMEIT_WHEEL         — wheel do dataframeit com adataframeit,
+#                                      enquanto a versão não está no PyPI
+
+on:
+  push:
+    branches: [feat/modo-estatico]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build do site estático
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Testes do modo estático
+        run: npx vitest run src/static src/lib/__tests__/supabase-admin-boundary.test.ts
+      - id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Build (site, Edge Function e schema)
+        env:
+          # usuario.github.io/<repositorio>/ → base "/<repositorio>"
+          STATIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+          VITE_SETUP_FUNCTION_URL: ${{ vars.STATIC_SETUP_FUNCTION_URL }}
+          VITE_SETUP_ANON_KEY: ${{ vars.STATIC_SETUP_ANON_KEY }}
+          VITE_SUPABASE_OAUTH_CLIENT_ID: ${{ vars.STATIC_SUPABASE_OAUTH_CLIENT_ID }}
+          VITE_DATAFRAMEIT_WHEEL: ${{ vars.STATIC_DATAFRAMEIT_WHEEL }}
+        run: npm run build:static
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: frontend/out
+
+  deploy:
+    name: Publicar no GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
