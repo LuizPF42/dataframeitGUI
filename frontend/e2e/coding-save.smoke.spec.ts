@@ -43,6 +43,12 @@ const DOC_TITLE = "Doc E2E save 1";
 // Valor distinto dos acima: se algum dia vazar para o banco, o texto diz de
 // qual caminho veio.
 const UNSENT_VALUE = "valor-e2e-nao-enviado";
+// Espera pela primeira pergunta: é onde o spec descobre que a página não chegou
+// ao estado esperado. A mensagem lista onde olhar, sem presumir a causa (#740).
+const QUESTION_NOT_SHOWN =
+  "pergunta 'Resumo do documento' não ficou visível uma única vez — confira " +
+  "no snapshot se a página é o login, no anexo navegacoes.json se houve 404, " +
+  "e só então o fixture e o reset";
 
 function createAdminClient() {
   return createClient(
@@ -138,7 +144,7 @@ test("codificação: enviar respostas persiste response e conclui assignment", a
       // Doc do fixture na fila de Atribuídos, com as duas perguntas do schema.
       await expect(
         visivel(page.getByText("Resumo do documento")),
-        "pergunta 'Resumo do documento' não apareceu — confira o fixture e o reset",
+        QUESTION_NOT_SHOWN,
       ).toBeVisible({ timeout: 30_000 });
       await expect(visivel(page.getByText("Observação livre"))).toBeVisible();
 
@@ -280,9 +286,10 @@ test("codificação: editar e sair sem enviar não grava, e o rascunho local ret
     context: "coding-save-unsent",
     run: async () => {
       await page.goto(`/projects/${projectId}/analyze/code`);
-      await expect(visivel(page.getByText("Resumo do documento"))).toBeVisible({
-        timeout: 30_000,
-      });
+      await expect(
+        visivel(page.getByText("Resumo do documento")),
+        QUESTION_NOT_SHOWN,
+      ).toBeVisible({ timeout: 30_000 });
 
       const textareas = visivel(page.getByPlaceholder("Digite sua resposta..."));
       await expect(textareas).toHaveCount(2);
