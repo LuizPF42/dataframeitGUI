@@ -15,6 +15,9 @@ export default defineConfig({
     // existe. No Node do `.nvmrc` a flag é inócua.
     execArgv: ["--no-experimental-webstorage"],
   },
+  // O worker Pyodide do modo estático importa `backend/services/*.py` como
+  // texto (`?raw`), fora da raiz do frontend.
+  server: { fs: { allow: [path.resolve(__dirname, "..")] } },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),
