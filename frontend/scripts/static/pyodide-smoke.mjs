@@ -198,6 +198,13 @@ const startResult = JSON.parse(backend.call("start_run", JSON.stringify({ projec
 if (!startResult.ok) throw new Error(`start_run falhou: ${JSON.stringify(startResult)}`);
 const jobId = startResult.data.job_id;
 
+// Rotas curtas, pelo mesmo ponto de entrada do worker.
+const preview = JSON.parse(
+  backend.call("preview_prompt", JSON.stringify({ project_description: "Descrição X", prompt_template: "Analise: {texto}" })),
+);
+const recovered = JSON.parse(backend.call("recover_fields", JSON.stringify({ project_id: PROJECT })));
+const badRun = JSON.parse(backend.call("start_run", JSON.stringify({ project_id: PROJECT, filter_mode: "random_sample" })));
+
 const runStarted = Date.now();
 await backend.run_job.callPromising("run", jobId, JSON.stringify({ project_id: PROJECT, filter_mode: "all" }));
 const seconds = (Date.now() - runStarted) / 1000;
@@ -216,6 +223,12 @@ const checks = [
   [`paralelismo real (máx. em voo ${maxInFlight})`, PARALLEL === 1 ? maxInFlight === 1 : maxInFlight > 1 && maxInFlight <= PARALLEL],
   ["JWT do coordenador em toda chamada ao banco", db.tokensSeen.size === 1 && db.tokensSeen.has("Bearer jwt-do-coordenador")],
   ["reconciliação da auto-revisão acordada pela Edge Function", db.edgeCalls >= 1],
+  ["prévia do prompt montada pelo _build_prompt do runner", preview.ok && preview.data.prompt.includes("Descrição X")],
+  [
+    "campos recuperados do pydantic_code pelo compile_pydantic",
+    recovered.ok && recovered.data.valid === true && recovered.data.fields.map((f) => f.name).join(",") === "campo_a,campo_b",
+  ],
+  ["validação da rota recusa random_sample sem sample_size", !badRun.ok && badRun.status === 422],
 ];
 console.log(`rodada: ${DOCS} documentos, ${llmCalls} chamadas ao LLM, paralelo ${PARALLEL}, ${seconds.toFixed(1)} s`);
 let failed = 0;
