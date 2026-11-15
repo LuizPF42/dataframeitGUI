@@ -4,6 +4,7 @@ import { createSupabaseServer } from "@/lib/supabase/server";
 import { getAuthUser } from "@/lib/auth";
 import { revalidatePath, revalidateTag } from "next/cache";
 import { fetchFastAPIServer } from "@/lib/api-server";
+import { ApiError } from "@/lib/api";
 import type {
   PydanticField,
   SchemaBaselineIdentity,
@@ -16,9 +17,10 @@ import {
   PROJECT_LOG_FIELD_NAME,
   type SchemaPersistencePlan,
 } from "@/lib/schema-utils";
-import { updateOrThrow } from "@/lib/supabase/rls-guard";
+import { updateOrThrow, ZeroRowsError } from "@/lib/supabase/rls-guard";
 import { resyncProjectCompareAssignments } from "@/lib/compare-assignment-sync";
 import { errorMessage } from "@/lib/utils";
+import { serverErrorCopy, type ServerError, type ServerErrorCopy } from "@/lib/server-error";
 import {
   generateFieldId,
   parsePydanticFields,
@@ -71,12 +73,10 @@ const PERSISTED_SCHEMA_INVALID =
 // permissão". Mesma regra do mapRpcError e da paginação do backfill: o texto do
 // Postgres é diagnóstico de servidor, some do toast, mas não pode sumir do log.
 // Devolve a copy do toast.
-function projectReadFailed(error: { code?: string; message: string }): string {
-  console.error("[schema] leitura do projeto falhou", {
-    code: error.code,
-    message: error.message,
+function projectReadFailed(error: ServerError): string {
+  return serverErrorCopy("[schema] leitura do projeto falhou", error, {
+    generic: "Não foi possível ler o schema do projeto. Tente novamente.",
   });
-  return "Não foi possível ler o schema do projeto. Tente novamente.";
 }
 
 function projectVersion(project: Partial<SchemaProjectRow>): {
@@ -231,11 +231,6 @@ type SchemaCommitRpc =
   | "resolve_schema_suggestion"
   | "apply_schema_backfill";
 
-interface SchemaRpcCopy {
-  generic: string;
-  byCode: Record<string, string>;
-}
-
 // As RAISE EXCEPTION das RPCs são de duas naturezas, e só uma delas interessa ao
 // usuário. Violação de contrato (22023, 23514, 42501: payload malformado, log
 // vazio, salto semver incompatível) um cliente correto não produz — a mensagem
@@ -244,10 +239,9 @@ interface SchemaRpcCopy {
 // descreve uma condição real de negócio e merece copy própria. O mapeamento é
 // por (rpc, código) e não só por código porque P0001 é ambíguo entre as RPCs:
 // significa "sugestão não pendente" numa e "cobertura mudou" na outra.
-const SCHEMA_RPC_COPY: Record<SchemaCommitRpc, SchemaRpcCopy> = {
+const SCHEMA_RPC_COPY: Record<SchemaCommitRpc, ServerErrorCopy> = {
   commit_project_schema: {
     generic: "Não foi possível salvar o schema. Tente novamente.",
-    byCode: {},
   },
   approve_schema_suggestion: {
     generic: "Não foi possível aplicar a sugestão. Tente novamente.",
@@ -266,30 +260,20 @@ const SCHEMA_RPC_COPY: Record<SchemaCommitRpc, SchemaRpcCopy> = {
   },
 };
 
-interface SchemaRpcError {
-  code?: string;
-  message: string;
-}
-
 function mapRpcError(
   rpc: SchemaCommitRpc,
-  error: SchemaRpcError,
+  error: ServerError,
 ): SchemaSaveResult {
-  const copy = SCHEMA_RPC_COPY[rpc];
-  const specific = error.code ? copy.byCode[error.code] : undefined;
-  if (!specific) {
-    console.error(`[schema] ${rpc} falhou`, {
-      code: error.code,
-      message: error.message,
-    });
-  }
-  return { status: "error", message: specific ?? copy.generic };
+  return {
+    status: "error",
+    message: serverErrorCopy(`[schema] ${rpc} falhou`, error, SCHEMA_RPC_COPY[rpc]),
+  };
 }
 
 function mapCommitResult(
   rpc: SchemaCommitRpc,
   data: SchemaCommitRow | null,
-  error: SchemaRpcError | null,
+  error: ServerError | null,
 ): SchemaSaveResult {
   if (error) return mapRpcError(rpc, error);
   if (!data) {
@@ -391,12 +375,29 @@ export async function recoverFieldsFromStoredCode(
     }
     return { fields };
   } catch (e) {
-    return { error: errorMessage(e) || "Erro ao recuperar campos do código" };
+    // O 4xx do backend já vem com copy pt-BR acionável (projeto sem código,
+    // acesso negado). Falha de rede ou 5xx ("fetch failed", "Internal Server
+    // Error") é diagnóstico: vai para o log, e o toast recebe copy pt-BR.
+    if (e instanceof ApiError && e.status < 500) return { error: e.message };
+    return {
+      error: serverErrorCopy(
+        "[schema] recuperação dos campos falhou",
+        { message: errorMessage(e) },
+        { generic: "Não foi possível recuperar os campos do código armazenado. Tente novamente." },
+      ),
+    };
   }
 }
 
 // As actions tratam erros na fronteira: o Next mascara mensagens lançadas em
 // Server Actions em produção, então a copy pt-BR precisa voltar no resultado.
+
+// `updateOrThrow` lança dois tipos de erro: ZeroRowsError, que já traz a copy de
+// permissão do fluxo, e o texto cru do Postgres, que vai para o log.
+function projectUpdateFailed(e: unknown, scope: string, generic: string): string {
+  if (e instanceof ZeroRowsError) return e.message;
+  return serverErrorCopy(scope, { message: errorMessage(e) }, { generic });
+}
 
 export async function savePrompt(
   projectId: string,
@@ -412,7 +413,13 @@ export async function savePrompt(
       { message: "Não foi possível salvar o prompt: sem permissão para alterar este projeto." },
     );
   } catch (e) {
-    return { error: errorMessage(e) || "Erro ao salvar o prompt" };
+    return {
+      error: projectUpdateFailed(
+        e,
+        "[schema] save do prompt falhou",
+        "Não foi possível salvar o prompt. Tente novamente.",
+      ),
+    };
   }
   revalidatePath(`/projects/${projectId}/analyze/code`);
   revalidatePath(`/projects/${projectId}/llm/configure`);
@@ -632,7 +639,7 @@ const BACKFILL_PAGE_SIZE = 500;
 
 interface BackfillPage<T> {
   data: T[] | null;
-  error: { message: string } | null;
+  error: ServerError | null;
 }
 
 async function fetchAllPages<T>(
@@ -650,10 +657,11 @@ async function fetchAllPages<T>(
       // Postgres ao toast pt-BR ("canceling statement due to statement
       // timeout", num projeto grande). Vale a mesma regra do mapRpcError: o
       // texto é diagnóstico de desenvolvedor e vai para o log do servidor.
-      console.error("[schema] paginação do backfill falhou", {
-        message: error.message,
-      });
-      throw new Error(SCHEMA_RPC_COPY.apply_schema_backfill.generic);
+      throw new Error(
+        serverErrorCopy("[schema] paginação do backfill falhou", error, {
+          generic: SCHEMA_RPC_COPY.apply_schema_backfill.generic,
+        }),
+      );
     }
     if (!data || data.length === 0) return rows;
     rows.push(...data);
@@ -704,17 +712,18 @@ async function runBackfill(
 
   const supabase = await createSupabaseServer();
 
-  const [{ data: project, error: projectError }, log, responses] = await Promise.all([
-    supabase
-      .from("projects")
-      .select(
-        "pydantic_fields, schema_version_major, schema_version_minor, schema_version_patch, schema_revision",
-      )
-      .eq("id", projectId)
-      .maybeSingle(),
-    fetchAllLogEntries(supabase, projectId),
-    fetchAllResponses(supabase, projectId),
-  ]);
+  // O projeto vem antes da paginação, e não em paralelo com ela: leitura que
+  // falha, projeto ausente, revisão stale e schema inválido encerram o backfill
+  // sem uso para o log e as respostas — num projeto grande, centenas de páginas
+  // lidas à toa, e uma falha da paginação que vencesse a corrida trocava a
+  // copy da leitura do projeto pela do backfill.
+  const { data: project, error: projectError } = await supabase
+    .from("projects")
+    .select(
+      "pydantic_fields, schema_version_major, schema_version_minor, schema_version_patch, schema_revision",
+    )
+    .eq("id", projectId)
+    .maybeSingle();
 
   if (projectError) throw new Error(projectReadFailed(projectError));
   if (!project) throw new Error("Projeto não encontrado ou sem permissão");
@@ -739,6 +748,11 @@ async function runBackfill(
   if (!persistedFields) {
     return { status: "error", message: PERSISTED_SCHEMA_INVALID };
   }
+
+  const [log, responses] = await Promise.all([
+    fetchAllLogEntries(supabase, projectId),
+    fetchAllResponses(supabase, projectId),
+  ]);
 
   const { enriched, finalVersion } = classifyLogEntries(log);
 
@@ -922,7 +936,13 @@ export async function saveLlmConfig(
         "Não foi possível salvar a configuração do LLM: sem permissão para alterar este projeto.",
     });
   } catch (e) {
-    return { error: errorMessage(e) || "Erro ao salvar a configuração do LLM" };
+    return {
+      error: projectUpdateFailed(
+        e,
+        "[schema] save da configuração do LLM falhou",
+        "Não foi possível salvar a configuração do LLM. Tente novamente.",
+      ),
+    };
   }
   revalidatePath(`/projects/${projectId}/llm/configure`);
   revalidatePath(`/projects/${projectId}/config`);
