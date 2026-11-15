@@ -19,7 +19,7 @@ import { findPrivilegedActions, sourceAliasPlugin } from "./privileged-actions.m
 
 const frontendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const srcDir = path.join(frontendDir, "src");
-const outDir = path.join(frontendDir, "out/edge");
+const defaultOutDir = path.join(frontendDir, "out/edge");
 
 /** Actions do modo hospedado que não existem no estático (conclusão de acesso do Clerk). */
 const NOT_SERVED = new Set(["complete-access"]);
@@ -50,7 +50,8 @@ const requestCachePlugin = {
   },
 };
 
-export async function buildEdgeActions() {
+/** @param {{ outDir?: string }} [options] `outDir` padrão: `out/edge` (testes passam um temporário). */
+export async function buildEdgeActions({ outDir = defaultOutDir } = {}) {
   const privileged = await findPrivilegedActions(srcDir);
   const modules = Object.keys(privileged).filter((module) => !NOT_SERVED.has(module));
   const entry = [
@@ -71,6 +72,11 @@ export async function buildEdgeActions() {
     format: "esm",
     platform: "neutral",
     target: "es2022",
+    // Com os pacotes npm dentro (supabase-js, zod), o arquivo sem minificar
+    // passa de 1,6 MB, perto do teto de 2 MB que a função de setup aceita no
+    // deploy. Nomes preservados para as mensagens de erro do log.
+    minify: true,
+    keepNames: true,
     outfile,
     metafile: true,
     mainFields: ["module", "main"],
@@ -85,7 +91,7 @@ export async function buildEdgeActions() {
         "globalThis.process ??= { env: Deno.env.toObject() };",
       ].join("\n"),
     },
-    plugins: [sourceAliasPlugin(srcDir, EDGE_ALIASES), requestCachePlugin],
+    plugins: [sourceAliasPlugin(srcDir, EDGE_ALIASES, { externalPackages: false }), requestCachePlugin],
     logLevel: "warning",
   });
 

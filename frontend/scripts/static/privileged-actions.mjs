@@ -19,7 +19,11 @@ const toPosix = (p) => p.split(path.sep).join("/").split("\\").join("/");
  * Aplica as trocas do modo estático e resolve `@/x` para `src/x`, como o
  * tsconfig; demais pacotes ficam externos.
  */
-export function sourceAliasPlugin(srcDir, aliases = ANALYSIS_ALIASES) {
+// `externalPackages`: a análise só precisa do grafo de `src`, então pacotes
+// npm ficam de fora. O bundle da Edge Function passa `false`: o Deno do
+// Supabase não resolve especificador sem prefixo ("react", "zod"), e a função
+// é publicada como um arquivo só, sem deno.json.
+export function sourceAliasPlugin(srcDir, aliases = ANALYSIS_ALIASES, { externalPackages = true } = {}) {
   const frontendDir = path.dirname(srcDir);
   return {
     name: "source-alias",
@@ -34,6 +38,7 @@ export function sourceAliasPlugin(srcDir, aliases = ANALYSIS_ALIASES) {
       build.onResolve({ filter: /^@\// }, (args) =>
         build.resolve("./" + args.path.slice(2), { resolveDir: srcDir, kind: args.kind }),
       );
+      if (!externalPackages) return;
       build.onResolve({ filter: /^[^./]/ }, (args) =>
         args.path.startsWith("@/") || args.kind === "entry-point" || path.isAbsolute(args.path)
           ? undefined

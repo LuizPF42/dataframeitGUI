@@ -41,6 +41,7 @@ export const EDGE_ALIASES = {
   "@/lib/supabase/admin": "src/static/edge/supabase-admin.ts",
   "@/lib/api-server": "src/static/edge/api-server.ts",
   "@/lib/clerk-sync": "src/static/edge/clerk-sync-native.ts",
+  "next/navigation": "src/static/edge/next-navigation.ts",
   "next/cache": "src/static/edge/next-cache.ts",
   "next/server": "src/static/edge/next-server.ts",
   "next/headers": "src/static/edge/next-headers.ts",
