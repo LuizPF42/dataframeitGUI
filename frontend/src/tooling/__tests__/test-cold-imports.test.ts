@@ -1,37 +1,20 @@
-import { fileURLToPath } from "node:url";
-
-import { ESLint } from "eslint";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { RULE_NAME } from "../../../eslint-rules/test-cold-imports.mjs";
 import { RULE_NAME as WARM_UP_RULE_NAME } from "../../../eslint-rules/test-jsdom-warm-up.mjs";
+import { frontendEslint, ruleLinter } from "@/test-utils/eslint-rule";
 
-const frontendRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const ruleId = `test-cold-imports/${RULE_NAME}`;
-const eslint = new ESLint({
-  cwd: frontendRoot,
-  overrideConfigFile: "eslint.config.mjs",
-});
-
-async function messagesFor(
-  code: string,
-  filePath = "src/lib/__tests__/example.test.ts",
-) {
-  const [result] = await eslint.lintText(code, { filePath });
-  return result?.messages.filter((message) => message.ruleId === ruleId) ?? [];
-}
-
-async function messageIdsFor(code: string, filePath?: string) {
-  return (await messagesFor(code, filePath)).map((message) => message.messageId);
-}
+const eslint = frontendEslint("eslint.config.mjs");
+const { messagesFor, messageIdsFor, warmUp } = ruleLinter(
+  eslint,
+  ruleId,
+  "src/lib/__tests__/example.test.ts",
+);
+// Os dois describes deste arquivo dependem dela.
+warmUp();
 
 describe("regra de import() a frio em arquivos de teste", () => {
-  // Mesma carga a frio de server-action-exports.test.ts: o primeiro lintText
-  // carrega eslint.config.mjs com o grafo do eslint-config-next.
-  beforeAll(async () => {
-    await messagesFor("export {};");
-  }, 30_000);
-
   it("reprova import() dentro de teste sem carga prévia e nomeia o módulo", async () => {
     const messages = await messagesFor(`
       import { it } from "vitest";
@@ -205,10 +188,14 @@ describe("regra de import() a frio em arquivos de teste", () => {
 // A regra de aquecimento do jsdom tem os testes de comportamento em
 // test-jsdom-warm-up.test.ts, só com ela e sem esta config. Aqui fica o que
 // depende de eslint.config.mjs, porque este arquivo já paga a carga dele no
-// beforeAll acima: a regra ligada nos arquivos de teste, e só neles, e o import
+// warmUp() do topo: a regra ligada nos arquivos de teste, e só neles, e o import
 // só de tipo, que pede o parser de TypeScript da config.
 describe("regra de aquecimento do jsdom na config do ESLint", () => {
-  const warmUpRuleId = `test-jsdom-warm-up/${WARM_UP_RULE_NAME}`;
+  const warmUpLinter = ruleLinter(
+    eslint,
+    `test-jsdom-warm-up/${WARM_UP_RULE_NAME}`,
+    "src/components/__tests__/Example.test.tsx",
+  );
   // Montado por partes, pelo mesmo motivo de test-jsdom-warm-up.test.ts: o
   // literal inteiro faria este arquivo rodar em jsdom.
   const jsdom = `// @vitest-${"environment"} jsdom\n`;
@@ -216,11 +203,8 @@ describe("regra de aquecimento do jsdom na config do ESLint", () => {
   // A severidade entra no resultado porque o lint-types não passa
   // --max-warnings: com a regra rebaixada para "warn", o hook sairia verde.
   async function warmUpMessageIds(code: string, filePath: string) {
-    const [result] = await eslint.lintText(code, { filePath });
-    return (
-      result?.messages
-        .filter((message) => message.ruleId === warmUpRuleId)
-        .map((message) => `${message.messageId}:${message.severity}`) ?? []
+    return (await warmUpLinter.messagesFor(code, filePath)).map(
+      (message) => `${message.messageId}:${message.severity}`,
     );
   }
 
