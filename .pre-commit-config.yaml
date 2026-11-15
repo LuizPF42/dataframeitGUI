@@ -93,13 +93,23 @@ repos:
         pass_filenames: false
         require_serial: true
 
+      # O parser compartilhado pelos dois contratos de Machines abaixo, testado
+      # num fly.toml mínimo nas regras que não dependem de cada app.
+      - id: fly-toml-contract
+        name: fly.toml contract parser
+        entry: .github/scripts/test-fly-toml-contract.sh
+        language: system
+        files: ^\.github/scripts/(test-)?fly-toml-contract\.(py|sh)$
+        pass_filenames: false
+        require_serial: true
+
       # Contrato de custo/disponibilidade do backend no Fly: o workflow só
       # converge de 0/1 para uma Machine e valida tamanho, região e health.
       - id: backend-fly-machine-contract
         name: backend Fly machine contract
         entry: .github/scripts/test-backend-fly-machine-contract.sh
         language: system
-        files: ^(\.github/(workflows/fly-deploy\.yml|scripts/(check|test)-backend-fly-machine.*\.sh)|backend/fly\.toml)$
+        files: ^(\.github/(workflows/fly-deploy\.yml|scripts/((check|test)-backend-fly-machine.*\.sh|fly-toml-contract\.py))|backend/fly\.toml)$
         pass_filenames: false
         require_serial: true
 
@@ -113,7 +123,7 @@ repos:
         name: frontend Fly machine contract
         entry: .github/scripts/test-frontend-fly-machine-contract.sh
         language: system
-        files: ^(\.github/(workflows/frontend-fly-deploy\.yml|scripts/(check|test)-frontend-fly-machine.*\.sh)|frontend/fly\.toml)$
+        files: ^(\.github/(workflows/frontend-fly-deploy\.yml|scripts/((check|test)-frontend-fly-machine.*\.sh|fly-toml-contract\.py))|frontend/fly\.toml)$
         pass_filenames: false
         require_serial: true
 

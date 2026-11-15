@@ -194,60 +194,60 @@ ruby -ryaml -e '
   abort("--ha=false trava a cardinalidade em 1") if runs.any? { |run| run.include?("--ha=false") }
 ' "$workflow"
 
-# A comparação é por linha inteira e sobre o fly.toml já sem comentários: o
-# arquivo documenta em prosa os valores que estas asserções rejeitam (o bloco
-# do always-on cita "min_machines_running = 1" como o valor anterior), então um
-# grep de substring passaria a casar a documentação em vez da diretiva e
-# aprovaria justamente a mudança que deveria barrar. O -Fx também dispensa
-# escapar os metacaracteres de regex que aparecem nos valores. A checagem roda
-# em subshell para que o `exit` reprove só a chamada e os casos vermelhos rodem.
+# Contrato estático do fly.toml, conferido bloco a bloco sobre o TOML parseado
+# (regras e porquês em fly-toml-contract.py, compartilhado com o contrato do
+# backend): o arquivo documenta em prosa valores que estas asserções rejeitam,
+# então a diretiva só conta como chave do bloco que ela nomeia. `[[vm]]` tem de
+# ser um só e ter só estas chaves.
 #
 # Sempre ligada é asserido aqui, e não só documentado no fly.toml: o "stop"
 # tirou o site do ar em 2026-08-10 e o "suspend" em 2026-11-03. Voltar a
-# qualquer um deles tem que passar por esta lista e pela busca abaixo.
+# qualquer um deles tem que passar por esta lista e pela busca de
+# auto_stop_machines em todo bloco.
 expected_directives=(
-  'strategy = "bluegreen"'
-  'auto_stop_machines = "off"'
-  'auto_start_machines = true'
-  'min_machines_running = 2'
-  'size = "shared-cpu-1x"'
-  'memory = "1gb"'
+  '[deploy] strategy = "bluegreen"'
+  '[http_service] auto_stop_machines = "off"'
+  '[http_service] auto_start_machines = true'
+  '[http_service] min_machines_running = 2'
+  '[[vm]] size = "shared-cpu-1x"'
+  '[[vm]] memory = "1gb"'
 )
 
-check_fly_config() (
-  fly_directives="$(sed 's/#.*//; s/[[:space:]]*$//; s/^[[:space:]]*//' "$1")"
-  for directive in "${expected_directives[@]}"; do
-    grep -Fxq "$directive" <<<"$fly_directives" \
-      || { echo "frontend/fly.toml sem a diretiva esperada: $directive" >&2; exit 1; }
-  done
-  # Nenhuma forma de scale-to-zero: "stop" derrubou o site em 2026-08-10 e
-  # "suspend" em 2026-11-03 (motivos no comentário do auto_stop_machines em
-  # frontend/fly.toml). Toda linha de auto_stop_machines, inclusive num bloco
-  # [[services]] separado que a asserção acima não vê, tem de ser "off" ou false.
-  # Lista do que se aceita, e não do que se proíbe: o flyctl também lê 'stop'
-  # (string literal do TOML) e true (o stop legado), e uma lista de proibidos
-  # deixava as duas passarem.
-  if grep -E '^auto_stop_machines[[:space:]]*=' <<<"$fly_directives" \
-    | grep -Evxq 'auto_stop_machines[[:space:]]*=[[:space:]]*("off"|false)'; then
-    echo "frontend/fly.toml com scale-to-zero: todo auto_stop_machines tem de ser \"off\"" >&2
+check_fly_config() {
+  python3 "$repo_root/.github/scripts/fly-toml-contract.py" "$1" "${expected_directives[@]}"
+}
+
+# Caso vermelho do contrato: reprova, e pela mensagem do contrato
+# ("<arquivo>: ..."), para que um traceback do script não passe por recusa.
+expect_contract_failure() {
+  local output
+  if output="$(check_fly_config "$1" 2>&1)"; then
+    echo "o contrato deveria reprovar $1" >&2
     exit 1
   fi
-)
+  [[ $output == "$1: "* ]] || { printf 'o contrato reprovou %s sem a própria mensagem:\n%s\n' "$1" "$output" >&2; exit 1; }
+}
 
 check_fly_config "$fly_config"
 
-# Casos vermelhos: cada diretiva esperada que sobra só num comentário reprova
-# (um grep de substring a aprovaria), e um scale-to-zero num bloco separado
-# também. O awk normaliza a linha como o sed acima para achar a diretiva.
+# Casos vermelhos de cada diretiva. As regras que não dependem deste arquivo
+# (tipo, [[vm]] a mais e seus aliases, scale-to-zero em outro bloco, TOML
+# inválido, `#` dentro de string) estão em test-fly-toml-contract.sh. O awk
+# acha a linha da diretiva normalizando-a (sem comentário e sem indentação;
+# nenhuma diretiva esperada tem `#`).
 mutated_config="$tmp_dir/fly.toml"
-for directive in "${expected_directives[@]}"; do
-  awk -v d="$directive" '{ t = $0; sub(/#.*/, "", t); gsub(/^[[:space:]]+|[[:space:]]+$/, "", t); print (t == d ? "# " : "") $0 }' \
-    "$fly_config" >"$mutated_config"
-  expect_failure check_fly_config "$mutated_config"
-done
-for scale_to_zero in '"stop"' "'stop'" '"suspend"' true; do
-  { cat "$fly_config"; printf '\n[[services]]\n  auto_stop_machines = %s\n' "$scale_to_zero"; } >"$mutated_config"
-  expect_failure check_fly_config "$mutated_config"
+for entry in "${expected_directives[@]}"; do
+  directive="${entry#* }"
+  line="$(awk -v d="$directive" '{ t = $0; sub(/#.*/, "", t); gsub(/^[[:space:]]+|[[:space:]]+$/, "", t) } t == d { print NR; exit }' "$fly_config")"
+  [[ -n $line ]] || { echo "$fly_config sem a linha $directive" >&2; exit 1; }
+  # A diretiva que sobra só num comentário reprova (um grep de substring a
+  # aprovaria)...
+  sed "${line}s/^/# /" "$fly_config" >"$mutated_config"
+  expect_contract_failure "$mutated_config"
+  # ...e a que sai do bloco certo também: aqui ela vai para a raiz do arquivo,
+  # onde o Fly não a lê, e a linha continua idêntica.
+  { printf '%s\n' "$directive"; sed "${line}d" "$fly_config"; } >"$mutated_config"
+  expect_contract_failure "$mutated_config"
 done
 
 echo "Contrato de Machines do frontend validado."
