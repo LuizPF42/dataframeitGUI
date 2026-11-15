@@ -67,6 +67,18 @@ const SCHEMA_PROJECT_SELECT =
 const PERSISTED_SCHEMA_INVALID =
   "O schema persistido é inválido e precisa ser corrigido antes da edição.";
 
+// Falha de query — timeout num projeto grande, conexão caída — não é "sem
+// permissão". Mesma regra do mapRpcError e da paginação do backfill: o texto do
+// Postgres é diagnóstico de servidor, some do toast, mas não pode sumir do log.
+// Devolve a copy do toast.
+function projectReadFailed(error: { code?: string; message: string }): string {
+  console.error("[schema] leitura do projeto falhou", {
+    code: error.code,
+    message: error.message,
+  });
+  return "Não foi possível ler o schema do projeto. Tente novamente.";
+}
+
 function projectVersion(project: Partial<SchemaProjectRow>): {
   major: number;
   minor: number;
@@ -136,19 +148,11 @@ async function loadSchemaSaveContext(
     .select(SCHEMA_PROJECT_SELECT)
     .eq("id", projectId)
     .maybeSingle();
-  // Falha de query — timeout num projeto grande, conexão caída — não é "sem
-  // permissão". Mesma regra do mapRpcError e da paginação do backfill: o texto
-  // do Postgres é diagnóstico de servidor, some do toast, mas não pode sumir do
-  // log.
   if (error) {
-    console.error("[schema] leitura do projeto falhou", {
-      code: error.code,
-      message: error.message,
-    });
     return {
       result: {
         status: "error",
-        message: "Não foi possível ler o schema do projeto. Tente novamente.",
+        message: projectReadFailed(error),
       },
     };
   }
@@ -437,15 +441,22 @@ type PreparedSchema =
   | { unchanged: true }
   | { result: SchemaSaveResult };
 
+const MAX_TOASTED_ERRORS = 3;
+
 function prepareSchemaCommit(
   fields: PydanticField[],
   context: SchemaSaveContext,
 ): PreparedSchema {
-  const parsedFields = parseSaveablePydanticFields(fields);
+  const { fields: parsedFields, errors } = parseSaveablePydanticFields(fields);
   if (!parsedFields) {
+    // As mensagens nomeiam o campo culpado: pelo EditFieldDialog, quem salva
+    // editou outro campo e não teria como achar o legado inválido (#502). O
+    // teto mantém o toast legível num projeto legado com muitos campos ruins.
+    const shown = errors.slice(0, MAX_TOASTED_ERRORS).join("; ");
+    const hidden = errors.length - MAX_TOASTED_ERRORS;
     return { result: {
       status: "error",
-      message: "O schema enviado é inválido. Revise os campos e tente novamente.",
+      message: `O schema enviado é inválido. ${shown}${hidden > 0 ? ` (e mais ${hidden})` : ""}`,
     } };
   }
   const plan = planSchemaPersistence(
@@ -693,18 +704,19 @@ async function runBackfill(
 
   const supabase = await createSupabaseServer();
 
-  const [{ data: project }, log, responses] = await Promise.all([
+  const [{ data: project, error: projectError }, log, responses] = await Promise.all([
     supabase
       .from("projects")
       .select(
         "pydantic_fields, schema_version_major, schema_version_minor, schema_version_patch, schema_revision",
       )
       .eq("id", projectId)
-      .single(),
+      .maybeSingle(),
     fetchAllLogEntries(supabase, projectId),
     fetchAllResponses(supabase, projectId),
   ]);
 
+  if (projectError) throw new Error(projectReadFailed(projectError));
   if (!project) throw new Error("Projeto não encontrado ou sem permissão");
 
   // O CAS compara contra a revisão que a ABA observou, como em
