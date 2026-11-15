@@ -53,6 +53,9 @@ vi.mock("@/components/llm/DocumentSelector", () => ({
 }));
 
 import { RunCard } from "@/components/llm/RunCard";
+import { saveLlmConfig, savePrompt } from "@/actions/schema";
+import { toast } from "sonner";
+import { maskedServerError } from "@/test-utils/masked-server-error";
 
 const props = {
   projectId: "00000000-0000-4000-8000-000000000001",
@@ -161,5 +164,34 @@ describe("RunCard — limites dos filtros", () => {
       aboveLimit: "1001",
       limitLabel: "1.000",
     });
+  });
+});
+
+describe("RunCard — exceção da Server Action (#653)", () => {
+  it("toast em pt-BR com o código do erro, e não a mensagem mascarada pelo Next", async () => {
+    vi.mocked(saveLlmConfig).mockRejectedValueOnce(maskedServerError());
+    render(<RunCard {...props} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Salvar configuração" }));
+
+    await vi.waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Erro ao salvar configuração — código 1bkm1w6",
+      ),
+    );
+  });
+
+  it("ao rodar, o save prévio (Server Action) que lança também vira toast com código", async () => {
+    vi.mocked(savePrompt).mockRejectedValueOnce(maskedServerError());
+    render(<RunCard {...props} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Rodar LLM" }));
+
+    await vi.waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Erro ao iniciar execução — código 1bkm1w6",
+      ),
+    );
+    expect(fetchFastAPI).not.toHaveBeenCalled();
   });
 });
