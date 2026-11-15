@@ -68,6 +68,13 @@ beforeAll(() => {
   return warmUpJsdom({ select: true });
 }, 30_000);
 
+// Carga a frio fora do primeiro teste (eslint-rules/test-cold-imports.mjs). O
+// `import("exceljs")` do download está no componente, onde a regra não olha:
+// frio, dentro do teste, ele estourava os 5 s com a suíte disputando a CPU.
+beforeAll(async () => {
+  await import("exceljs");
+}, 30_000);
+
 afterEach(cleanup);
 beforeEach(() => {
   hoisted.getAutoReviewVerdicts.mockReset();
@@ -148,7 +155,9 @@ describe("AutoReviewVerdictsExportCard", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /Baixar XLSX/ }));
 
-    await waitFor(() => expect(hoisted.downloadBlob).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    // Abaixo do prazo de 5 s do teste, para a lentidão falhar nesta asserção,
+    // com mensagem, e não como timeout genérico do teste.
+    await waitFor(() => expect(hoisted.downloadBlob).toHaveBeenCalledTimes(1), { timeout: 4_000 });
     const [blob, filename] = hoisted.downloadBlob.mock.calls[0] as [Blob, string];
     expect(filename).toMatch(/^Proj-vereditos-auto-revisao-.+\.xlsx$/);
     expect(blob.size).toBeGreaterThan(0);
