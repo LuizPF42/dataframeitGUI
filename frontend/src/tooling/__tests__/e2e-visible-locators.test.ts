@@ -2,6 +2,7 @@ import type { ESLint } from "eslint";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import {
+  DOM_QUERY_APIS,
   HIDDEN_INSENSITIVE_LOCATORS,
   LEGACY_SELECTOR_APIS,
 } from "../../../eslint-rules/e2e-visible-locators.mjs";
@@ -103,6 +104,18 @@ describe("regra de locators visíveis nos specs E2E", () => {
       "html filtrado por visivel()",
       `visivel(page.locator(" html ")).locator("p");`,
     ],
+    [
+      "seletor do DOM em waitForFunction",
+      `await page.waitForFunction(() => document.querySelectorAll("p").length > 2);`,
+    ],
+    [
+      "window.document em evaluateHandle",
+      `await page.evaluateHandle(() => window.document.querySelector("p"));`,
+    ],
+    [
+      "seletor do DOM em helper passado ao evaluate",
+      `const box = (s: string) => document.querySelector(s); await page.evaluate(box, "p");`,
+    ],
   ])("bloqueia %s", async (_caseName, body) => {
     const messages = await messagesFor(
       `${prelude}\ntest("x", async ({ page, context }) => { ${body} });`,
@@ -137,6 +150,32 @@ describe("regra de locators visíveis nos specs E2E", () => {
 
     expect(messages).toHaveLength(1);
     expect(messages[0]?.message).toContain("includeHidden");
+  });
+
+  // O callback roda no navegador, onde visivel() não alcança: um seletor do DOM
+  // ali pega a primeira cópia, que pode ser a órfã do Suspense (desvio do #862).
+  it.each(DOM_QUERY_APIS)(
+    "bloqueia document.%s no callback de evaluate",
+    async (api) => {
+      const messages = await messagesFor(
+        `${prelude}\ntest("x", async ({ page }) => { await page.evaluate(() => document.${api}("a")); });`,
+      );
+
+      expect(messages).toHaveLength(1);
+      expect(messages[0]?.message).toContain("roda no navegador");
+    },
+  );
+
+  it("permite evaluate que não consulta o DOM por seletor", async () => {
+    await expect(
+      messagesFor(`${prelude}
+        test("x", async ({ page }) => {
+          await page.evaluate((key) => localStorage.getItem(key), "k");
+          await page.evaluate(() => document.dispatchEvent(new Event("x")));
+          await visivel(page.getByText("a")).evaluate((el) => el.querySelector("p"));
+        });
+      `),
+    ).resolves.toEqual([]);
   });
 
   // Sem type-checker, a página é reconhecida pelo nome; estes casos provam que

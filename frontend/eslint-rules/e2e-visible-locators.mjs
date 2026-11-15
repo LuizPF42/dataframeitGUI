@@ -51,3 +51,16 @@ export const LEGACY_SELECTOR_APIS = [
   "uncheck",
   "waitForSelector",
 ];
+
+// Consultas do DOM por seletor, id, classe ou tag: devolvem as cópias na ordem
+// do documento, a órfã do Suspense inclusive. Num spec, `document` só existe no
+// código que roda no navegador (evaluate, waitForFunction), fora do alcance de
+// visivel().
+export const DOM_QUERY_APIS = [
+  "getElementById",
+  "getElementsByClassName",
+  "getElementsByName",
+  "getElementsByTagName",
+  "querySelector",
+  "querySelectorAll",
+];

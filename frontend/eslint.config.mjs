@@ -14,6 +14,7 @@ import {
   testJsdomWarmUpPlugin,
 } from "./eslint-rules/test-jsdom-warm-up.mjs";
 import {
+  DOM_QUERY_APIS,
   HIDDEN_INSENSITIVE_LOCATORS,
   LEGACY_SELECTOR_APIS,
 } from "./eslint-rules/e2e-visible-locators.mjs";
@@ -80,6 +81,15 @@ const e2eLocatorRules = [
       'CallExpression[callee.property.name="locator"][arguments.0.value=/^\\s*(html|body|:root)\\s*$/]',
     message:
       "body e html contêm a cópia oculta de um segmento de Suspense, mesmo filtrados por visivel(). Parta de getByRole (main, dialog) ou de um locator mais específico.",
+  },
+  // Heurística sintática: pega `document.x(...)` e `window.document.x(...)`.
+  // Escapam o `document` guardado em variável, a expressão em string, a
+  // consulta a partir de `document.body` e a navegação pelo DOM
+  // (`document.body.children[...]`).
+  {
+    selector: `CallExpression:matches([callee.object.name="document"], [callee.object.property.name="document"])[callee.property.name=/^(${DOM_QUERY_APIS.join("|")})$/]`,
+    message:
+      "Consulta do DOM roda no navegador (evaluate, waitForFunction), fora do alcance de visivel(), e pega a primeira cópia, que pode ser a órfã de um segmento de Suspense. Ache o elemento com um locator em visivel() e chame evaluate/evaluateAll nele (ver e2e/compare-split-layout.smoke.spec.ts).",
   },
   {
     selector:
