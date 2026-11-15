@@ -146,8 +146,13 @@ cc(u, k, { auth: { autoRefreshToken: false, persistSession: false } });`),
   });
 
   it("nenhum módulo em src cria cliente com o timer ligado", () => {
+    // Única exceção: o cliente do site estático (GitHub Pages). Ele só roda no
+    // navegador, é um por aba e precisa renovar a sessão do Supabase Auth —
+    // sem servidor nenhum para acumular clientes.
+    const browserOnly = new Set([path.join(SRC_ROOT, "static", "runtime", "supabase.ts")]);
     const violations: string[] = [];
     for (const file of sourceFiles(SRC_ROOT)) {
+      if (browserOnly.has(file)) continue;
       const text = fs.readFileSync(file, "utf8");
       if (!text.includes("@supabase/supabase-js")) continue;
       for (const line of callsWithTimerOn(parseText(text))) {
