@@ -23,7 +23,7 @@ import {
   type ValueEquivalence,
   type ValueEquivalencesByField,
 } from "@/lib/equivalence";
-import { isFieldApplicable } from "@/lib/compare-divergence";
+import { isComparedField, isFieldApplicable } from "@/lib/compare-divergence";
 import { isFieldVisible } from "@/lib/conditional";
 import type { AutoReviewProvenance } from "@/lib/llm-error-metrics";
 import { formatExportValue, formatVerdict } from "./format";
@@ -589,7 +589,7 @@ function uncodedCell(field: PydanticField, applicable: DocResponses, fillFromLlm
 // O que decide o motivo de uma célula que ficou sem consenso.
 interface PendingSignals {
   researchersDiverge: boolean;
-  /** O campo entra na Comparação, que não examina `human_only`. */
+  /** O campo entra na Comparação (`isComparedField`). */
   inComparison: boolean;
   fewResponses: boolean;
 }
@@ -606,8 +606,9 @@ function pendingSignals(
     researchersDiverge: applicable.humans.length >= 2 && !agree(applicable.humans),
     // A regra de `computeDivergentFieldNames` pede também duas ou mais
     // respostas que contam e divergem; os dois usos em `pendingReason` já
-    // garantem isso (pesquisadores divergentes, ou `fewResponses` falso).
-    inComparison: field.target !== "human_only",
+    // garantem isso (pesquisadores divergentes, ou `fewResponses` falso). O
+    // campo em si sai do mesmo predicado da fila e do gabarito.
+    inComparison: isComparedField(field),
     // As que contam concordam e mesmo assim não fizeram consenso, então só o
     // piso `minResponses` as barrou; ou o documento todo fica abaixo do piso
     // sem dois pesquisadores.
@@ -632,8 +633,8 @@ function pendingReason(docId: string, fieldName: string, ctx: CellContext, signa
   return arbitrationReason(docId, ctx, signals.inComparison);
 }
 
-// Quando a regra da Comparação não vê a divergência (campo `human_only`),
-// ninguém vai arbitrar. Quando vê, a divergência só tem quem a arbitre se o
+// Quando a regra da Comparação não vê a divergência (campo fora de
+// `isComparedField`), ninguém vai arbitrar. Quando vê, a divergência só tem quem a arbitre se o
 // documento tem atribuição de comparação na rodada atual.
 function arbitrationReason(docId: string, ctx: CellContext, inComparison: boolean): string {
   if (!inComparison) return PENDING_REASON.uncompared;
