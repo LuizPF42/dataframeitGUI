@@ -1,5 +1,5 @@
 import { beforeAll, describe, it, expect, vi, beforeEach } from "vitest";
-import { revalidatePath, revalidateTag } from "next/cache";
+import { revalidatePath } from "next/cache";
 import { isCodingComplete } from "@/lib/coding-completeness";
 import { responseQualifiesForVersion } from "@/lib/compare-version";
 import type { VersionedResponse } from "@/lib/compare-version";
@@ -16,7 +16,6 @@ const drainAutoReviewReconciliationRequests = vi.hoisted(() => vi.fn(async () =>
 // Mocks precisam ser declarados antes do import dinamico do modulo sob teste.
 vi.mock("next/cache", () => ({
   revalidatePath: vi.fn(),
-  revalidateTag: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -88,7 +87,6 @@ beforeEach(() => {
     automationMode: null,
   };
   vi.mocked(revalidatePath).mockClear();
-  vi.mocked(revalidateTag).mockClear();
   drainAutoReviewReconciliationRequests.mockClear();
 });
 
@@ -645,13 +643,12 @@ describe("saveResponse — gravação pelo envio explícito", () => {
     expect(state.assignmentUpdatePayload).toBeNull();
   });
 
-  it("o envio dispara revalidatePath e revalidateTag das rotas relevantes", async () => {
+  it("o envio dispara revalidatePath das rotas relevantes", async () => {
     const saveResponse = await loadSaveResponse();
     await saveResponse("proj-1", "doc-1", { q1: "a" });
     expect(revalidatePath).toHaveBeenCalledWith("/projects/proj-1/analyze/code");
     expect(revalidatePath).toHaveBeenCalledWith("/projects/proj-1/analyze/compare");
     expect(revalidatePath).toHaveBeenCalledWith("/projects/proj-1/reviews");
-    expect(revalidateTag).toHaveBeenCalledWith("project-proj-1-progress", { expire: 60 });
   });
 
   it("opts.notes serializa em justifications._notes", async () => {

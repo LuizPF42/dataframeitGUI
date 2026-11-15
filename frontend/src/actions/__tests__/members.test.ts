@@ -66,7 +66,6 @@ let adminCreateCalls: number;
 
 const hoisted = vi.hoisted(() => ({
   revalidatePath: vi.fn<(path: string) => void>(),
-  revalidateTag: vi.fn<(tag: string, profile: unknown) => void>(),
   retry: vi.fn<
     (projectId: string) => Promise<{
       success: boolean;
@@ -120,7 +119,6 @@ const hoisted = vi.hoisted(() => ({
 
 vi.mock("next/cache", () => ({
   revalidatePath: hoisted.revalidatePath,
-  revalidateTag: hoisted.revalidateTag,
 }));
 vi.mock("@/lib/auth", () => ({
   requireCoordinator: hoisted.requireCoordinator,
@@ -189,7 +187,6 @@ beforeEach(() => {
     error: null,
   });
   hoisted.revalidatePath.mockReset();
-  hoisted.revalidateTag.mockReset();
   hoisted.retry.mockReset();
   hoisted.retry.mockResolvedValue({
     success: true,
@@ -286,10 +283,6 @@ describe("removeMember", () => {
     expect(writeCalls).toEqual([]);
     expect(hoisted.revalidatePath).toHaveBeenCalledWith(
       "/projects/p-canonical",
-    );
-    expect(hoisted.revalidateTag).toHaveBeenCalledWith(
-      "project-p-canonical-members",
-      expect.anything(),
     );
   });
 
@@ -846,7 +839,6 @@ describe("addMember (pré-registro de membro sem conta)", () => {
     });
     expectLogged("insert indisponível");
     expect(hoisted.revalidatePath).not.toHaveBeenCalled();
-    expect(hoisted.revalidateTag).not.toHaveBeenCalled();
   });
 
   it("membership do profile administrativo bloqueia duplicação antes da reconciliação", async () => {
@@ -1865,10 +1857,6 @@ describe("unifyMembers", () => {
     expect(hoisted.revalidatePath).toHaveBeenCalledWith(
       "/projects/p1/analyze/assignments",
     );
-    expect(hoisted.revalidateTag).toHaveBeenCalledWith(
-      "project-p1-members",
-      expect.anything(),
-    );
   });
 
   it("pré-registro pendente sem conta Clerk pode ser unificado pelo próprio e-mail", async () => {
@@ -2142,6 +2130,5 @@ describe("unifyMembers", () => {
       await unifyMembers("p1", "source", "target", "source@example.com"),
     ).toEqual({ error: "conflito concorrente" });
     expect(hoisted.revalidatePath).not.toHaveBeenCalled();
-    expect(hoisted.revalidateTag).not.toHaveBeenCalled();
   });
 });
