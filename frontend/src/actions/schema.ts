@@ -17,10 +17,10 @@ import {
   PROJECT_LOG_FIELD_NAME,
   type SchemaPersistencePlan,
 } from "@/lib/schema-utils";
-import { updateOrThrow, ZeroRowsError } from "@/lib/supabase/rls-guard";
+import { guardErrorCopy, updateOrThrow } from "@/lib/supabase/rls-guard";
 import { resyncProjectCompareAssignments } from "@/lib/compare-assignment-sync";
 import { errorMessage } from "@/lib/utils";
-import { serverErrorCopy, type ServerError, type ServerErrorCopy } from "@/lib/server-error";
+import { caughtErrorCopy, serverErrorCopy, type ServerError, type ServerErrorCopy } from "@/lib/server-error";
 import {
   generateFieldId,
   parsePydanticFields,
@@ -376,28 +376,17 @@ export async function recoverFieldsFromStoredCode(
     return { fields };
   } catch (e) {
     // O 4xx do backend já vem com copy pt-BR acionável (projeto sem código,
-    // acesso negado). Falha de rede ou 5xx ("fetch failed", "Internal Server
-    // Error") é diagnóstico: vai para o log, e o toast recebe copy pt-BR.
-    if (e instanceof ApiError && e.status < 500) return { error: e.message };
-    return {
-      error: serverErrorCopy(
-        "[schema] recuperação dos campos falhou",
-        { message: errorMessage(e) },
-        { generic: "Não foi possível recuperar os campos do código armazenado. Tente novamente." },
-      ),
-    };
+    // acesso negado). O 5xx o fetchFastAPI já levou ao log, com status e
+    // detail; falha de rede ("fetch failed") é diagnóstico que ainda não foi.
+    // Os dois dão a copy pt-BR do fluxo.
+    const generic = "Não foi possível recuperar os campos do código armazenado. Tente novamente.";
+    if (e instanceof ApiError) return { error: e.status < 500 ? e.message : generic };
+    return { error: caughtErrorCopy("[schema] recuperação dos campos falhou", e, generic) };
   }
 }
 
 // As actions tratam erros na fronteira: o Next mascara mensagens lançadas em
 // Server Actions em produção, então a copy pt-BR precisa voltar no resultado.
-
-// `updateOrThrow` lança dois tipos de erro: ZeroRowsError, que já traz a copy de
-// permissão do fluxo, e o texto cru do Postgres, que vai para o log.
-function projectUpdateFailed(e: unknown, scope: string, generic: string): string {
-  if (e instanceof ZeroRowsError) return e.message;
-  return serverErrorCopy(scope, { message: errorMessage(e) }, { generic });
-}
 
 export async function savePrompt(
   projectId: string,
@@ -414,7 +403,7 @@ export async function savePrompt(
     );
   } catch (e) {
     return {
-      error: projectUpdateFailed(
+      error: guardErrorCopy(
         e,
         "[schema] save do prompt falhou",
         "Não foi possível salvar o prompt. Tente novamente.",
@@ -621,6 +610,11 @@ export type BackfillSchemaResult =
   | { status: "conflict"; current: SchemaSnapshot }
   | { status: "error"; message: string };
 
+// Falha da paginação, que o fetchAllPages já levou ao log e cuja mensagem é a
+// copy pt-BR do toast. O resto que o runBackfill lança é exceção inesperada: o
+// texto vai para o log, não ao usuário.
+class BackfillFailure extends Error {}
+
 export async function backfillSchemaVersionHistory(
   projectId: string,
   expectedBaseline: SchemaBaselineIdentity,
@@ -628,9 +622,14 @@ export async function backfillSchemaVersionHistory(
   try {
     return await runBackfill(projectId, expectedBaseline);
   } catch (e) {
+    if (e instanceof BackfillFailure) return { status: "error", message: e.message };
     return {
       status: "error",
-      message: errorMessage(e) || "Erro ao reconstruir o histórico de versões",
+      message: caughtErrorCopy(
+        "[schema] backfill falhou",
+        e,
+        SCHEMA_RPC_COPY.apply_schema_backfill.generic,
+      ),
     };
   }
 }
@@ -657,7 +656,7 @@ async function fetchAllPages<T>(
       // Postgres ao toast pt-BR ("canceling statement due to statement
       // timeout", num projeto grande). Vale a mesma regra do mapRpcError: o
       // texto é diagnóstico de desenvolvedor e vai para o log do servidor.
-      throw new Error(
+      throw new BackfillFailure(
         serverErrorCopy("[schema] paginação do backfill falhou", error, {
           generic: SCHEMA_RPC_COPY.apply_schema_backfill.generic,
         }),
@@ -708,7 +707,7 @@ async function runBackfill(
   expectedBaseline: SchemaBaselineIdentity,
 ): Promise<BackfillSchemaResult> {
   const user = await getAuthUser();
-  if (!user) throw new Error("Não autenticado");
+  if (!user) return { status: "error", message: "Não autenticado" };
 
   const supabase = await createSupabaseServer();
 
@@ -725,8 +724,8 @@ async function runBackfill(
     .eq("id", projectId)
     .maybeSingle();
 
-  if (projectError) throw new Error(projectReadFailed(projectError));
-  if (!project) throw new Error("Projeto não encontrado ou sem permissão");
+  if (projectError) return { status: "error", message: projectReadFailed(projectError) };
+  if (!project) return { status: "error", message: "Projeto não encontrado ou sem permissão" };
 
   // O CAS compara contra a revisão que a ABA observou, como em
   // publishMajorVersion — não contra a leitura fresca deste request. Ler o
@@ -937,7 +936,7 @@ export async function saveLlmConfig(
     });
   } catch (e) {
     return {
-      error: projectUpdateFailed(
+      error: guardErrorCopy(
         e,
         "[schema] save da configuração do LLM falhou",
         "Não foi possível salvar a configuração do LLM. Tente novamente.",

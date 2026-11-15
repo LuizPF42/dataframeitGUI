@@ -662,6 +662,39 @@ describe("backfillSchemaVersionHistory", () => {
     consoleError.mockRestore();
   });
 
+  // Exceção inesperada (bug, linha malformada, rede) ia crua ao toast pt-BR,
+  // com o texto do runtime em inglês: vai para o log, e o toast recebe a copy.
+  it("exceção inesperada não chega crua ao toast", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    state.tables = {
+      projects: {
+        data: {
+          pydantic_fields: [FIELD],
+          schema_version_major: 0,
+          schema_version_minor: 1,
+          schema_version_patch: 0,
+          schema_revision: 3,
+        },
+      },
+      schema_change_log: { data: [] },
+      // Linha nula: o casamento de versões lê propriedade de null e lança TypeError.
+      responses: { data: [null] },
+    };
+
+    const result = await backfillSchemaVersionHistory("p1", { revision: 3 });
+
+    expect(result).toEqual({
+      status: "error",
+      message: "Não foi possível reconstruir o histórico. Tente novamente.",
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      "[schema] backfill falhou",
+      expect.objectContaining({ message: expect.stringMatching(/null/) }),
+    );
+    expect(state.rpcs).toHaveLength(0);
+    consoleError.mockRestore();
+  });
+
   it("projeto ausente ou filtrado pela RLS mantém a copy de permissão", async () => {
     state.tables = {
       projects: { data: null },
@@ -758,7 +791,9 @@ describe("erro de servidor não chega cru ao toast", () => {
     expect(result).toEqual({ error: copy });
     expect(consoleError).toHaveBeenCalledWith(
       expect.stringContaining("falhou"),
-      expect.objectContaining({ message: postgresError.message }),
+      // O `code` do Postgres é o que diferencia timeout de violação no log:
+      // `updateOrThrow` o descartava, e o log saía com `code: undefined`.
+      expect.objectContaining({ code: postgresError.code, message: postgresError.message }),
     );
     consoleError.mockRestore();
   });
@@ -774,11 +809,9 @@ describe("erro de servidor não chega cru ao toast", () => {
     expect(result).toEqual({ error: "Projeto não possui código Pydantic armazenado" });
   });
 
-  it.each([
-    ["5xx", new ApiError("Internal Server Error", 500)],
-    ["falha de rede", new TypeError("fetch failed")],
-  ])("recoverFieldsFromStoredCode com %s loga e devolve copy pt-BR", async (_, failure) => {
+  it("recoverFieldsFromStoredCode com falha de rede loga e devolve copy pt-BR", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const failure = new TypeError("fetch failed");
     fetchMock.mockRejectedValueOnce(failure);
 
     const result = await recoverFieldsFromStoredCode("p1");
@@ -790,6 +823,23 @@ describe("erro de servidor não chega cru ao toast", () => {
       "[schema] recuperação dos campos falhou",
       expect.objectContaining({ message: failure.message }),
     );
+    consoleError.mockRestore();
+  });
+
+  // O 5xx já foi para o log no fetchFastAPI, com o status e o detail; a
+  // mensagem do ApiError aqui é a copy dele, e logá-la de novo só duplica.
+  it("recoverFieldsFromStoredCode com 5xx devolve copy pt-BR sem logar de novo", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockRejectedValueOnce(
+      new ApiError("Erro no servidor (HTTP 502). Tente novamente.", 502),
+    );
+
+    const result = await recoverFieldsFromStoredCode("p1");
+
+    expect(result).toEqual({
+      error: "Não foi possível recuperar os campos do código armazenado. Tente novamente.",
+    });
+    expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
 });

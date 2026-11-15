@@ -13,6 +13,18 @@ import { retryPendingArbitrations } from "@/actions/field-reviews";
 import { retryPendingComparisons } from "@/actions/comparisons";
 import { revalidatePath, revalidateTag } from "next/cache";
 import { MEMBERS_TAG_PROFILE as TAG_PROFILE } from "@/lib/cache";
+import { serverErrorCopy, serverErrorScope, type ServerError } from "@/lib/server-error";
+
+// Erro do Postgres, PostgREST ou Auth: o texto é diagnóstico em inglês e vai
+// para o log; o toast recebe a copy pt-BR do fluxo (#502).
+const IDENTITY_COPY = "Não foi possível verificar a identidade do membro. Tente novamente.";
+const ADD_COPY = "Não foi possível adicionar o membro. Tente novamente.";
+const EMAIL_UPDATE_COPY = "Não foi possível atualizar o e-mail. Tente novamente.";
+const PERMISSION_COPY = "Não foi possível alterar a permissão do membro. Tente novamente.";
+const EMAIL_LINK_COPY = "Não foi possível atualizar o vínculo de e-mail. Tente novamente.";
+const UNIFY_COPY = "Não foi possível preparar a unificação dos membros. Tente novamente.";
+
+const memberServerError = serverErrorScope("members");
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -50,7 +62,7 @@ async function classifyProfileIdentity(
     .select("supabase_user_id")
     .eq("supabase_user_id", profile.id)
     .maybeSingle();
-  if (error) return { status: "error", error: error.message };
+  if (error) return { status: "error", error: memberServerError("leitura da identidade", error, IDENTITY_COPY) };
   return { status: "classified", state: data ? "mapped" : "claimable" };
 }
 
@@ -131,7 +143,7 @@ async function resolveCurrentClerkMemberIdentity(
   ]);
   const error =
     profileResult.error ?? membershipResult.error ?? linkResult.error;
-  if (error) return { status: "error", error: error.message };
+  if (error) return { status: "error", error: memberServerError("leitura da identidade", error, IDENTITY_COPY) };
   if (!profileResult.data) {
     return {
       status: "error",
@@ -188,9 +200,15 @@ async function resolvePendingMemberIdentity(
       email,
       error,
     });
-    const message =
-      error instanceof Error ? error.message : "Erro desconhecido";
-    return { status: "error", error: `Erro ao pré-registrar: ${message}` };
+    // Conflito estrutural (e-mail ativado ou reclamado no meio do caminho)
+    // não melhora com insistência: a mensagem própria diz o que está no caminho.
+    if (error instanceof ClerkIdentityConflictError) {
+      return { status: "error", error: error.message };
+    }
+    return {
+      status: "error",
+      error: "Não foi possível pré-registrar o membro. Tente novamente.",
+    };
   }
 }
 
@@ -217,7 +235,7 @@ async function classifyPendingAddMemberProfile(
     classifyProfileIdentity(admin, emailProfile),
   ]);
   if (membershipResult.error) {
-    return { status: "error", error: membershipResult.error.message };
+    return { status: "error", error: memberServerError("leitura da membership", membershipResult.error, ADD_COPY) };
   }
   if (identityState.status === "error") return identityState;
   if (membershipResult.data) {
@@ -250,7 +268,7 @@ async function loadAddMemberLocalState(
       .maybeSingle(),
   ]);
   const lookupError = emailProfileResult.error ?? linkedToResult.error;
-  if (lookupError) return { status: "error", error: lookupError.message };
+  if (lookupError) return { status: "error", error: memberServerError("leitura do e-mail", lookupError, ADD_COPY) };
   if (linkedToResult.data) {
     return {
       status: "error",
@@ -330,7 +348,7 @@ export async function addMember(
     if (error.code === "40001") {
       return { error: "A posse verificada do e-mail mudou. Tente novamente." };
     }
-    return { error: error.message };
+    return { error: memberServerError("inserção do membro", error, ADD_COPY) };
   }
 
   revalidatePath(`/projects/${projectId}`);
@@ -398,7 +416,7 @@ export async function updatePendingMemberEmail(
     emailOwnerResult.error ??
     emailLinkResult.error ??
     resolvedAliasResult.error;
-  if (lookupError) return { error: lookupError.message };
+  if (lookupError) return { error: memberServerError("leitura do e-mail pendente", lookupError, EMAIL_UPDATE_COPY) };
   const membership = membershipResult.data;
   const targetProfile = targetProfileResult.data;
   const emailOwner = emailOwnerResult.data;
@@ -450,7 +468,7 @@ export async function updatePendingMemberEmail(
     { email: newEmail, email_confirm: true },
   );
   if (authError) {
-    return { error: `Erro ao atualizar e-mail: ${authError.message}` };
+    return { error: memberServerError("troca do e-mail pendente", authError, EMAIL_UPDATE_COPY) };
   }
 
   const { count } = await admin
@@ -491,7 +509,7 @@ export async function changeRole(
     .select("project_id")
     .maybeSingle();
 
-  if (error) return { error: error.message };
+  if (error) return { error: memberServerError("troca do papel", error, "Não foi possível alterar o papel do membro. Tente novamente.") };
   if (!member) return { error: "Membro não encontrado ou sem permissão." };
   const projectId = member.project_id;
   revalidatePath(`/projects/${projectId}`);
@@ -513,7 +531,7 @@ export async function setCanResolve(
     .select("project_id")
     .maybeSingle();
 
-  if (error) return { error: error.message };
+  if (error) return { error: memberServerError("permissão de resolver", error, PERMISSION_COPY) };
   if (!member) return { error: "Membro não encontrado ou sem permissão." };
   const projectId = member.project_id;
 
@@ -549,7 +567,7 @@ export async function setCanArbitrate(
     })
     .maybeSingle();
 
-  if (error) return { error: error.message };
+  if (error) return { error: memberServerError("permissão de arbitrar", error, PERMISSION_COPY) };
   const member = data as { project_id: string } | null;
   if (!member) return { error: "Membro não encontrado ou sem permissão." };
   const projectId = member.project_id;
@@ -589,7 +607,7 @@ export async function setCanCompare(
     })
     .maybeSingle();
 
-  if (error) return { error: error.message };
+  if (error) return { error: memberServerError("permissão de comparar", error, PERMISSION_COPY) };
   const member = data as { project_id: string } | null;
   if (!member) return { error: "Membro não encontrado ou sem permissão." };
   const projectId = member.project_id;
@@ -683,7 +701,7 @@ async function loadMemberEmailLinkContext(
   ]);
   const error =
     membershipResult.error ?? linkResult.error ?? profileResult.error;
-  if (error) return { status: "error", error: error.message };
+  if (error) return { status: "error", error: memberServerError("leitura do vínculo de e-mail", error, EMAIL_LINK_COPY) };
 
   const targetMembership = membershipResult.data;
   const existingLink = linkResult.data;
@@ -696,7 +714,7 @@ async function loadMemberEmailLinkContext(
       .select("first_name, email")
       .eq("id", existingLink.member_user_id)
       .maybeSingle();
-    if (profileError) return { status: "error", error: profileError.message };
+    if (profileError) return { status: "error", error: memberServerError("leitura do perfil vinculado", profileError, EMAIL_LINK_COPY) };
     const name = linkedTo?.first_name || linkedTo?.email || "outro membro";
     return {
       status: "error",
@@ -734,7 +752,7 @@ async function loadCurrentEmailOwnerProfile(
     .select("id, first_name, email, activated_at")
     .eq("id", ownerUserId)
     .maybeSingle();
-  if (error) return { status: "error", error: error.message };
+  if (error) return { status: "error", error: memberServerError("leitura do dono do e-mail", error, EMAIL_LINK_COPY) };
   if (!data) {
     return {
       status: "error",
@@ -807,7 +825,7 @@ async function buildUnificationPreview(
       p_target_user_id: targetUserId,
     })
     .maybeSingle();
-  if (error) return { error: error.message };
+  if (error) return { error: memberServerError("prévia da unificação", error, UNIFY_COPY) };
   if (!data) return { data: null };
 
   const preview = data as {
@@ -969,11 +987,12 @@ const MEMBER_EMAIL_LINK_WRITE_ERRORS: Readonly<Record<string, string>> = {
     "Não foi possível confirmar a conta deste e-mail. Verifique o endereço e tente de novo.",
 };
 
-function memberEmailLinkWriteError(
-  error: { code?: string; message: string } | null,
-): string | null {
+function memberEmailLinkWriteError(error: ServerError | null): string | null {
   if (!error) return null;
-  return MEMBER_EMAIL_LINK_WRITE_ERRORS[error.code ?? ""] ?? error.message;
+  return serverErrorCopy("[members] gravação do vínculo de e-mail falhou", error, {
+    generic: EMAIL_LINK_COPY,
+    byCode: MEMBER_EMAIL_LINK_WRITE_ERRORS,
+  });
 }
 
 async function persistMemberEmailLink(
@@ -1033,7 +1052,7 @@ async function refreshPendingEmailLinkAfterRegistration(
     .eq("id", result.link.id)
     .eq("project_id", request.projectId)
     .maybeSingle();
-  if (error) return { status: "error", error: error.message };
+  if (error) return { status: "error", error: memberServerError("leitura do vínculo pendente", error, EMAIL_LINK_COPY) };
   if (!data) {
     return {
       status: "error",
@@ -1264,7 +1283,7 @@ async function loadValidUnificationRequest(
       .maybeSingle(),
   ]);
   const error = sourceResult.error ?? previewResult.error;
-  if (error) return { status: "error", error: error.message };
+  if (error) return { status: "error", error: memberServerError("leitura da unificação", error, UNIFY_COPY) };
   if (!sourceResult.data) {
     return { status: "error", error: "O membro de origem não possui profile." };
   }
@@ -1417,7 +1436,7 @@ export async function unlinkMemberEmail(
     .eq("id", linkId)
     .eq("project_id", projectId);
 
-  if (error) return { error: error.message };
+  if (error) return { error: memberServerError("desvínculo do e-mail", error, "Não foi possível desvincular o e-mail. Tente novamente.") };
 
   revalidatePath(`/projects/${projectId}/config/members`);
   revalidateTag(`project-${projectId}-members`, TAG_PROFILE);

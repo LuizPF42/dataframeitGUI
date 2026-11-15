@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { caughtErrorCopy } from "@/lib/server-error";
 
 // UPDATE/DELETE via client RLS que não casa nenhuma linha (porque a policy
 // filtrou, ou porque o registro não existe) retorna sucesso com 0 linhas e
@@ -30,6 +31,27 @@ export class ZeroRowsError extends Error {
   }
 }
 
+// Erro real do PostgREST no write. Carrega o `code` do Postgres (57014 timeout,
+// 23505 unique, ...) para o log da action distinguir as causas: um
+// `new Error(error.message)` o descartava e o log saía com `code: undefined`.
+export class PostgrestWriteError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: string,
+  ) {
+    super(message);
+    this.name = "PostgrestWriteError";
+  }
+}
+
+// Copy do toast para o que updateOrThrow/deleteOrThrow lançam: ZeroRowsError já
+// traz a copy de permissão do fluxo; o resto (PostgrestWriteError, falha de rede)
+// vai para o log com o `code`, e o toast recebe a copy genérica (#502).
+export function guardErrorCopy(e: unknown, scope: string, generic: string): string {
+  if (e instanceof ZeroRowsError) return e.message;
+  return caughtErrorCopy(scope, e, generic);
+}
+
 interface GuardOpts {
   // Copy pt-BR específica do fluxo — vai para o toast do usuário.
   message?: string;
@@ -50,7 +72,7 @@ export async function updateOrThrow(
     .update(payload)
     .match(match)
     .select(col);
-  if (error) throw new Error(error.message);
+  if (error) throw new PostgrestWriteError(error.message, error.code);
   if (!data || data.length === 0) {
     throw new ZeroRowsError(table, "update", opts?.message);
   }
@@ -70,7 +92,7 @@ export async function deleteOrThrow(
     .delete()
     .match(match)
     .select(col);
-  if (error) throw new Error(error.message);
+  if (error) throw new PostgrestWriteError(error.message, error.code);
   if (!data || data.length === 0) {
     throw new ZeroRowsError(table, "delete", opts?.message);
   }
