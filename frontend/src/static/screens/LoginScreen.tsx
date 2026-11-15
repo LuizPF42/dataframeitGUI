@@ -111,7 +111,7 @@ export function LoginScreen() {
       }
     >
       {step === "email" ? (
-        <form onSubmit={sendCode} className="space-y-4" noValidate>
+        <form onSubmit={(event) => void sendCode(event)} className="space-y-4" noValidate>
           <div className="space-y-1.5">
             <Label htmlFor={emailId}>E-mail</Label>
             <Input
@@ -133,7 +133,7 @@ export function LoginScreen() {
           </Button>
         </form>
       ) : (
-        <form onSubmit={verify} className="space-y-4" noValidate>
+        <form onSubmit={(event) => void verify(event)} className="space-y-4" noValidate>
           <p className="text-sm text-muted-foreground">
             Enviamos um código de 6 dígitos para <strong>{email}</strong>. Ele vale por alguns minutos.
           </p>
