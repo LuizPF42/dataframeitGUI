@@ -40,13 +40,20 @@ def _supabase(docs: list[dict], responses=None, max_rows: int = 1000):
     return _FakeSupabase(tables)
 
 
-def _load(sb, filter_mode="all", sample_size=None, sample_seed="job-1", ids=None):
+def _load(
+    sb,
+    filter_mode="all",
+    sample_size=None,
+    sample_seed="job-1",
+    ids=None,
+    max_response_count=None,
+):
     return llm_runner._load_documents_for_run(
         sb,
         PROJECT_ID,
         ids,
         filter_mode,
-        None,
+        max_response_count,
         sample_size,
         sample_seed=sample_seed,
     )
@@ -128,10 +135,10 @@ def test_amostra_muda_entre_runs_diferentes():
     assert {d["id"] for d in first} != {d["id"] for d in other}
 
 
-def test_pendentes_considera_respostas_alem_do_max_rows():
+def test_pendentes_considera_candidatos_alem_do_max_rows():
     # 1200 documentos, todos já com resposta LLM menos o último em ordem de id.
-    # Se a leitura das respostas parasse em 1000, ~200 documentos já
-    # respondidos voltariam a ser processados (e pagos) como pendentes.
+    # A contagem vem embutida em cada documento, e a primeira fase tem de ler
+    # os 1200 candidatos, e não só os 1000 do max_rows, para achar o pendente.
     docs = _documents(1200)
     ids = sorted(d["id"] for d in docs)
     responses = [
@@ -149,3 +156,185 @@ def test_pendentes_considera_respostas_alem_do_max_rows():
     pending = _load(_supabase(docs, responses), "pending")
 
     assert [d["id"] for d in pending] == [ids[-1]]
+
+
+def _llm_response(i: int, doc_id: str, **overrides) -> dict:
+    return {
+        "id": f"resp-{i:05d}",
+        "document_id": doc_id,
+        "project_id": PROJECT_ID,
+        "respondent_type": "llm",
+        "is_latest": True,
+        **overrides,
+    }
+
+
+def _texts_read(sb) -> list[str]:
+    """Ids dos documentos cujo `text` alguma leitura baixou."""
+    return [
+        row["id"]
+        for _columns, _filters, rows in sb.table("documents").reads
+        for row in rows
+        if "text" in row
+    ]
+
+
+def _in_sizes(sb) -> list[int]:
+    """Quantos ids cada requisição a documents levou no filtro `in`."""
+    return [
+        len(values)
+        for _columns, filters, _rows in sb.table("documents").reads
+        for op, _column, values in filters
+        if op == "in"
+    ]
+
+
+def test_amostra_baixa_o_texto_so_dos_sorteados():
+    # Fase 1 só com ids; o `text` vem depois, só dos 10 escolhidos, e não dos
+    # 200 documentos do projeto.
+    sb = _supabase(_documents(200))
+
+    sample = _load(sb, "random_sample", sample_size=10)
+
+    assert sorted(_texts_read(sb)) == sorted(d["id"] for d in sample)
+    assert all(d["text"] for d in sample)
+    candidate_reads = [c for c, _, _ in sb.table("documents").reads if "text" not in c]
+    assert candidate_reads and all(c == "id" for c in candidate_reads)
+
+
+def test_amostra_mantem_a_ordem_do_sorteio():
+    # A segunda fase lê em ordem de id, mas a run recebe a ordem da amostra,
+    # a mesma de antes das 2 fases.
+    docs = _documents(200)
+    ids = sorted(d["id"] for d in docs)
+
+    sample = _load(_supabase(docs), "random_sample", sample_size=10)
+
+    assert [d["id"] for d in sample] == random.Random("job-1").sample(ids, 10)
+
+
+def test_pendentes_baixa_o_texto_so_dos_pendentes():
+    docs = _documents(300)
+    ids = sorted(d["id"] for d in docs)
+    responses = [_llm_response(i, doc_id) for i, doc_id in enumerate(ids[5:])]
+    sb = _supabase(docs, responses)
+
+    pending = _load(sb, "pending")
+
+    assert [d["id"] for d in pending] == ids[:5]
+    assert sorted(_texts_read(sb)) == ids[:5]
+
+
+def test_pendentes_conta_as_respostas_no_banco():
+    # A contagem vem embutida na leitura de documents (`responses(count)`):
+    # nenhuma linha de responses é baixada para contar em Python.
+    docs = _documents(20)
+    ids = sorted(d["id"] for d in docs)
+    sb = _supabase(docs, [_llm_response(0, ids[0])])
+
+    _load(sb, "pending")
+
+    assert sb.table("responses").reads == []
+
+
+def test_max_responses_conta_so_respostas_llm_vigentes_do_projeto():
+    # Resposta humana, versão antiga e resposta de outro projeto não contam.
+    docs = _documents(4)
+    a, b, c, d = sorted(x["id"] for x in docs)
+    responses = [
+        _llm_response(0, a),
+        _llm_response(1, a),
+        _llm_response(2, b),
+        _llm_response(3, b, respondent_type="humano"),
+        _llm_response(4, b, is_latest=False),
+        _llm_response(5, c, project_id="outro"),
+    ]
+
+    chosen = _load(_supabase(docs, responses), "max_responses", max_response_count=1)
+
+    assert [x["id"] for x in chosen] == [b, c, d]
+
+
+def test_nenhum_pendente_nao_vira_todos_os_documentos():
+    # Uma escolha vazia não pode ser lida como "sem restrição de ids".
+    docs = _documents(5)
+    responses = [_llm_response(i, d["id"]) for i, d in enumerate(docs)]
+    sb = _supabase(docs, responses)
+
+    assert _load(sb, "pending") == []
+    assert _texts_read(sb) == []
+
+
+def test_documento_excluido_entre_as_fases_sai_da_run(monkeypatch):
+    docs = _documents(4)
+    first, *_, last = sorted(docs, key=lambda d: d["id"])
+    original = llm_runner._choose_document_ids
+
+    def choose_and_exclude(*args, **kwargs):
+        chosen = original(*args, **kwargs)
+        first["excluded_at"] = "agora"
+        return chosen
+
+    monkeypatch.setattr(llm_runner, "_choose_document_ids", choose_and_exclude)
+
+    # `last` já respondido: a escolha não é o escopo todo, e o texto vem da
+    # segunda fase, que reaplica o escopo.
+    loaded = _load(_supabase(docs, [_llm_response(0, last["id"])]), "pending")
+
+    assert [d["id"] for d in loaded] == sorted(d["id"] for d in docs)[1:3]
+
+
+def test_selecao_de_ids_vai_em_lotes_no_filtro_in():
+    # O `in` vai inteiro na URL: uma seleção grande tem de ser fatiada, nos
+    # dois modos de leitura (com e sem 2 fases).
+    docs = _documents(450)
+    wanted = sorted(d["id"] for d in docs)[:430]
+    sb_all, sb_sample = _supabase(docs), _supabase(docs)
+
+    loaded = _load(sb_all, ids=wanted)
+    sampled = _load(sb_sample, "random_sample", sample_size=420, ids=wanted)
+
+    assert [d["id"] for d in loaded] == wanted
+    assert len(sampled) == 420 and set(d["id"] for d in sampled) <= set(wanted)
+    sizes = _in_sizes(sb_all) + _in_sizes(sb_sample)
+    assert sizes and max(sizes) <= llm_runner._ID_BATCH_SIZE
+
+
+def test_select_all_com_ids_junta_os_lotes_em_ordem_e_sem_repetir():
+    docs = _documents(40)
+    ids = [d["id"] for d in docs]  # ordem física embaralhada
+    wanted = ids[:25] + ids[:3]  # com repetição
+    sb = _supabase(docs)
+
+    rows = llm_runner._select_all(
+        lambda: sb.table("documents").select("id"), wanted, id_batch_size=10
+    )
+
+    assert [r["id"] for r in rows] == sorted(set(wanted))
+    # Um pedido por lote: um lote completo dispensa a página vazia.
+    assert _in_sizes(sb) == [10, 10, 5]
+
+
+def test_lote_incompleto_ainda_pede_a_pagina_seguinte():
+    # Um lote que volta com menos linhas que ids pode ter sido cortado por um
+    # max-rows menor que o lote; só a página vazia prova que acabou.
+    docs = _documents(30)
+    wanted = sorted(d["id"] for d in docs) + ["doc-inexistente"]
+    sb = _supabase(docs, max_rows=7)
+
+    rows = llm_runner._select_all(
+        lambda: sb.table("documents").select("id"), wanted, id_batch_size=31
+    )
+
+    assert [r["id"] for r in rows] == wanted[:-1]
+
+
+def test_sem_nada_filtrado_le_o_escopo_sem_lotes():
+    # Amostra maior que o projeto: todos os candidatos ficam, e o texto vem
+    # numa leitura paginada só, e não em lotes de ids.
+    sb = _supabase(_documents(150))
+
+    loaded = _load(sb, "random_sample", sample_size=500)
+
+    assert len(loaded) == 150
+    assert _in_sizes(sb) == []
