@@ -65,6 +65,9 @@ const PROPERTY_LABELS: Record<FieldPropertyDiff["property"], string> = {
   options: "opções",
   type: "tipo",
   target: "alvo",
+  // Substantivo, e não o adjetivo do controle no editor: o rótulo também
+  // aparece sem o valor (selo da linha recolhida, mensagem de conflito), e ali
+  // "obrigatório" afirmaria o valor em vez de nomear a propriedade.
   required: "obrigatoriedade",
   allow_other: "permite outro",
   subfield_rule: "regra de subcampos",
