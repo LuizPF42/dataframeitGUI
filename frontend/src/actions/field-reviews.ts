@@ -244,27 +244,10 @@ async function assignArbitrator(
   documentId: string,
   excludeUserId: string,
   fieldReviewIds: string[],
-  precomputedCoderIds?: Set<string>,
+  // Codificadores humanos do documento, pré-buscados em batch pelo único
+  // chamador (retryPendingArbitrations), cuja query cobre os filtros.
+  coderIds: Set<string>,
 ): Promise<{ count: number; noPool: boolean }> {
-  // Codificadores humanos deste documento — quem já tem resposta registrada
-  // para o doc (recurso de comparação N+). Quando o caller pré-buscou em
-  // batch (retryPendingArbitrations), reusa o set para evitar N queries.
-  let coderIds: Set<string>;
-  if (precomputedCoderIds) {
-    coderIds = precomputedCoderIds;
-  } else {
-    const { data: coders } = await admin
-      .from("responses")
-      .select("respondent_id")
-      .eq("project_id", projectId)
-      .eq("document_id", documentId)
-      .eq("respondent_type", "humano");
-    coderIds = new Set<string>();
-    for (const c of coders ?? []) {
-      if (c.respondent_id) coderIds.add(c.respondent_id as string);
-    }
-  }
-
   // Elegíveis (can_arbitrate) menos o auto-revisor original — esse nunca
   // arbitra, sob nenhuma circunstância, porque julgaria a própria resposta.
   const { data: eligibleMembers } = await admin
@@ -699,21 +682,24 @@ export async function retryPendingArbitrations(
     }
 
     // Pré-busca em batch: codificadores humanos de todos os docs pendentes
-    // de uma vez. assignArbitrator originalmente faz 1 SELECT em responses
-    // por chamada — em loop de N groups isso vira N queries. Centralizar
-    // num único SELECT mantém a chamada O(1) em queries de responses
-    // independente do tamanho do backlog.
+    // de uma vez, num único SELECT em responses (O(1) queries independente do
+    // tamanho do backlog). assignArbitrator depende deste set: é ele que tira
+    // os codificadores do documento do pool de árbitros.
     const allDocIds = [
       ...new Set([...groups.values()].map((g) => g.documentId)),
     ];
     const codersByDoc = new Map<string, Set<string>>();
     if (allDocIds.length > 0) {
-      const { data: allCoders } = await supabase
+      const { data: allCoders, error: codersError } = await supabase
         .from("responses")
         .select("document_id, respondent_id")
         .eq("project_id", projectId)
         .in("document_id", allDocIds)
         .eq("respondent_type", "humano");
+      // Sem o set, o codificador do documento entraria no pool como árbitro
+      // "neutro": falha alto em vez de atribuir errado (P3).
+      if (codersError)
+        return { success: false, error: codersError.message, assigned: 0, stillNoPool: 0 };
       for (const c of allCoders ?? []) {
         const docId = c.document_id as string;
         const respId = c.respondent_id as string | null;
