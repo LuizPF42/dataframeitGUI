@@ -150,14 +150,18 @@ export function useArbitrationDoc({
           return;
         }
       }
-      // Limpa o override para que, após o refresh, a fase derivada dos dados
-      // (agora "reveal") apareça — inclusive se o usuário tinha voltado à cega.
-      setBlindOverrideDocId(null);
-      // refresh() repuxa o payload com `reveal` populado; a fase deriva sozinha.
-      refresh();
+    } catch (error) {
+      console.error("[useArbitrationDoc] erro ao registrar veredito cego", error);
+      toast.error("Não foi possível registrar o veredito cego. Tente novamente.");
+      return;
     } finally {
       setSubmitting(false);
     }
+    // Limpa o override para que, após o refresh, a fase derivada dos dados
+    // (agora "reveal") apareça — inclusive se o usuário tinha voltado à cega.
+    setBlindOverrideDocId(null);
+    // refresh() repuxa o payload com `reveal` populado; a fase deriva sozinha.
+    refresh();
   }, [doc, blindChoices, projectId, refresh]);
 
   const handleFinalSubmit = useCallback(async () => {
@@ -183,9 +187,16 @@ export function useArbitrationDoc({
           : undefined,
       arbitratorComment: comments[f.fieldReviewId] || undefined,
     }));
-    const r = await submitFinalVerdicts(projectId, doc.docId, payload).finally(
-      () => setSubmitting(false),
-    );
+    let r: Awaited<ReturnType<typeof submitFinalVerdicts>>;
+    try {
+      r = await submitFinalVerdicts(projectId, doc.docId, payload);
+    } catch (error) {
+      console.error("[useArbitrationDoc] erro ao enviar veredito final", error);
+      toast.error("Não foi possível enviar o veredito final. Tente novamente.");
+      return;
+    } finally {
+      setSubmitting(false);
+    }
     if (!r.success) {
       toast.error(r.error ?? "Falha ao enviar veredito final");
       return;
