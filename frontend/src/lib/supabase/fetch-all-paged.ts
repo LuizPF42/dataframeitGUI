@@ -1,3 +1,5 @@
+import { mapWithConcurrency } from "@/lib/upload-chunking";
+
 // Paginação de leitura do PostgREST. O builder é de uso único (o await o
 // executa), por isso o caller passa uma FÁBRICA de query, não a query pronta.
 //
@@ -45,4 +47,36 @@ export async function fetchAllPaged<T>(
     from += PAGE_SIZE;
   }
   return { data: all, error: null };
+}
+
+// Lote do `.in("document_id", ...)`: uma lista longa de UUIDs vai na URL do
+// PostgREST, e cem ficam bem abaixo do limite.
+const DOCUMENT_CHUNK = 100;
+// Lotes em voo ao mesmo tempo. Uma lista de milhares de documentos não pode
+// virar dezenas de requisições simultâneas contra o PostgREST.
+const CHUNK_CONCURRENCY = 4;
+
+export type PagedRead<T> = Promise<{ data: T[]; error: { message: string } | null }>;
+
+// Leitura restrita a `documentIds`, um `.in` por lote, até `concurrency` lotes
+// em paralelo. A primeira falha vence e para de abrir lotes: um lote faltando
+// daria número errado, não erro.
+export async function fetchByDocumentChunks<T>(
+  documentIds: readonly string[],
+  fetchChunk: (ids: string[]) => PagedRead<T>,
+  concurrency = CHUNK_CONCURRENCY,
+): PagedRead<T> {
+  const chunks: string[][] = [];
+  for (let i = 0; i < documentIds.length; i += DOCUMENT_CHUNK) {
+    chunks.push(documentIds.slice(i, i + DOCUMENT_CHUNK));
+  }
+  let failed: { message: string } | null = null;
+  const results = await mapWithConcurrency(chunks, concurrency, async (ids) => {
+    if (failed) return null;
+    const result = await fetchChunk(ids);
+    failed ??= result.error;
+    return result;
+  });
+  if (failed) return { data: [], error: failed };
+  return { data: results.flatMap((result) => result?.data ?? []), error: null };
 }

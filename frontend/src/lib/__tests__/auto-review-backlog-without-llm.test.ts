@@ -73,6 +73,44 @@ describe("fetchDocsWithoutLlmCount", () => {
     expect(result).toEqual({ count: 2, error: null });
   });
 
+  // #889: a segunda fase lia todos os field_reviews e o histórico do projeto;
+  // só os documentos candidatos interessam, e a lista vai na URL em lotes.
+  it("fora do modo de auto-revisão, lê só as auto-revisões dos candidatos, em lotes", async () => {
+    const candidates = Array.from({ length: 250 }, (_, i) => `d${i}`);
+    const client = makeFilterAwareSupabaseMock({
+      tableData: {
+        projects: [{ id: "p1", automation_mode: "compare_llm" }],
+        responses: [...candidates.map((d, i) => human(`h${i}`, d)), human("hx", "dx"), llm("lx", "dx")],
+        field_reviews: [
+          { id: "f1", project_id: "p1", document_id: "d0" },
+          { id: "f2", project_id: "p1", document_id: "dx" },
+        ],
+        field_review_cycle_history_entries: [{ id: "c1", project_id: "p1", document_id: "d249" }],
+      },
+      writeCalls: [],
+    });
+    const ins: Array<{ table: string; column: string; ids: unknown[] }> = [];
+    const from = client.from;
+    client.from = (table: string) => {
+      const builder = from(table) as Record<string, unknown> & {
+        in: (column: string, ids: unknown[]) => unknown;
+      };
+      const original = builder.in;
+      builder.in = (column, ids) => {
+        ins.push({ table, column, ids });
+        return original(column, ids);
+      };
+      return builder as never;
+    };
+
+    expect(await fetchDocsWithoutLlmCount(client as never, "p1")).toEqual({ count: 2, error: null });
+    for (const table of ["field_reviews", "field_review_cycle_history_entries"]) {
+      const batches = ins.filter((call) => call.table === table);
+      expect(batches.map((call) => call.column)).toEqual(["document_id", "document_id", "document_id"]);
+      expect(batches.flatMap((call) => call.ids).sort()).toEqual([...candidates].sort());
+    }
+  });
+
   it("pagina além das 1000 linhas do PostgREST", async () => {
     const responses = Array.from({ length: 1_500 }, (_, i) => human(`h${i}`, `d${i}`));
     expect(await count({ responses })).toEqual({ count: 1_500, error: null });
@@ -84,5 +122,19 @@ describe("fetchDocsWithoutLlmCount", () => {
       { "responses:select": { message: "boom" } },
     );
     expect(result).toEqual({ count: null, error: { message: "boom" } });
+  });
+
+  // A contagem é informativa nos dois chamadores: na action, uma exceção
+  // rejeitava o Promise.all com o dreno e virava "falha" depois de a RPC já
+  // ter reenfileirado; na tela, derrubava a rota.
+  it("exceção na leitura vira erro explícito, não rejeição", async () => {
+    const client = makeFilterAwareSupabaseMock({ tableData: {}, writeCalls: [] });
+    client.from = () => {
+      throw new Error("fetch failed");
+    };
+    expect(await fetchDocsWithoutLlmCount(client as never, "p1")).toEqual({
+      count: null,
+      error: { message: "fetch failed" },
+    });
   });
 });
