@@ -72,55 +72,46 @@ export function isFieldVisible(
   return evaluateCondition(field.condition, answers);
 }
 
-// Núcleo compartilhado do ponto-fixo: limpar uma condicional pode esconder
-// outra que dependia dela, então iteramos até estabilizar. Trabalha sobre uma
+// Cliente (estado vivo de codificação): zera para `null` as respostas de
+// condicionais ocultas. É também o núcleo da fronteira abaixo, que lê a
+// visibilidade final nesta mesma view. Ponto-fixo: limpar uma condicional pode
+// esconder outra que dependia dela, então iteramos até estabilizar. Trabalha sobre uma
 // view copy-on-write (clona só na primeira limpeza), marcando cada órfão com
-// valor SIGNIFICATIVO como `null` para reavaliar a visibilidade em cascata —
-// `null` e chave ausente são equivalentes para `isFieldVisible`. O guard de
-// valor não-vazio é essencial para a cascata: zerar um `""`/`null` não muda a
-// visibilidade downstream (inclusive para `exists`), e limitar a limpeza a
-// valores significativos garante terminação em ≤N passes (cada campo entra em
-// `cleared` no máximo uma vez). Não muta a entrada. Retorna a `view` resolvida
-// (com os órfãos significativos zerados) e o conjunto `cleared` de nomes que
-// foram efetivamente zerados.
-function resolveHiddenConditionals(
-  fields: PydanticField[],
-  answers: Record<string, unknown>,
-): { view: Record<string, unknown>; cleared: Set<string> } {
-  const cleared = new Set<string>();
-  let view = answers;
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const f of fields) {
-      if (!f.condition) continue;
-      if (cleared.has(f.name)) continue;
-      if (isFieldVisible(f, view)) continue;
-      const v = Object.hasOwn(view, f.name) ? view[f.name] : undefined;
-      if (v !== undefined && v !== null && v !== "") {
-        if (view === answers) view = { ...answers };
-        view[f.name] = null;
-        cleared.add(f.name);
-        changed = true;
-      }
-    }
-  }
-  return { view, cleared };
+// valor como `null` para reavaliar a visibilidade em cascata — `null` e chave
+// ausente são equivalentes para `isFieldVisible`. `""` também é zerado: para
+// `not_equals`/`not_in` ele é valor, e mantê-lo deixava visível na view o
+// dependente de um gatilho oculto — a tela mostrava a pergunta e a fronteira,
+// que lê esta mesma view, guardava a resposta dele enquanto omitia o gatilho.
+// Só `null` e ausente ficam de fora: zerá-los não muda nada, e é isso que
+// garante a terminação (cada passada troca ao menos um valor não nulo por
+// `null`). Não muta a entrada e devolve o MESMO objeto quando nada muda,
+// preservando a identidade referencial que o React usa para evitar re-renders.
+function isHiddenWithValue(
+  field: PydanticField,
+  view: Record<string, unknown>,
+): boolean {
+  if (!field.condition || isFieldVisible(field, view)) return false;
+  return Object.hasOwn(view, field.name) && view[field.name] != null;
 }
 
-// Cliente (estado vivo de codificação): zera as respostas de condicionais
-// ocultas para `null`. Só toca campos com valor significativo (o conjunto
-// `cleared` do ponto-fixo), então retorna o MESMO objeto quando nada muda,
-// preservando a identidade referencial que o React usa para evitar re-renders.
 export function clearHiddenConditionalAnswers(
   fields: PydanticField[],
   answers: Record<string, unknown>,
 ): Record<string, unknown> {
-  const { cleared } = resolveHiddenConditionals(fields, answers);
-  if (cleared.size === 0) return answers;
-  const next = { ...answers };
-  for (const name of cleared) next[name] = null;
-  return next;
+  let view = answers;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    // Sequencial de propósito: o campo seguinte da mesma passada já vê o
+    // anterior zerado (com `exists: false`, isso o torna visível).
+    for (const f of fields) {
+      if (!isHiddenWithValue(f, view)) continue;
+      if (view === answers) view = { ...answers };
+      view[f.name] = null;
+      changed = true;
+    }
+  }
+  return view;
 }
 
 // Fronteira (leitura/escrita de respostas persistidas): OMITE a chave de TODA
@@ -132,13 +123,20 @@ export function clearHiddenConditionalAnswers(
 // Avaliar visibilidade sobre o conjunto COMPLETO de campos (não filtrado por
 // `target`), pois uma condição pode referenciar qualquer campo. Retorna o
 // MESMO objeto quando nada há a omitir.
+//
+// A visibilidade final é lida na view resolvida do mesmo ponto-fixo do estado
+// vivo, e não decidida durante a cascata: com o dependente antes do gatilho
+// (o editor permite arrastar) e `exists: false`, omitir o gatilho oculto torna
+// o dependente visível, e uma omissão feita enquanto o gatilho ainda estava
+// presente não se desfaz. Ler da view também faz a tela e o save concordarem
+// por construção.
 export function dropHiddenConditionals(
   fields: PydanticField[],
   answers: Record<string, unknown>,
 ): Record<string, unknown> {
-  const { view } = resolveHiddenConditionals(fields, answers);
-  // Reavalia sobre a view resolvida do ponto-fixo: uma chave presente cujo
-  // campo condicional segue oculto é órfã, independente de o valor ser vazio.
+  const view = clearHiddenConditionalAnswers(fields, answers);
+  // Uma chave presente cujo campo condicional segue oculto na view resolvida é
+  // órfã, independente de o valor ser vazio.
   const orphans: string[] = [];
   for (const f of fields) {
     if (!f.condition) continue;
