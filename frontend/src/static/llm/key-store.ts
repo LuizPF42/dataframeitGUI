@@ -1,7 +1,11 @@
 // Chaves de API dos provedores de LLM no modo estático. Como no QualiLab, a
 // chave é do coordenador: fica só no navegador dele (em memória, ou no
 // localStorage se ele pedir) e nunca vai para o banco nem para servidor algum.
-// Sai do navegador apenas na chamada direta ao provedor.
+// Sai do navegador apenas na chamada direta ao provedor. A chave fica presa à
+// nuvem em que foi informada: trocar de nuvem (por exemplo, por um link
+// forjado) não leva a chave junto.
+
+import { readConnection } from "@/static/runtime/connection";
 
 export type ProviderId = "google_genai" | "openai" | "anthropic";
 
@@ -18,27 +22,32 @@ export const PROVIDER_KEY_HELP: Record<ProviderId, string> = {
 };
 
 const STORAGE_PREFIX = "dataframeit:llm-key:";
-const memory = new Map<ProviderId, string>();
+const memory = new Map<string, string>();
+
+function slot(provider: ProviderId): string {
+  const url = readConnection()?.url ?? "sem-nuvem";
+  return `${url}|${provider}`;
+}
 
 export function isProviderId(value: unknown): value is ProviderId {
   return value === "google_genai" || value === "openai" || value === "anthropic";
 }
 
 function readStoredKey(provider: ProviderId): string | null {
-  const inMemory = memory.get(provider);
+  const inMemory = memory.get(slot(provider));
   if (inMemory) return inMemory;
   try {
-    return window.localStorage.getItem(STORAGE_PREFIX + provider);
+    return window.localStorage.getItem(STORAGE_PREFIX + slot(provider));
   } catch {
     return null;
   }
 }
 
 function storeKey(provider: ProviderId, key: string, remember: boolean): void {
-  memory.set(provider, key);
+  memory.set(slot(provider), key);
   try {
-    if (remember) window.localStorage.setItem(STORAGE_PREFIX + provider, key);
-    else window.localStorage.removeItem(STORAGE_PREFIX + provider);
+    if (remember) window.localStorage.setItem(STORAGE_PREFIX + slot(provider), key);
+    else window.localStorage.removeItem(STORAGE_PREFIX + slot(provider));
   } catch {
     // Armazenamento bloqueado: a chave vale só nesta aba.
   }

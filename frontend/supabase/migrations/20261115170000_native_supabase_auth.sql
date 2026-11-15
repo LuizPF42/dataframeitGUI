@@ -26,11 +26,13 @@ INSERT INTO public.instance_settings (singleton)
 VALUES (true)
 ON CONFLICT (singleton) DO NOTHING;
 
--- Deny-by-default: nenhum papel de cliente lê ou escreve a configuração. Ela
--- é lida só pelas funções SECURITY DEFINER abaixo e alterada pelo instalador
--- (SQL como owner).
+-- Deny-by-default: nenhum papel da API lê ou escreve a configuração — nem a
+-- service role, que no modo hospedado está no Next e no FastAPI: um defeito
+-- ali não pode trocar o emissor de identidade da instância. Ela é lida só
+-- pelas funções SECURITY DEFINER abaixo e alterada pelo instalador (SQL como
+-- owner).
 ALTER TABLE public.instance_settings ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON public.instance_settings FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON public.instance_settings FROM PUBLIC, anon, authenticated, service_role;
 
 CREATE OR REPLACE FUNCTION public.native_auth_enabled()
 RETURNS boolean

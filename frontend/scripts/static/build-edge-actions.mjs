@@ -55,11 +55,11 @@ export async function buildEdgeActions() {
   const modules = Object.keys(privileged).filter((module) => !NOT_SERVED.has(module));
   const entry = [
     `import { serveActions } from "@/static/edge/entry";`,
-    `import { drainAutoReviewReconciliationRequests } from "@/lib/auto-review-reconciler";`,
+    `import { drainAutoReviewReconciliation } from "@/static/edge/internal";`,
     ...modules.map((module, index) => `import * as m${index} from "@/actions/${module}";`),
     `serveActions({`,
     ...modules.map((module, index) => `  ${JSON.stringify(module)}: m${index},`),
-    `  internal: { drainAutoReviewReconciliation: () => drainAutoReviewReconciliationRequests() },`,
+    `  internal: { drainAutoReviewReconciliation },`,
     `});`,
   ].join("\n");
 

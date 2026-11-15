@@ -76,6 +76,8 @@ describe("função de setup do assistente", () => {
     expect(ok.status).toBe(200);
     const payload = JSON.parse(String((fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1].body));
     expect(payload.mailer_otp_length).toBe(6);
+    expect(payload.jwt_exp).toBe(900);
+    expect(payload.external_anonymous_users_enabled).toBe(false);
     expect(payload.mailer_templates_magic_link_content).toContain("{{ .Token }}");
     expect(payload.mailer_templates_confirmation_content).toContain("{{ .Token }}");
   });

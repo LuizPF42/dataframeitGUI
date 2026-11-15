@@ -87,6 +87,16 @@ END
 $$;
 RESET ROLE;
 
+-- Nem a service role altera a configuração da instância.
+DO $$
+BEGIN
+  IF has_table_privilege('service_role', 'public.instance_settings', 'UPDATE')
+     OR has_table_privilege('service_role', 'public.instance_settings', 'DELETE') THEN
+    RAISE EXCEPTION 'FALHOU: service_role pode alterar instance_settings';
+  END IF;
+END
+$$;
+
 -- Login no modo hospedado não ativa perfil pela via nativa.
 UPDATE auth.users SET last_sign_in_at = now()
 WHERE id = '5a700000-0000-0000-0000-000000000002';

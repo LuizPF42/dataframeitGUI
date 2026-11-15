@@ -233,6 +233,12 @@ export async function handle(req, env, fetchImpl) {
       mailer_subjects_confirmation: OTP_SUBJECT,
       mailer_templates_confirmation_content: OTP_TEMPLATE,
       disable_signup: body.invite_only === true,
+      // Sem sessão anônima: ela não resolve identidade na RLS, mas ocupa cota.
+      external_anonymous_users_enabled: false,
+      // A identidade do modo nativo vale enquanto o JWT vale (o banco não
+      // consulta a sessão). 15 min em vez da 1 h padrão encurta a janela de um
+      // token vazado ou de uma sessão encerrada; o supabase-js renova sozinho.
+      jwt_exp: 900,
     });
     if (!r.ok) return reply(502, await upstreamError(r), cors);
     return reply(200, { ok: true }, cors);

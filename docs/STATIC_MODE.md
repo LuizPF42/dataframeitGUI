@@ -90,6 +90,14 @@ npx vitest run src/static
 
 Banco sem Docker: `scripts/db-embedded/README.md` (Postgres 17 por pacote npm; roda as migrations e as suítes, inclusive no modo nativo).
 
+## Segurança: o que mudar ao publicar
+
+- **Origem compartilhada no GitHub Pages.** A sessão do Supabase Auth e as chaves de LLM "lembradas" ficam no `localStorage`, que é por origem, não por caminho. Em `https://<dono>.github.io/<repo>/`, qualquer outro repositório do mesmo dono que publique JavaScript no Pages lê esses dados. Publique o modo estático com **domínio próprio** (ou numa conta/organização cujo Pages só sirva este site). As chaves de LLM, por padrão, ficam só em memória.
+- **Link para a equipe.** O link nunca conecta sozinho: mostra o endereço da nuvem e pede confirmação, e as chaves de LLM ficam presas à nuvem em que foram informadas.
+- **Validade do token.** No modo nativo a identidade vale enquanto o JWT vale (o banco não consulta a sessão). O assistente reduz o `jwt_exp` para 15 minutos; o padrão do Supabase é 1 hora.
+- **Dreno da auto-revisão.** Na Edge Function, só coordenador ou master o aciona, e as contagens (que somam todos os projetos) não voltam ao navegador.
+- **A conferir no Supabase real.** Com "só entra quem o coordenador cadastrar" desligado, o cadastro por senha do GoTrue continua aberto. Falta confirmar se um cadastro por senha não confirmado, feito por terceiro com o e-mail de outra pessoa, perde a senha quando o dono confirma por código.
+
 ## Limites conhecidos
 
 - **Navegador para rodar o LLM**: exige JSPI (Chrome/Edge). Os demais fluxos funcionam em qualquer navegador moderno.

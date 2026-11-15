@@ -49,9 +49,12 @@ export function ConnectScreen() {
   const keyId = useId();
   const [url, setUrl] = useState("");
   const [anonKey, setAnonKey] = useState("");
-  // O link para a equipe chega no hash; lido uma vez, na montagem.
+  // O link para a equipe chega no hash; lido uma vez, na montagem. Nunca
+  // conecta sozinho: um link forjado levaria a pessoa a entrar (e a digitar
+  // dados de pesquisa, ou gastar a chave de LLM) na nuvem de outra pessoa.
+  // O endereço é mostrado e a troca exige um clique.
   const [fromLink] = useState(() => parseTeamLink(window.location.hash));
-  const [status, setStatus] = useState<"idle" | "checking">(fromLink ? "checking" : "idle");
+  const [status, setStatus] = useState<"idle" | "checking">("idle");
   const [error, setError] = useState<string | null>(null);
   const current = readConnection();
 
@@ -72,17 +75,8 @@ export function ConnectScreen() {
   }
 
   useEffect(() => {
-    if (!fromLink) return;
     // O hash leva a chave anônima; não deixá-lo no histórico.
-    window.history.replaceState(null, "", window.location.pathname);
-    let cancelled = false;
-    void checkConnection(fromLink).then((result) => {
-      if (!cancelled) applyResult(fromLink, result);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- só na montagem
+    if (fromLink) window.history.replaceState(null, "", window.location.pathname);
   }, [fromLink]);
 
   function handleSubmit(event: FormEvent) {
@@ -112,6 +106,23 @@ export function ConnectScreen() {
             Ir para os projetos
           </Link>
         </p>
+      ) : null}
+      {fromLink ? (
+        <div className="space-y-3 rounded-md border p-3 text-sm">
+          <p>
+            Este link conecta à nuvem{fromLink.name ? <> <strong>{fromLink.name}</strong></> : null} em{" "}
+            <strong>{new URL(fromLink.url).hostname}</strong>.
+          </p>
+          {current && current.url !== fromLink.url ? (
+            <p className="text-amber-800">
+              Você está conectado a outra nuvem ({new URL(current.url).hostname}). Conectar troca a nuvem
+              deste navegador. Só continue se o link veio do seu coordenador.
+            </p>
+          ) : null}
+          <Button type="button" disabled={status === "checking"} onClick={() => connect(fromLink)}>
+            {status === "checking" ? "Verificando…" : "Conectar a esta nuvem"}
+          </Button>
+        </div>
       ) : null}
       <form onSubmit={handleSubmit} className="space-y-4" noValidate>
         <div className="space-y-1.5">
