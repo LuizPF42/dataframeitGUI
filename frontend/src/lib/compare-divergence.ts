@@ -6,6 +6,16 @@ import {
   multiSelectionsAgree,
 } from "@/lib/compare-multi-options";
 import type { AnswerFieldHashes, PydanticField } from "@/lib/types";
+import { resolveTarget } from "@/lib/pydantic-field";
+
+// O campo entra na Comparacao: o LLM responde e o humano revisa, ou seja,
+// `target` resolvido e `all`. Regra unica para a fila de divergencia, o
+// gabarito (`comparableFields` em reviews/queries.ts) e as metricas do LLM
+// (`isMeasurableField`). O default de `target` sai de `resolveTarget`, nunca de
+// uma comparacao local (regra (c2) do CLAUDE.md, issue #500).
+export function isComparedField(field: Pick<PydanticField, "target">): boolean {
+  return resolveTarget(field.target) === "all";
+}
 
 interface ResponseLike {
   id: string;
@@ -51,12 +61,7 @@ export function computeDivergentFieldNames(
   const divergent: string[] = [];
 
   for (const field of fields) {
-    if (
-      field.target === "llm_only" ||
-      field.target === "human_only" ||
-      field.target === "none"
-    )
-      continue;
+    if (!isComparedField(field)) continue;
 
     const applicable = responses.filter((r) =>
       isFieldApplicable(field, r.answers, r.answerFieldHashes),
