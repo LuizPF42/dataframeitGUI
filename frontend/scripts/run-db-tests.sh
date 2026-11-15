@@ -72,7 +72,6 @@ GATE_SUITES=(
   responses_latest_human_concurrency
   response_round_serialization
   unmark_equivalence_atomic
-  value_equivalences
   auto_review_reconciliation_outbox
   arbitration_reopen
   rls_audit
@@ -87,8 +86,17 @@ GATE_SUITES=(
 # derruba o gate até ser consertada. Isto NÃO é silenciamento: aparece no resumo
 # com sua issue; ao consertar, mover para GATE_SUITES (a guarda 2 força esse
 # passo).
+#
+# value_equivalences (#851) troca a sessão com `SET SESSION AUTHORIZATION
+# authenticator` para exercitar as recusas das RPCs, que liberam
+# `SESSION_USER = 'postgres'`. Isso exige superusuário, e o `postgres` da imagem
+# do Supabase não é (o mesmo motivo da #572): a suíte nunca passou no CI nem no
+# hook local. Apareceu quando o CI passou a rodar GATE_SUITES (#913); o conserto
+# (rodar como `supabase_admin` ou outra forma de trocar o SESSION_USER) fica com
+# o dono.
 declare -A KNOWN_RED=(
   [schema_revision_serialization]="#572"
+  [value_equivalences]="#913"
 )
 
 # ── Guarda 1: drift entre o runner e o disco (fecha a causa raiz da #557). ────
@@ -130,18 +138,40 @@ run_pgtap() {
     local port
     port="$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "${CONTAINER}")"
     if [[ ! "$port" =~ ^[0-9]+$ ]]; then
-      echo "container sem porta PostgreSQL publicada" >"${LOG_DIR}/$1.log"
+      echo "container sem porta PostgreSQL publicada"
       return 2
     fi
     PGPASSWORD=postgres npx supabase test db "${TESTS_DIR}/$1.test.sql" \
-      --db-url "postgresql://postgres@127.0.0.1:${port}/${SUPABASE_DB_NAME:-postgres}" >"${LOG_DIR}/$1.log" 2>&1
+      --db-url "postgresql://postgres@127.0.0.1:${port}/${SUPABASE_DB_NAME:-postgres}"
   else
-    npx supabase test db "${TESTS_DIR}/$1.test.sql" --local >"${LOG_DIR}/$1.log" 2>&1
+    npx supabase test db "${TESTS_DIR}/$1.test.sql" --local
   fi
 }
 
 run_psql() {
-  bash scripts/run-sql-test.sh "${TESTS_DIR}/$1.test.sql" >"${LOG_DIR}/$1.log" 2>&1
+  bash scripts/run-sql-test.sh "${TESTS_DIR}/$1.test.sql"
+}
+
+# No GitHub Actions o database-tests.yml roda tudo num passo só, e o passo por
+# suíte de antes mostrava a saída inteira de cada uma e, num travamento, qual
+# estava rodando. Lá cada suíte vira um grupo, aberto antes de ela rodar e com
+# a saída inteira enquanto roda, e a falha de gate vira anotação.
+in_ci() { [[ ${GITHUB_ACTIONS:-} == true ]]; }
+
+# Roda uma suíte com a saída no log dela e a reporta: gate|known, suíte, comando.
+run_suite() {
+  local gated="$1" suite="$2" code
+  shift 2
+  if in_ci; then
+    echo "::group::${suite}"
+    "$@" 2>&1 | tee "${LOG_DIR}/${suite}.log"
+    code=${PIPESTATUS[0]}
+    echo "::endgroup::"
+  else
+    "$@" >"${LOG_DIR}/${suite}.log" 2>&1
+    code=$?
+  fi
+  report "${suite}" "${code}" "${gated}"
 }
 
 tail_log() {
@@ -164,7 +194,11 @@ report() {
   elif [[ ${gated} == gate ]]; then
     printf '  FAIL  %s\n' "${suite}"
     fail_gate+=("${suite}")
-    tail_log "${suite}"
+    if in_ci; then
+      echo "::error title=Suíte do banco ${suite}::falhou; saída inteira no grupo ${suite} do passo"
+    else
+      tail_log "${suite}"
+    fi
   else
     printf '  RED*  %s (conhecida, %s)\n' "${suite}" "${KNOWN_RED[$suite]}"
     fail_known+=("${suite}")
@@ -174,17 +208,16 @@ report() {
 echo "▸ suítes de contrato do banco (varredura completa)"
 
 for s in "${PGTAP_SUITES[@]}"; do
-  run_pgtap "$s"; report "$s" $? gate
+  run_suite gate "$s" run_pgtap "$s"
 done
 for s in "${GATE_SUITES[@]}"; do
-  run_psql "$s"; report "$s" $? gate
+  run_suite gate "$s" run_psql "$s"
 done
 for s in "${!KNOWN_RED[@]}"; do
-  run_psql "$s"; report "$s" $? known
+  run_suite known "$s" run_psql "$s"
 done
 # Contrato do llm_runner em `llm_runs` (#674), pytest contra este mesmo stack.
-bash scripts/run-backend-integration.sh >"${LOG_DIR}/backend_integration.log" 2>&1
-report backend_integration $? gate
+run_suite gate backend_integration bash scripts/run-backend-integration.sh
 
 echo "────────────────────────────────────────"
 printf 'PASS=%d  FAIL(gate)=%d  RED*(conhecida)=%d  VERDE(promover)=%d\n' \
