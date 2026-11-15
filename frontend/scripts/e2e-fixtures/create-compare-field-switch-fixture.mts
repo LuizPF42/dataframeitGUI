@@ -24,22 +24,17 @@
 // título, então rodar de novo é seguro e devolve sempre o mesmo id.
 //
 // Rodar de frontend/:  npm run e2e:fixture:compare
+// Contra o Supabase local:  E2E_ENV_PATH=<arquivo> npm run e2e:fixture:compare
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
-import {
-  applyEnvironment,
-  readOptionalEnvironmentFile,
-} from "../worktree-env/env-contract.mjs";
+import { loadE2eEnvironment } from "../worktree-env/env-contract.mjs";
+import { sameStoredFields } from "./fixture-schema";
 
-// Mesmo par de arquivos, na mesma ordem de precedência, que o
-// playwright.config.ts carrega, ancorado no diretório do próprio script (não no
-// cwd): rodar da raiz do repo acharia o contrato e nenhum valor.
+// O mesmo ambiente que o playwright.config.ts carrega, inclusive o
+// E2E_ENV_PATH (ver loadE2eEnvironment): a fixture nasce no banco que o spec lê.
 const frontendDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-applyEnvironment(process.env, readOptionalEnvironmentFile(join(frontendDir, ".env.local")));
-applyEnvironment(process.env, readOptionalEnvironmentFile(join(frontendDir, ".env.e2e")), {
-  override: true,
-});
+loadE2eEnvironment(process.env, frontendDir);
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -57,6 +52,8 @@ if (!COORDINATOR_EMAIL || !MEMBER_EMAIL) {
 }
 
 const supabase = createClient(url, key, { auth: { persistSession: false } });
+// O ambiente pode vir do E2E_ENV_PATH: diz em qual banco a fixture nasceu.
+console.log(`Supabase: ${new URL(url).host}`);
 
 export const PROJECT_NAME = "Comparação campo-trocado — teste E2E";
 const SCHEMA_HASH = "e2e-campotrocado-schema-hash";
@@ -121,11 +118,14 @@ async function main() {
     profileId(MEMBER_EMAIL!),
   ]);
 
-  const { data: existing } = await supabase
+  const { data: existing, error: findError } = await supabase
     .from("projects")
-    .select("id, schema_revision")
+    .select("id, schema_revision, pydantic_fields")
     .eq("name", PROJECT_NAME)
     .maybeSingle();
+  // Sem esta checagem, uma falha de leitura viraria "projeto não existe" e o
+  // script criaria um segundo projeto com o mesmo nome.
+  if (findError) throw new Error(`projects: ${findError.message}`);
 
   let projectId: string;
   const schema = {
@@ -135,16 +135,23 @@ async function main() {
   };
   if (existing) {
     projectId = existing.id as string;
-    // O banco recusa alteração de `pydantic_fields` sem avanço de
-    // `schema_revision` (exatamente +1). Reexecutar o script com os campos
-    // inalterados também passa por aqui: incrementar sem mudança é inofensivo,
-    // enquanto derivar "mudou?" no cliente duplicaria a regra que a própria
-    // trigger já aplica.
+    // Os campos só vão no update quando diferem dos gravados (ver
+    // sameStoredFields), e então junto com a revisão + 1. Reexecutar com os
+    // campos inalterados não os reenvia: o banco recusaria avançar a revisão, e
+    // regravá-los sem avançar dependeria de a comparação daqui concordar com a
+    // da trigger. O gerador do llm-decisions, em vez disso, recusa campo mudado.
+    const { pydantic_fields, ...rest } = schema;
+    const schemaChanged = !sameStoredFields(existing.pydantic_fields, pydantic_fields);
     const { error } = await supabase
       .from("projects")
       .update({
-        ...schema,
-        schema_revision: ((existing.schema_revision as number) ?? 0) + 1,
+        ...rest,
+        ...(schemaChanged
+          ? {
+              pydantic_fields,
+              schema_revision: ((existing.schema_revision as number) ?? 0) + 1,
+            }
+          : {}),
       })
       .eq("id", projectId);
     if (error) throw new Error(`update projects: ${error.message}`);
