@@ -182,6 +182,9 @@ done
 for s in "${!KNOWN_RED[@]}"; do
   run_psql "$s"; report "$s" $? known
 done
+# Contrato do llm_runner em `llm_runs` (#674), pytest contra este mesmo stack.
+bash scripts/run-backend-integration.sh >"${LOG_DIR}/backend_integration.log" 2>&1
+report backend_integration $? gate
 
 echo "────────────────────────────────────────"
 printf 'PASS=%d  FAIL(gate)=%d  RED*(conhecida)=%d  VERDE(promover)=%d\n' \
