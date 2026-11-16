@@ -324,4 +324,48 @@ describe("useAssignedCoding", () => {
       await p;
     });
   });
+
+  it("mantém o documento aberto quando a fila é reordenada pela revalidação após o envio", async () => {
+    // Regressão medida no modo estático: depois de enviar d1, a tela abria d2;
+    // a revalidação da rota trazia a fila numa ordem nova (o desempate é a
+    // ordem do PostgREST, não garantida) e, com o índice posicional, a tela
+    // trocava sozinha para d3 — com a URL ainda em d2 — e o envio seguinte
+    // gravava num documento diferente do que a pesquisadora tinha começado a ler.
+    const { params } = setup();
+    const view = renderHook((props: typeof params) => useAssignedCoding(props), {
+      initialProps: params,
+    });
+    act(() => view.result.current.handleAnswer("q1", "sim"));
+    await act(async () => {
+      await view.result.current.handleSubmit();
+    });
+    expect(view.result.current.currentDoc?.id).toBe("d2");
+    expect(params.updateDocParam).toHaveBeenLastCalledWith("d2");
+
+    const reordered = [doc("d1"), doc("d3"), doc("d2")];
+    view.rerender({ ...params, documents: reordered, sortedDocuments: reordered });
+    expect(view.result.current.currentDoc?.id).toBe("d2");
+    expect(view.result.current.docIndex).toBe(2);
+
+    act(() => view.result.current.handleAnswer("q1", "não"));
+    await act(async () => {
+      await view.result.current.handleSubmit();
+    });
+    expect(mockSave).toHaveBeenLastCalledWith("p1", "d2", { q1: "não" }, expect.anything());
+    // d2 era o último na ordem nova: a fila termina, sem pular para d3 nem
+    // anunciar "Parabéns" com documento pendente atrás.
+    expect(view.result.current.allDone).toBe(true);
+  });
+
+  it("volta à posição quando o documento aberto sai da fila", async () => {
+    const { params } = setup();
+    const view = renderHook((props: typeof params) => useAssignedCoding(props), {
+      initialProps: params,
+    });
+    act(() => view.result.current.handleDocNavigate(1));
+    expect(view.result.current.currentDoc?.id).toBe("d2");
+    const withoutD2 = [doc("d1"), doc("d3")];
+    view.rerender({ ...params, documents: withoutD2, sortedDocuments: withoutD2 });
+    expect(view.result.current.currentDoc?.id).toBe("d3");
+  });
 });

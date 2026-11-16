@@ -12,6 +12,9 @@ import type { AssignedDoc, PydanticField } from "@/lib/types";
 
 interface AssignedState {
   docIndex: number;
+  /** Documento aberto. A fila é ancorada por ele, não pela posição: ver
+   *  `anchoredIndex`. `null` só com a fila vazia. */
+  docId: string | null;
   allAnswers: Record<string, Record<string, unknown>>;
   allNotes: Record<string, string>;
   allDone: boolean;
@@ -20,7 +23,7 @@ interface AssignedState {
 type AssignedAction =
   | { type: "answer"; docId: string; field: string; value: unknown; fields: PydanticField[] }
   | { type: "notes"; docId: string; notes: string }
-  | { type: "index"; index: number }
+  | { type: "index"; index: number; docId: string | null }
   | { type: "allDone"; value: boolean }
   // Aplicação EXPLÍCITA de um rascunho local (#608). Nunca entra pelo seed do
   // reducer: semear a partir do rascunho seria aplicá-lo em silêncio, e o
@@ -57,7 +60,7 @@ function reducer(state: AssignedState, action: AssignedAction): AssignedState {
       // trocar a ordenação a partir da tela "Parabéns!" sai dela e reabre o
       // doc para edição (no fluxo antigo o usuário ficava preso até clicar
       // "Explorar mais documentos").
-      return { ...state, docIndex: action.index, allDone: false };
+      return { ...state, docIndex: action.index, docId: action.docId, allDone: false };
     case "allDone":
       return { ...state, allDone: action.value };
     case "restoreDraft":
@@ -146,12 +149,24 @@ export function useAssignedCoding({
 }: UseAssignedCodingParams) {
   const [state, dispatch] = useReducer(reducer, undefined, () => ({
     docIndex: initialDocIndex,
+    docId: sortedDocuments[initialDocIndex]?.id ?? null,
     allAnswers: existingAnswers,
     allNotes: notesFromJustifications(existingJustifications),
     allDone: false,
   }));
 
-  const { docIndex, allAnswers, allNotes, allDone } = state;
+  const { allAnswers, allNotes, allDone } = state;
+  // A fila muda de ordem quando a rota é revalidada depois de um envio: o
+  // desempate de `sortByAssignmentStatus` é a ordem do PostgREST, que não é
+  // garantida, e "Codificados recentemente" reordena pelo `updated_at`. Com um
+  // índice posicional, o documento aberto trocava sozinho — no modo estático,
+  // segundos depois de aparecer, com a pesquisadora já lendo — e a URL
+  // (`?doc=`) apontava para outro. Ancorar pelo id mantém o documento aberto;
+  // a posição só vale quando ele saiu da fila.
+  const anchoredIndex = state.docId
+    ? sortedDocuments.findIndex((d) => d.id === state.docId)
+    : -1;
+  const docIndex = anchoredIndex >= 0 ? anchoredIndex : state.docIndex;
   const currentDoc = sortedDocuments[docIndex];
   const docAnswers = useMemo(
     () => allAnswers[currentDoc?.id] || {},
@@ -259,7 +274,7 @@ export function useAssignedCoding({
       if (result.missingRequiredFields.length) return result.missingRequiredFields;
       if (docIndex < sortedDocuments.length - 1) {
         const nextIndex = docIndex + 1;
-        dispatch({ type: "index", index: nextIndex });
+        dispatch({ type: "index", index: nextIndex, docId: sortedDocuments[nextIndex]?.id ?? null });
         // Mantem a URL em sincronia com o doc exibido — sem isso, um refresh
         // apos enviar cai no doc recem-enviado (que no modo "recent" pula para
         // o topo da lista), nao no proximo.
@@ -301,7 +316,7 @@ export function useAssignedCoding({
         0,
         Math.min(newIndex, sortedDocuments.length - 1),
       );
-      dispatch({ type: "index", index: clampedIndex });
+      dispatch({ type: "index", index: clampedIndex, docId: sortedDocuments[clampedIndex]?.id ?? null });
       updateDocParam(sortedDocuments[clampedIndex]?.id ?? null);
     },
     [sortedDocuments, updateDocParam],
@@ -321,7 +336,8 @@ export function useAssignedCoding({
       const targetIndex = targetId
         ? nextDocs.findIndex((d) => d.id === targetId)
         : 0;
-      dispatch({ type: "index", index: Math.max(0, targetIndex) });
+      const index = Math.max(0, targetIndex);
+      dispatch({ type: "index", index, docId: nextDocs[index]?.id ?? null });
 
       const updates: Record<string, string | null> = {
         sort: nextSort === "default" ? "default" : null,
