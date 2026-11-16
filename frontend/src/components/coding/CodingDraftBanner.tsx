@@ -93,9 +93,10 @@ interface CodingDraftBannerProps {
   fields: PydanticField[];
   onRestore: () => void;
   onDiscard: () => void;
-  /** Instante em que a oferta chegou (`recoveryAt` de `useCodingDrafts`): a
-   *  idade do rascunho é medida dele, e não do mount da página, que pode ter
-   *  sido horas antes de a pesquisadora abrir este documento. */
+  /** Instante em que a oferta chegou à tela (`recoveryAt` de
+   *  `useCodingDrafts`, ou a saída do fullscreen, se posterior): a idade do
+   *  rascunho é medida dele, e não do mount da página, que pode ter sido horas
+   *  antes de a pesquisadora abrir este documento. */
   offeredAt: number;
 }
 
@@ -135,9 +136,10 @@ export function CodingDraftBanner({
           controles ficam fora daqui pelo mesmo motivo do #634: dentro de live
           region, botão é ruído reanunciado.
           O conteúdo é keyed pela chegada da oferta (`offeredAt`, um instante
-          por documento aberto): de um documento para outro, a mesma frase
-          ("há 2 horas") não mudaria o DOM, e o leitor não anunciaria a oferta
-          nova. Com a key, os nós são trocados e a chegada é anunciada. */}
+          por chegada à tela: documento aberto ou saída do fullscreen): de um
+          documento para outro, a mesma frase ("há 2 horas") não mudaria o
+          DOM, e o leitor não anunciaria a oferta nova. Com a key, os nós são
+          trocados e a chegada é anunciada. */}
       <div role="status" className="sr-only">
         {announced && (
           <div key={offeredAt}>

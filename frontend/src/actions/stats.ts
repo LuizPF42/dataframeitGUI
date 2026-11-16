@@ -5,6 +5,7 @@ import { getAuthUser, type AuthUser } from "@/lib/auth";
 import { revalidatePath } from "next/cache";
 import type { LlmErrorSource } from "@/lib/llm-error-metrics";
 import { caughtErrorCopy, serverErrorScope } from "@/lib/server-error";
+import { ambiguityCommentBody } from "@/lib/reviews/ambiguity-comment";
 import { carriesValue, decisionDependsOnSource, errorResolutionInputSchema, errorResolutionContextSchema, type ErrorDecision, type ErrorResolutionInput, type ErrorResolutionContext } from "@/lib/error-resolution";
 
 // Erro do Postgres ou PostgREST: o texto vai para o log, e o toast recebe a
@@ -37,46 +38,95 @@ async function withResolutionAction(
   }
 }
 
+const REVIEW_CELL_COLUMNS = "id, project_id, document_id, field_name, verdict, comment";
+
+type ResolutionPatch = { resolved_at: string | null; resolved_by: string | null };
+
+// O card da revisão "Ambíguo" esconde o comentário kind='ambiguity' da célula
+// que repete a nota dele (`mergeAmbiguityRepeats`, comments-mapper.ts), e o
+// leva junto ao ser resolvido ou reaberto. Pelo cliente do usuário: a RLS de
+// project_comments decide, e sem permissão nenhuma linha muda. Ao resolver, só
+// o comentário ainda aberto: um já resolvido mantém quem o resolveu.
+async function syncCoveredAmbiguityComment(
+  supabase: Awaited<ReturnType<typeof createSupabaseServer>>,
+  review: { project_id: string; document_id: string; field_name: string; verdict: string; comment: string | null },
+  patch: ResolutionPatch,
+): Promise<{ success: boolean; error?: string }> {
+  if (review.verdict !== "ambiguo") return { success: true };
+  let query = supabase
+    .from("project_comments")
+    .update(patch)
+    .eq("project_id", review.project_id)
+    .eq("document_id", review.document_id)
+    .eq("field_name", review.field_name)
+    .eq("kind", "ambiguity")
+    .eq("body", ambiguityCommentBody(review.comment));
+  if (patch.resolved_at !== null) query = query.is("resolved_at", null);
+  const { error } = await query;
+  if (error) {
+    return {
+      success: false,
+      error: statsServerError(
+        "comentário de ambiguidade da revisão",
+        error,
+        "O comentário da revisão foi atualizado, mas o de ambiguidade do campo não. Tente novamente.",
+      ),
+    };
+  }
+  return { success: true };
+}
+
+// Resolver e reabrir o comentário de uma revisão são o mesmo UPDATE com valores
+// opostos, e o mesmo patch vai ao comentário de ambiguidade que ele cobre.
+async function setReviewCommentResolution(
+  supabase: Awaited<ReturnType<typeof createSupabaseServer>>,
+  reviewId: string,
+  patch: ResolutionPatch,
+  copy: { step: string; failed: string; forbidden: string },
+): Promise<{ success: boolean; error?: string }> {
+  const { data, error } = await supabase
+    .from("reviews")
+    .update(patch)
+    .eq("id", reviewId)
+    .select(REVIEW_CELL_COLUMNS);
+
+  if (error) return { success: false, error: statsServerError(copy.step, error, copy.failed) };
+  if (!data || data.length === 0) return { success: false, error: copy.forbidden };
+  return syncCoveredAmbiguityComment(supabase, data[0], patch);
+}
+
 export async function resolveReviewComment(
   reviewId: string,
   projectId: string,
 ): Promise<{ success: boolean; error?: string }> {
-  return withResolutionAction(projectId, async (user, supabase) => {
-    const { data, error } = await supabase
-      .from("reviews")
-      .update({
-        resolved_at: new Date().toISOString(),
-        resolved_by: user.id,
-      })
-      .eq("id", reviewId)
-      .select("id");
-
-    if (error) return { success: false, error: statsServerError("resolver comentário", error, "Não foi possível resolver o comentário. Tente novamente.") };
-    if (!data || data.length === 0)
-      return { success: false, error: "Sem permissão para resolver este comentário" };
-    return { success: true };
-  });
+  return withResolutionAction(projectId, (user, supabase) =>
+    setReviewCommentResolution(
+      supabase,
+      reviewId,
+      { resolved_at: new Date().toISOString(), resolved_by: user.id },
+      {
+        step: "resolver comentário",
+        failed: "Não foi possível resolver o comentário. Tente novamente.",
+        forbidden: "Sem permissão para resolver este comentário",
+      },
+    ));
 }
 
 export async function reopenReviewComment(
   reviewId: string,
   projectId: string,
 ): Promise<{ success: boolean; error?: string }> {
-  return withResolutionAction(projectId, async (_user, supabase) => {
-    const { data, error } = await supabase
-      .from("reviews")
-      .update({
-        resolved_at: null,
-        resolved_by: null,
-      })
-      .eq("id", reviewId)
-      .select("id");
-
-    if (error) return { success: false, error: statsServerError("reabrir comentário", error, "Não foi possível reabrir o comentário. Tente novamente.") };
-    if (!data || data.length === 0)
-      return { success: false, error: "Sem permissão para reabrir este comentário" };
-    return { success: true };
-  });
+  return withResolutionAction(projectId, (_user, supabase) =>
+    setReviewCommentResolution(
+      supabase,
+      reviewId,
+      { resolved_at: null, resolved_by: null },
+      {
+        step: "reabrir comentário",
+        failed: "Não foi possível reabrir o comentário. Tente novamente.",
+        forbidden: "Sem permissão para reabrir este comentário",
+      },
+    ));
 }
 
 export async function resolveNote(
