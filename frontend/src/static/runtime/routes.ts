@@ -12,12 +12,12 @@ type Loader<T = unknown> = () => Promise<{ default: T }>;
 export type ServerComponent = (props: Record<string, unknown>) => ReactNode | Promise<ReactNode>;
 
 // Os padrões negativos tiram do bundle o que o modo estático substitui.
-const pages = import.meta.glob<{ default: ServerComponent }>([
+const pages = import.meta.glob<{ default: ServerComponent; __clientComponent?: boolean }>([
   "../../app/**/page.tsx",
   "!../../app/auth/**",
   "!../../app/api/**",
 ]);
-const layouts = import.meta.glob<{ default: ServerComponent }>([
+const layouts = import.meta.glob<{ default: ServerComponent; __clientComponent?: boolean }>([
   "../../app/**/layout.tsx",
   "!../../app/layout.tsx",
   "!../../app/auth/**",

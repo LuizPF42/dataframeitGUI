@@ -14,6 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import { BROWSER_ALIASES } from "./scripts/static/aliases.mjs";
+import { markClientRoute } from "./scripts/static/client-route.mjs";
 import { findPrivilegedActions } from "./scripts/static/privileged-actions.mjs";
 
 const frontendDir = path.dirname(fileURLToPath(import.meta.url));
@@ -71,6 +72,17 @@ function requestCachePlugin(): Plugin {
   };
 }
 
+/** Marca pages/layouts com "use client" (ver `scripts/static/client-route.mjs`). */
+function clientRoutePlugin(): Plugin {
+  return {
+    name: "dataframeit-client-route",
+    enforce: "pre",
+    transform(code, id) {
+      return markClientRoute(code, id);
+    },
+  };
+}
+
 /** Falha o build se a service role ou o Clerk entrarem no grafo do navegador. */
 function boundaryGuardPlugin(): Plugin {
   const forbidden = [
@@ -112,7 +124,7 @@ export default defineConfig(({ mode }) => ({
   base: process.env.STATIC_BASE_PATH ?? "/",
   envDir: frontendDir,
   publicDir: path.join(frontendDir, "static/public"),
-  plugins: [edgeActionsPlugin(), requestCachePlugin(), boundaryGuardPlugin(), spaFallbackPlugin()],
+  plugins: [edgeActionsPlugin(), requestCachePlugin(), clientRoutePlugin(), boundaryGuardPlugin(), spaFallbackPlugin()],
   resolve: {
     alias: [
       ...exactAliases,

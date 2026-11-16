@@ -7,7 +7,7 @@
 // Um componente assíncrono aninhado no JSX devolvido também é resolvido aqui,
 // porque o React no cliente não renderiza componentes `async`.
 
-import { cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
+import { cloneElement, createElement, isValidElement, type ReactElement, type ReactNode } from "react";
 
 const AsyncFunction = (async () => {}).constructor;
 
@@ -48,4 +48,19 @@ export async function renderServerComponent(
   props: Record<string, unknown>,
 ): Promise<ReactNode> {
   return resolveTree(await component(props));
+}
+
+/**
+ * Page ou layout carregado da árvore `src/app`. Módulo `"use client"` (marcado
+ * no build por `scripts/static/client-route.mjs`) vai ao React como elemento:
+ * chamá-lo como função rodaria os hooks fora da renderização (erro #321).
+ */
+export async function renderRouteModule(
+  module: { default: (props: Record<string, unknown>) => unknown; __clientComponent?: boolean },
+  props: Record<string, unknown>,
+): Promise<ReactNode> {
+  if (module.__clientComponent) {
+    return resolveTree(createElement(module.default as (p: Record<string, unknown>) => ReactNode, props));
+  }
+  return renderServerComponent(module.default, props);
 }

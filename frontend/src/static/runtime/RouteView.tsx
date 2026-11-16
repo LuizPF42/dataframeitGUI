@@ -20,7 +20,7 @@ import { NotFoundSignal, RedirectSignal } from "@/static/runtime/control-flow";
 import { getSnapshot, navigate, refresh, subscribe } from "@/static/runtime/navigation";
 import { beginRequest } from "@/static/runtime/request-cache";
 import { matchRoute, type RouteMatch } from "@/static/runtime/routes";
-import { renderServerComponent } from "@/static/runtime/server-tree";
+import { renderRouteModule } from "@/static/runtime/server-tree";
 import { NotFoundScreen } from "@/static/screens/NotFoundScreen";
 
 type ErrorComponent = ComponentType<{ error: Error; reset: () => void }>;
@@ -107,12 +107,12 @@ async function resolveMatch(match: RouteMatch, search: string) {
   // como `children` um slot que mostra o nível seguinte já resolvido.
   const resolved = await Promise.all([
     ...layoutModules.map((module, level) =>
-      renderServerComponent(module.default, {
+      renderRouteModule(module, {
         params: paramsPromise,
         children: <ChildSlot level={level} />,
       }),
     ),
-    renderServerComponent(pageModule.default, {
+    renderRouteModule(pageModule, {
       params: paramsPromise,
       searchParams: searchPromise,
     }),
