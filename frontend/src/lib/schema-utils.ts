@@ -8,6 +8,7 @@ import {
   normalizeSubfields,
   resolveAllowOther,
   resolveOptionalText,
+  resolveOptions,
   resolveRequired,
   resolveSubfieldRequired,
   resolveSubfieldRule,
@@ -36,11 +37,15 @@ function subfieldClassName(fieldName: string): string {
 }
 
 function baseAnnotation(field: PydanticField): string {
-  if (field.type === "single" && field.options) {
-    return `Literal[${field.options.map((o) => `"${escapeString(o)}"`).join(", ")}]`;
+  // Lista vazia é ausente, como em `snapshotOf`: os dois não podem divergir
+  // sobre o que é "o mesmo campo". (Campo de escolha sem opção não passa na
+  // validação do save.)
+  const options = resolveOptions(field.options);
+  if (field.type === "single" && options) {
+    return `Literal[${options.map((o) => `"${escapeString(o)}"`).join(", ")}]`;
   }
-  if (field.type === "multi" && field.options) {
-    return `list[Literal[${field.options.map((o) => `"${escapeString(o)}"`).join(", ")}]]`;
+  if (field.type === "multi" && options) {
+    return `list[Literal[${options.map((o) => `"${escapeString(o)}"`).join(", ")}]]`;
   }
   if (field.subfields && field.subfields.length > 0) {
     return subfieldClassName(field.name);
@@ -113,8 +118,10 @@ function fieldExtra(field: PydanticField): string {
   // código por aqui. Entram no hash do campo, então sem elas o código não
   // reconstrói o campo (#747). Só a lista não vazia sai, e o texto fica
   // byte-idêntico para quem não as usa.
-  if ((field.type === "date" || field.type === "text") && field.options?.length) {
-    const opts = field.options.map((o) => `"${escapeString(o)}"`).join(", ");
+  const extraOptions =
+    field.type === "date" || field.type === "text" ? resolveOptions(field.options) : null;
+  if (extraOptions) {
+    const opts = extraOptions.map((o) => `"${escapeString(o)}"`).join(", ");
     extras.push(`"options": [${opts}]`);
   }
   if ((field.type === "single" || field.type === "multi") && resolveAllowOther(field.allow_other)) {
@@ -225,12 +232,9 @@ export function generatePydanticCode(
     if (field.type === "date") {
       desc += ". Formato: DD/MM/AAAA (use XX para partes desconhecidas)";
     }
-    if (
-      field.type === "date" &&
-      field.options &&
-      field.options.length > 0
-    ) {
-      const sentinelList = field.options
+    const sentinels = field.type === "date" ? resolveOptions(field.options) : null;
+    if (sentinels) {
+      const sentinelList = sentinels
         .map((o) => `\\"${escapeString(o)}\\"`)
         .join(", ");
       desc += `. Caso não seja possível informar a data, usar um dos seguintes valores: ${sentinelList}`;
@@ -578,7 +582,8 @@ export function computeFieldHash(
   questionRevision?: number | null,
 ): string {
   // Lista vazia conta como ausente, como o `if options` do Python.
-  const optionsPart = options && options.length > 0 ? pythonSortedListRepr(options) : "";
+  const resolvedOptions = resolveOptions(options);
+  const optionsPart = resolvedOptions ? pythonSortedListRepr(resolvedOptions) : "";
   const revisionPart =
     questionRevision && questionRevision > 0 ? `|r${questionRevision}` : "";
   const content = `${name}|${type}|${optionsPart}|${description}${revisionPart}`;
@@ -673,7 +678,7 @@ export function snapshotOf(field: PydanticField): Record<string, unknown> {
     type: field.type,
     description: field.description,
     help_text: resolveOptionalText(field.help_text),
-    options: field.options ?? null,
+    options: resolveOptions(field.options),
     target: resolveTarget(field.target),
     required: resolveRequired(field.required),
     subfields: normalizeSubfields(field.subfields),
@@ -829,12 +834,12 @@ export function diffFields(
       before.help_text = resolveOptionalText(old.help_text);
       after.help_text = resolveOptionalText(f.help_text);
     }
-    const oldOpts = JSON.stringify(old.options ?? null);
-    const newOpts = JSON.stringify(f.options ?? null);
-    if (oldOpts !== newOpts) {
+    const oldOpts = resolveOptions(old.options);
+    const newOpts = resolveOptions(f.options);
+    if (JSON.stringify(oldOpts) !== JSON.stringify(newOpts)) {
       diffs.push(f.type === "text" ? "respostas padronizadas" : "opções");
-      before.options = old.options;
-      after.options = f.options;
+      before.options = oldOpts;
+      after.options = newOpts;
     }
     if (old.type !== f.type) {
       diffs.push("tipo");
@@ -942,11 +947,42 @@ export function inheritQuestionRevisions(
   );
 }
 
+// Teto do código Pydantic, o mesmo `_MAX_CODE_LENGTH` de
+// `backend/services/pydantic_compiler.py`: acima dele o backend recusa o
+// código, e o projeto salvo deixaria de compilar (LLM, recuperação de campos).
+export const MAX_PYDANTIC_CODE_LENGTH = 64 * 1024;
+
+// O backend mede com o `len()` do Python, que conta code points; `.length`
+// conta unidades UTF-16 e daria duas por emoji.
+export function pydanticCodeLength(code: string): number {
+  return Array.from(code).length;
+}
+
+// Mensagem de recusa quando o código passa do teto, ou `null`. Um schema que
+// já estava acima dele (gravado antes desta checagem) ainda aceita o save que
+// o encurta: recusar deixaria o coordenador sem caminho de volta pelo
+// `EditFieldDialog`, que salva um campo por vez.
+function pydanticCodeSizeError(code: string, previousCode: () => string): string | null {
+  const length = pydanticCodeLength(code);
+  if (length <= MAX_PYDANTIC_CODE_LENGTH) return null;
+  if (length < pydanticCodeLength(previousCode())) return null;
+  const format = (n: number) => n.toLocaleString("pt-BR");
+  return (
+    `O schema ficou grande demais para salvar: o código gerado tem ${format(length)} caracteres ` +
+    `e o limite é ${format(MAX_PYDANTIC_CODE_LENGTH)}. Encurte descrições, instruções ou opções.`
+  );
+}
+
 export interface SchemaPersistencePlan {
   changeType: ChangeType | null;
   bumped: { major: number; minor: number; patch: number };
   logEntries: SchemaLogEntry[];
   code: string;
+  /**
+   * Preenchido quando o código passa do teto do backend: quem persiste recusa
+   * o save com esta mensagem.
+   */
+  codeSizeError: string | null;
   hash: string;
   fieldsWithHash: PydanticField[];
 }
@@ -974,5 +1010,6 @@ export function planSchemaPersistence(
     ...f,
     hash: fieldHashOf(f),
   }));
-  return { changeType, bumped, logEntries, code, hash, fieldsWithHash };
+  const codeSizeError = pydanticCodeSizeError(code, () => generatePydanticCode(oldFields));
+  return { changeType, bumped, logEntries, code, codeSizeError, hash, fieldsWithHash };
 }

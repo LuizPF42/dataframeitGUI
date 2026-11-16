@@ -451,6 +451,11 @@ function prepareSchemaCommit(
   if (!plan.changeType && plan.logEntries.length === 0) {
     return { unchanged: true };
   }
+  // O backend recusa código acima do teto ao compilar; sem esta checagem o
+  // save passava e o projeto só falhava depois, ao rodar o LLM.
+  if (plan.codeSizeError) {
+    return { result: { status: "error", message: plan.codeSizeError } };
+  }
   return {
     plan,
     targetVersion: plan.changeType ? plan.bumped : context.current,

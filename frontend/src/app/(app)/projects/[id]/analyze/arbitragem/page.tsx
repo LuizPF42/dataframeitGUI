@@ -151,6 +151,9 @@ export default async function ArbitrationRoute({
           // A projeção é `string`: o tipo da linha é declarado aqui.
           .returns<ArbitrationFieldReviewRow[]>() as never,
       ),
+    // O documento sem campo pendente não entra na fila (filtro abaixo), e o
+    // texto dele não precisa trafegar.
+    { onlyDocumentsWithReviews: true },
   );
 
   const responseIdSet = new Set<string>();
