@@ -101,6 +101,7 @@ def configure(url: str, anon_key: str) -> None:
     _patch_http_clients()
     _install_dataframeit_bridge()
     _install_status_mirror()
+    _install_inline_executor()
 
 
 def set_provider_keys(keys_json: str) -> None:
@@ -208,6 +209,51 @@ def _install_status_mirror() -> None:
 
     init_job.__dataframeit_mirrored__ = True  # type: ignore[attr-defined]
     llm_runner.init_job = init_job
+
+
+class _InlineExecutor:
+    """`ThreadPoolExecutor` sem threads, no lugar do que o `llm_runner` usa.
+
+    O Pyodide não cria thread (`RuntimeError: can't start new thread`), e o
+    runner lê em paralelo, num `ThreadPoolExecutor`, os lotes de ids de
+    `_select_all` sempre que há mais de um lote: uma seleção de mais de 100
+    documentos, ou os pendentes de um projeto já em parte processado. Aqui os
+    lotes saem em sequência e na mesma ordem, então o resultado é o mesmo; só
+    as idas e voltas deixam de se sobrepor, o que o XHR síncrono do shim também
+    não faria. `pyodide-smoke.mjs` cobre o caminho com uma seleção de 150.
+    """
+
+    def __init__(self, max_workers: int | None = None, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __enter__(self) -> _InlineExecutor:
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        return None
+
+    def submit(self, fn, /, *args: Any, **kwargs: Any):
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # o Future guarda a falha, como no pool
+            future.set_exception(exc)
+        return future
+
+    def map(self, fn, *iterables: Any, timeout: float | None = None, chunksize: int = 1):
+        # Como o `Executor.map`: para no iterável mais curto.
+        return iter([fn(*args) for args in zip(*iterables, strict=False)])
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        return None
+
+
+def _install_inline_executor() -> None:
+    from services import llm_runner
+
+    llm_runner.ThreadPoolExecutor = _InlineExecutor  # type: ignore[attr-defined,misc]
 
 
 # ------------------------------------------------------------------ rotas

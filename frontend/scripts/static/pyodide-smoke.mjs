@@ -102,15 +102,19 @@ const db = {
     schema_version_major: 1, schema_version_minor: 0, schema_version_patch: 0,
     current_round_id: "22222222-2222-4222-8222-222222222222",
   },
-  documents: Array.from({ length: DOCS }, (_, i) => ({
-    id: `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`,
-    text: `Documento ${i + 1}`, title: `Doc ${i + 1}`, external_id: `d${i + 1}`,
-  })),
+  documents: Array.from({ length: DOCS }, (_, i) => fakeDocument(i)),
   runs: new Map(),
   published: [],
   edgeCalls: 0,
+  idBatchReads: 0,
   tokensSeen: new Set(),
 };
+function fakeDocument(i) {
+  return {
+    id: `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`,
+    text: `Documento ${i + 1}`, title: `Doc ${i + 1}`, external_id: `d${i + 1}`,
+  };
+}
 const params = (url) => new URL(url).searchParams;
 function route(method, url, body, headers) {
   db.tokensSeen.add(headers.authorization);
@@ -120,9 +124,15 @@ function route(method, url, body, headers) {
   }
   if (u.pathname === "/rest/v1/projects" && method === "PATCH") return [200, [db.project]];
   if (u.pathname === "/rest/v1/documents" && method === "GET") {
-    const gt = params(url).get("id")?.replace(/^gt\./, "");
+    // `_select_all` combina `id=gt.<último>` (página seguinte) com
+    // `id=in.(...)` (lote de ids), como o PostgREST.
+    const idFilters = params(url).getAll("id");
+    const gt = idFilters.find((f) => f.startsWith("gt."))?.slice(3);
+    const inList = idFilters.find((f) => f.startsWith("in."));
+    const only = inList && new Set(inList.slice(4, -1).split(",").map((v) => v.replace(/^"|"$/g, "")));
+    if (only) db.idBatchReads += 1;
     const limit = Number(params(url).get("limit") ?? 1000);
-    const rows = db.documents.filter((d) => !gt || d.id > gt).slice(0, limit);
+    const rows = db.documents.filter((d) => (!gt || d.id > gt) && (!only || only.has(d.id))).slice(0, limit);
     return [200, rows];
   }
   if (u.pathname === "/rest/v1/llm_runs" && method === "POST") {
@@ -208,18 +218,45 @@ const badRun = JSON.parse(backend.call("start_run", JSON.stringify({ project_id:
 const runStarted = Date.now();
 await backend.run_job.callPromising("run", jobId, JSON.stringify({ project_id: PROJECT, filter_mode: "all" }));
 const seconds = (Date.now() - runStarted) / 1000;
+const run = db.runs.get(jobId);
+const last = statuses.at(-1) ?? {};
+const firstPublished = db.published.slice();
+
+// Rodada sobre uma seleção de mais de 100 documentos: `_select_all` lê os ids
+// em lotes de 100, que no servidor saem em paralelo num ThreadPoolExecutor. O
+// Pyodide não cria thread, e é o `static_backend` que põe os lotes em sequência.
+const SELECTED = 150;
+while (db.documents.length < SELECTED) db.documents.push(fakeDocument(db.documents.length));
+const selection = { project_id: PROJECT, filter_mode: "all", document_ids: db.documents.slice(0, SELECTED).map((d) => d.id) };
+const selectionStart = JSON.parse(backend.call("start_run", JSON.stringify(selection)));
+if (!selectionStart.ok) throw new Error(`start_run (seleção) falhou: ${JSON.stringify(selectionStart)}`);
+const selectionJob = selectionStart.data.job_id;
+let selectionError = null;
+try {
+  await backend.run_job.callPromising("run", selectionJob, JSON.stringify(selection));
+} catch (error) {
+  selectionError = String(error).split("\n").filter(Boolean).slice(-3).join(" | ");
+}
+const selectionRun = db.runs.get(selectionJob);
+const selectionPublished = db.published.slice(firstPublished.length);
 server.close();
 
 // ------------------------------------------------------------ asserções
-const run = db.runs.get(jobId);
-const last = statuses.at(-1) ?? {};
 const checks = [
   ["rodada aberta em llm_runs", Boolean(run)],
   ["rodada concluída", run?.status === "completed"],
   ["status espelhado para o JS", last.status === "completed" && last.progress === DOCS],
-  [`${DOCS} respostas publicadas pela RPC do navegador`, db.published.length === DOCS],
-  ["respostas com os campos do schema", db.published.every((r) => r.answers?.campo_a === "valor simulado")],
-  ["um documento por resposta", new Set(db.published.map((r) => r.document_id)).size === DOCS],
+  [`${DOCS} respostas publicadas pela RPC do navegador`, firstPublished.length === DOCS],
+  ["respostas com os campos do schema", firstPublished.every((r) => r.answers?.campo_a === "valor simulado")],
+  ["um documento por resposta", new Set(firstPublished.map((r) => r.document_id)).size === DOCS],
+  [
+    `seleção de ${SELECTED} documentos lida em lotes de ids e concluída${selectionError ? ` (erro: ${selectionError})` : ""}`,
+    !selectionError && selectionRun?.status === "completed" && db.idBatchReads >= 2,
+  ],
+  [
+    `${SELECTED} respostas publicadas na rodada da seleção`,
+    new Set(selectionPublished.map((r) => r.document_id)).size === SELECTED,
+  ],
   [`paralelismo real (máx. em voo ${maxInFlight})`, PARALLEL === 1 ? maxInFlight === 1 : maxInFlight > 1 && maxInFlight <= PARALLEL],
   ["JWT do coordenador em toda chamada ao banco", db.tokensSeen.size === 1 && db.tokensSeen.has("Bearer jwt-do-coordenador")],
   ["reconciliação da auto-revisão acordada pela Edge Function", db.edgeCalls >= 1],
@@ -237,4 +274,7 @@ for (const [label, ok] of checks) {
   if (!ok) failed += 1;
 }
 if (run?.status !== "completed") console.log("llm_runs:", JSON.stringify(run, null, 1).slice(0, 3000));
+if (selectionRun?.status !== "completed") {
+  console.log("llm_runs (seleção):", JSON.stringify(selectionRun, null, 1).slice(0, 3000));
+}
 process.exit(failed ? 1 : 0);
