@@ -42,10 +42,22 @@ import {
   type LatestResponseRow,
 } from "@/lib/latest-response-uniqueness";
 import { verdictMatchesAnswer } from "@/lib/llm-error-metrics";
+import {
+  autoReviewCoverageCandidates,
+  autoReviewCoverageViolations,
+  autoReviewDivergences,
+  coverageKey,
+  type CoverageResponseMeta,
+} from "@/lib/auto-review-coverage";
+import {
+  groupValueEquivalencesByField,
+  VALUE_EQUIVALENCE_SELECT,
+  type ValueEquivalence,
+} from "@/lib/equivalence";
 // Mesma primitiva de igualdade que o produto usa para decidir divergência
 // (`lib/compare-divergence.ts`, `lib/equivalence.ts`): se as duas réguas
 // divergirem, é bug de contrato e a invariante deve enxergar.
-import { normalizeForComparison } from "@/lib/utils";
+import { groupBy, normalizeForComparison } from "@/lib/utils";
 import type { AnswerFieldHashes, PydanticField } from "@/lib/types";
 import { loadEnv } from "../comentarios-relatorio/load-env";
 
@@ -1043,6 +1055,115 @@ const invariants: Invariant[] = [
           key: r.document_id,
           detail: `${r.attempt_count} tentativa(s) desde ${r.requested_at} (projeto ${r.project_id}): ${r.last_error ?? "nenhuma tentativa registrada"}`,
         }));
+    },
+  },
+  {
+    name: "divergencia-de-auto-revisao-tem-ciclo-ou-request",
+    motivation:
+      "#683, inversa da anterior: aquela pega a fila que não drena, esta pega o trabalho que sumiu. Em projeto auto_review_llm, documento ativo cujo replay do reconciliador (computeBacklogRows com as equivalências de valor) dá divergência humano×LLM num campo sem ciclo operacional em field_reviews para o (documento, campo) e sem request pendente para a geração LLM corrente. Nesse estado final_answers não acha ciclo e exporta a resposta do LLM como 'consenso'. FAIL = algum caminho deixou de reenfileirar quando devia (inclusive a premissa do #670 de que nada se perde sem LLM), o ACK apagou um reenfileiramento (#682), a RPC recusou criar o ciclo, ou o projeto entrou em auto_review_llm com codificações já feitas e ninguém usou 'Regenerar backlog'. Regra em lib/auto-review-coverage.ts",
+    run: async () => {
+      const projects = await fetchAll<{ id: string; pydantic_fields: PydanticField[] | null }>(
+        "projects",
+        "id, pydantic_fields",
+        (q) => q.eq("automation_mode", "auto_review_llm"),
+      );
+      if (projects.length === 0) return [];
+      const projectIds = projects.map((p) => p.id);
+      const inProjects = (q: UntypedSelectBuilder) => q.in("project_id", projectIds);
+
+      // Fase 1 (metadados leves): respostas correntes e completas, membros e
+      // documentos ativos dos projetos em auto-revisão, para saber de quem
+      // buscar `answers`.
+      const [documents, responses, members, equivalences] = await Promise.all([
+        fetchAll<{ id: string }>("documents", "id", (q) => inProjects(q).is("excluded_at", null)),
+        fetchAll<CoverageResponseMeta>(
+          "responses",
+          "id, project_id, document_id, respondent_type, respondent_id",
+          (q) => inProjects(q).eq("is_latest", true).eq("is_partial", false),
+        ),
+        fetchAll<{ project_id: string; user_id: string }>("project_members", "project_id, user_id", inProjects),
+        fetchAll<ValueEquivalence & { project_id: string }>(
+          "value_equivalences",
+          `project_id, ${VALUE_EQUIVALENCE_SELECT}`,
+          inProjects,
+        ),
+      ]);
+      const membersOf = new Map(
+        [...groupBy(members, (m) => m.project_id)].map(([id, rows]) => [id, new Set(rows.map((m) => m.user_id))]),
+      );
+      const candidates = autoReviewCoverageCandidates(responses, new Set(documents.map((d) => d.id)), membersOf);
+
+      // Fase 2 (campos pesados só dos candidatos) e o replay.
+      const heavyOf = new Map(
+        (await fetchByIds<{ id: string; answers: Record<string, unknown> | null; answer_field_hashes: AnswerFieldHashes }>(
+          "responses",
+          "id, answers, answer_field_hashes",
+          candidates.flatMap((c) => [c.llm, ...c.humans].map((r) => r.id)),
+        )).map((r) => [r.id, r]),
+      );
+      const withAnswers = (r: CoverageResponseMeta) => {
+        const heavy = heavyOf.get(r.id);
+        if (!heavy) throw new Error(`responses(${r.id}): sumiu entre as duas fases`);
+        return { id: r.id, document_id: r.document_id, answers: heavy.answers ?? {}, answer_field_hashes: heavy.answer_field_hashes };
+      };
+      const candidatesOf = groupBy(candidates, (c) => c.llm.project_id);
+      const equivalencesOf = groupBy(equivalences, (e) => e.project_id);
+      const divergences = projects.flatMap((project) => {
+        const docs = candidatesOf.get(project.id) ?? [];
+        return autoReviewDivergences({
+          projectId: project.id,
+          fields: project.pydantic_fields ?? [],
+          humans: docs.flatMap((c) => c.humans.map((h) => ({ ...withAnswers(h), respondent_id: h.respondent_id }))),
+          llmByDocId: new Map(docs.map((c) => [c.llm.document_id, withAnswers(c.llm)])),
+          equivalencesByField: groupValueEquivalencesByField(equivalencesOf.get(project.id)),
+        });
+      });
+
+      // Outbox e ciclos só dos documentos divergentes, lidos DEPOIS das
+      // respostas e nesta ordem, para não fabricar falso positivo com o dreno
+      // correndo: o save grava resposta e request na mesma transação, e o
+      // worker grava os ciclos antes de apagar a request. Uma request que
+      // existia quando as respostas foram lidas ou ainda aparece, ou já foi
+      // apagada, e aí os ciclos gravados antes do ACK aparecem. Sobra o caso de
+      // um save novo e um dreno completo depois da fase 2, que some na execução
+      // seguinte. Ler por documento, e não a tabela paginada, também evita o
+      // salto de página: o worker apaga ciclos e troca o `id` dos que rotaciona.
+      const divergentDocs = [...new Set(divergences.map((d) => d.documentId))];
+      // Mesmo teto de URL do `fetchByIds`; aqui com paginação dentro do lote,
+      // porque 100 documentos podem ter mais de 1000 ciclos.
+      const CHUNK = 100;
+      const inDivergentDocs = async <T,>(
+        table: string,
+        columns: string,
+        filter?: (q: UntypedSelectBuilder) => UntypedSelectBuilder,
+        orderColumn?: string,
+      ) => {
+        const batches = [];
+        for (let i = 0; i < divergentDocs.length; i += CHUNK) batches.push(divergentDocs.slice(i, i + CHUNK));
+        const pages = await Promise.all(
+          batches.map((batch) =>
+            fetchAll<T>(table, columns, (q) => (filter ? filter(q.in("document_id", batch)) : q.in("document_id", batch)), orderColumn),
+          ),
+        );
+        return pages.flat();
+      };
+      const pendingLlmOf = new Map(
+        (await inDivergentDocs<{ document_id: string; llm_response_id: string }>(
+          "auto_review_reconciliation_requests",
+          "document_id, llm_response_id",
+          undefined,
+          "document_id",
+        )).map((r) => [r.document_id, r.llm_response_id]),
+      );
+      const openCycles = new Set(
+        (await inDivergentDocs<{ document_id: string; field_name: string }>(
+          "field_reviews",
+          "document_id, field_name",
+          (q) => q.is("superseded_at", null),
+        )).map((c) => coverageKey(c.document_id, c.field_name)),
+      );
+
+      return autoReviewCoverageViolations({ divergences, openCycles, pendingLlmOf });
     },
   },
 ];
