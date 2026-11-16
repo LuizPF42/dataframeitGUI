@@ -8,6 +8,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 matrix_script="$repo_root/.github/scripts/ci-gate-matrix.sh"
 real_config="$repo_root/.pre-commit-config.yaml"
 workflow="$repo_root/.github/workflows/ci.yml"
+database_workflow="$repo_root/.github/workflows/database-tests.yml"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -112,8 +113,15 @@ echo '{"fora-do-servidor": "precisa de segredo", "hook-que-sumiu": "motivo"}' >"
 expect_rejected "exceção de hook inexistente" 'exceção órfã'
 
 reset_fixture
+echo '{"fora-do-servidor": "precisa de segredo", "informativo": "motivo"}' >"$exempt"
+expect_rejected "exceção de hook de post-checkout" 'exceção órfã'
+
+# Exceção de hook de pre-commit vale (o job `lint` a lê em SKIP) e não mexe
+# nas células.
+reset_fixture
 echo '{"fora-do-servidor": "precisa de segredo", "leve": "motivo"}' >"$exempt"
-expect_rejected "exceção de hook que não é de pre-push" 'exceção órfã'
+[[ "$(cells "$config" "$exempt" "$shards")" == "pesado" ]] ||
+  fail "exceção de hook de pre-commit deveria ser aceita sem mudar as células"
 
 for empty_reason in '""' '"   "' 'null' 'true'; do
   reset_fixture
@@ -162,6 +170,24 @@ ruby -ryaml -e '
   check = required.fetch("steps").map { |step| step["run"].to_s }.join("\n")
   abort("ci-required precisa exigir success de todos os jobs") unless check.include?(%q{all(.[]; .result == "success")})
 
+  # O estágio pre-commit inteiro, menos as exceções do mesmo arquivo: hook
+  # leve novo entra sozinho, sem lista aqui.
+  light = jobs.fetch("lint").fetch("steps").map { |step| step["run"].to_s }.find { |text| text.include?("--hook-stage pre-commit --all-files") } or abort("o lint não roda os hooks de pre-commit com --all-files")
+  abort("o lint precisa tirar o SKIP de ci-exempt-gates.json") unless light =~ /SKIP="\$\(jq -r .keys \| join\(","\). \.github\/ci-exempt-gates\.json\)"/
+
+  # As exceções db-tests e llm-runs-contract apontam para este job.
+  # Workflow chamado que deixe de aceitar a chamada, ou peça permissão que o
+  # job não concede, derruba o ci.yml inteiro na largada: nenhum job roda e o
+  # check obrigatório fica "Expected".
+  abort("o job database precisa chamar o database-tests.yml") unless jobs.dig("database", "uses") == "./.github/workflows/database-tests.yml"
+  called = YAML.safe_load(File.read(ARGV.fetch(1)), aliases: true)
+  called_trigger = called["on"] || called[true]
+  abort("database-tests.yml precisa de workflow_call: é o ci.yml que o chama") unless called_trigger.key?("workflow_call")
+  abort("database-tests.yml não pode disparar sozinho em pull_request: rodaria duas vezes") if called_trigger.key?("pull_request")
+  abort("database-tests.yml pede permissão diferente da que o job database concede") unless called["permissions"] == jobs.dig("database", "permissions")
+  called_runs = called.fetch("jobs").values.flat_map { |job| job.fetch("steps").map { |step| step["run"].to_s } }
+  abort("database-tests.yml precisa rodar o runner (npm run test:db)") unless called_runs.include?("npm run test:db")
+
   gate = jobs.fetch("gate")
   abort("a matriz do gate precisa vir do job discover") unless gate.dig("strategy", "matrix") == "${{ fromJSON(needs.discover.outputs.matrix) }}"
   abort("uma célula vermelha não pode cancelar as outras") unless gate.dig("strategy", "fail-fast") == false
@@ -169,6 +195,6 @@ ruby -ryaml -e '
   env = run.fetch("env")
   abort("o gate precisa passar o id e o shard da célula ao hook") unless env["HOOK_ID"] == "${{ matrix.id }}" && env["GATE_SHARD"] == "${{ matrix.shard }}"
   abort("o gate precisa de GATE_FAIL_OPEN=0: no servidor, gate que não rodou não passa") unless env["GATE_FAIL_OPEN"] == "0"
-' "$workflow"
+' "$workflow" "$database_workflow"
 
 echo "contrato da matriz de gates: ok"
