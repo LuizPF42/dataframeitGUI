@@ -9,8 +9,8 @@ describe("tabela de rotas do modo estático", () => {
   });
 
   it("captura o parâmetro dinâmico e monta a cadeia de layouts", () => {
-    const match = matchRoute("/projects/abc-123/code");
-    expect(match?.route.dir).toBe("/(app)/projects/[id]/code");
+    const match = matchRoute("/projects/abc-123/documents");
+    expect(match?.route.dir).toBe("/(app)/projects/[id]/documents");
     expect(match?.params).toEqual({ id: "abc-123" });
     expect(match?.route.layouts.map((layout) => layout.dir)).toEqual([
       "/(app)",

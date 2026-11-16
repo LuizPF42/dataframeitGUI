@@ -33,11 +33,15 @@ afterAll(() => {
 
 describe("bundle da Edge Function actions", () => {
   it("só importa módulos embutidos (node:*), nunca pacote sem prefixo", () => {
+    // `(?<!")`: a palavra dentro de uma string não é import. O bundle traz
+    // listas como as palavras reservadas do Python (`"from","global",...`), e
+    // sem a guarda `"from","` virava o especificador ",".
     const specifiers = [
-      ...code.matchAll(/\bfrom\s*"([^"]+)"/g),
-      ...code.matchAll(/\bimport\s*\(\s*"([^"]+)"\s*\)/g),
-      ...code.matchAll(/\bimport\s*"([^"]+)"/g),
+      ...code.matchAll(/(?<!")\bfrom\s*"([^"]+)"/g),
+      ...code.matchAll(/(?<!")\bimport\s*\(\s*"([^"]+)"\s*\)/g),
+      ...code.matchAll(/(?<!")\bimport\s*"([^"]+)"/g),
     ].map((match) => match[1]);
+    expect(specifiers).toContain("node:async_hooks");
     expect(specifiers.filter((specifier) => !specifier.startsWith("node:"))).toEqual([]);
   });
 
