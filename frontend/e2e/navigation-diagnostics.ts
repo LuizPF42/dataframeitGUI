@@ -134,11 +134,29 @@ const ORIGIN_EXPLANATION: Record<NotFoundOrigin, string> = {
 // e a do login hospedado do Clerk, para onde vai quem não define aquela.
 const LOGIN_PATH = /^\/(?:auth\/login|sign-in)(?:\/|$)/;
 
+// Código que `errorDetail` (src/lib/server-error.ts) põe no painel de erro do
+// app, o mesmo da linha `[erro <código>]` que o `onRequestError`
+// (src/instrumentation.ts) loga. O código é hash do erro, não pista da origem:
+// só o log diz por que o servidor falhou (#527).
+const ERROR_SCREEN_CODE = /Código do erro: ([0-9a-z]+)/;
+
+export function describeErrorScreen(pageText: string): string | null {
+  const code = ERROR_SCREEN_CODE.exec(pageText)?.[1];
+  if (!code) return null;
+  return (
+    `tela de erro de servidor, código ${code}: a linha "[erro ${code}]" do ` +
+    "log do servidor ([WebServer] nesta saída, ou o terminal do servidor " +
+    "reaproveitado) traz a mensagem e o stack"
+  );
+}
+
 // URL final do frame principal de uma página, para o teste que falhou: é ela
 // que mostra o redirecionamento ao login, que a mensagem do spec ("pergunta
-// não apareceu") não tem como saber (#740). Os parâmetros do Clerk saem
-// redigidos, como nas navegações.
-export function describeFinalUrl(url: string): string {
+// não apareceu") não tem como saber (#740). Com o texto da página, aponta
+// também a tela de erro de servidor, que pode chegar com status 200 (erro
+// dentro do layout do projeto) e então não aparece nas navegações com erro.
+// Os parâmetros do Clerk saem redigidos, como nas navegações.
+export function describeFinalUrl(url: string, pageText = ""): string {
   let path = "";
   try {
     path = new URL(url).pathname;
@@ -146,9 +164,11 @@ export function describeFinalUrl(url: string): string {
     // about:blank ou URL malformada: mostra como veio.
   }
   const login = LOGIN_PATH.test(path)
-    ? " — tela de login: o login do spec não terminou, ou a sessão não valeu para o servidor"
-    : "";
-  return `${redactUrl(url)}${login}`;
+    ? "tela de login: o login do spec não terminou, ou a sessão não valeu para o servidor"
+    : null;
+  return [redactUrl(url), login, describeErrorScreen(pageText)]
+    .filter(Boolean)
+    .join(" — ");
 }
 
 export function describeNavigation(record: NavigationRecord): string {
