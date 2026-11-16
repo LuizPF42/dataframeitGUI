@@ -10,7 +10,8 @@
 # integrity` é pgTAP e roda por `supabase test db`; as demais sinalizam falha
 # com `RAISE EXCEPTION 'FALHOU ...'` e rodam por psql com ON_ERROR_STOP=1.
 #
-# Três guardas fecham os modos de drift que originaram ou disfarçariam a #557:
+# Quatro guardas fecham os modos de drift que originaram ou disfarçariam a #557
+# (a quarta veio da #650):
 #   1. Drift disco↔runner: a causa raiz da #557 foi uma suíte .test.sql fora de
 #      toda cadeia. Aqui, qualquer .test.sql no disco não classificado em um dos
 #      três conjuntos — ou qualquer suíte listada sem arquivo no disco — derruba
@@ -20,6 +21,10 @@
 #      silenciosamente até alguém reparar (drift no sentido bom, mas ainda drift).
 #   3. Diagnóstico em falha: a saída de cada suíte vai para um log; em FAIL de
 #      gate a cauda é impressa, sem exigir re-run da suíte.
+#   4. KNOWN_RED fóssil: toda entrada aponta para uma issue (#N) ABERTA. Uma
+#      suíte silenciada por issue fechada ou inexistente derruba o gate antes de
+#      rodar. Fora do CI, sem `gh`, sem rede ou sem login, a consulta é pulada
+#      com aviso (fail-open); no CI ela reprova.
 #
 # Uso: `npm run test:db` roda tudo; `npm run test:db -- <suíte> [<suíte>...]`
 # roda só as nomeadas (o nome do arquivo sem `.test.sql`, ou
@@ -212,6 +217,35 @@ report() {
     fail_known+=("${suite}")
   fi
 }
+
+# ── Guarda 4 (ver o cabeçalho): toda KNOWN_RED aponta para issue aberta. ─────
+# Fechada a issue, ou a suíte foi consertada e vai para GATE_SUITES, ou a
+# exceção perdeu o dono. No CI o workflow dá o token ao `gh`.
+KNOWN_RED_REPO=bdcdo/dataframeitGUI
+fossil=()
+for s in "${!KNOWN_RED[@]}"; do
+  ref="${KNOWN_RED[$s]}"
+  if [[ ! "$ref" =~ ^#([0-9]+)$ ]]; then
+    fossil+=("${s}: '${ref}' não é referência de issue (#N)")
+    continue
+  fi
+  if state="$(gh issue view "${BASH_REMATCH[1]}" --repo "${KNOWN_RED_REPO}" \
+    --json state -q .state 2>"${LOG_DIR}/gh.err")"; then
+    [[ "$state" == OPEN ]] || fossil+=("${s}: ${ref} está ${state}")
+  elif grep -q "Could not resolve to an issue" "${LOG_DIR}/gh.err"; then
+    fossil+=("${s}: ${ref} não existe em ${KNOWN_RED_REPO}")
+  elif in_ci; then
+    fossil+=("${s}: não deu para conferir ${ref} no GitHub: $(head -1 "${LOG_DIR}/gh.err")")
+  else
+    echo "aviso: não deu para conferir ${ref} de ${s} no GitHub (gh ausente, sem rede ou sem login); seguindo." >&2
+  fi
+done
+if [[ ${#fossil[@]} -gt 0 ]]; then
+  echo "▸ KNOWN_RED sem issue aberta — corrija antes de rodar:" >&2
+  printf '   - %s\n' "${fossil[@]}" >&2
+  echo "conserte a suíte e mova-a para GATE_SUITES, ou aponte a entrada para a issue aberta que a rastreia." >&2
+  exit 1
+fi
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   echo "▸ suítes de contrato do banco (varredura completa)"

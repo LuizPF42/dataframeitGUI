@@ -58,6 +58,16 @@ case "$*" in
 esac
 `,
   uv: "#!/usr/bin/env bash\nexit 0\n",
+  // Registra a chamada e imprime FAKE_GH_STATE. Sem ele, falha como o gh sem
+  // rede; com NOTFOUND, como o gh diante de um número que não existe.
+  gh: `#!/usr/bin/env bash
+echo "$*" >>"$FAKE_BIN/gh.log"
+case "\${FAKE_GH_STATE:-}" in
+  "") echo "error connecting to api.github.com" >&2; exit 1 ;;
+  NOTFOUND) echo "GraphQL: Could not resolve to an issue or pull request with the number of 123. (repository.issue)" >&2; exit 1 ;;
+  *) echo "$FAKE_GH_STATE" ;;
+esac
+`,
 };
 
 function makeBin(): string {
@@ -88,10 +98,10 @@ function run(
   failing: string[],
   env: Record<string, string> = {},
   suites: string[] = [],
-  dir: string = bin,
+  { dir = bin, script = runner }: { dir?: string; script?: string } = {},
 ) {
   // O próprio CI define GITHUB_ACTIONS; aqui só o caso que o pede o tem.
-  return spawnSync("/bin/bash", [runner, ...suites], {
+  return spawnSync("/bin/bash", [script, ...suites], {
     env: { ...process.env, GITHUB_ACTIONS: "", PATH: `${dir}:${process.env.PATH}`, FAKE_BIN: dir, FAKE_FAIL_FILES: failing.map(suite).join(":"), ...env },
     encoding: "utf8",
     timeout: RUNNER_TIMEOUT_MS,
@@ -105,7 +115,7 @@ let sweep: { status: number | null; stdout: string; log: string };
 beforeAll(() => {
   const dir = makeBin();
   try {
-    const result = run([], {}, [], dir);
+    const result = run([], {}, [], { dir });
     const log = fs.readFileSync(path.join(dir, "psql.log"), "utf8");
     sweep = { status: result.status, stdout: result.stdout, log };
   } finally {
@@ -205,5 +215,105 @@ describe("run-db-tests.sh", () => {
     expect(stdout).not.toContain("::error title=Suíte do banco value_equivalences");
     // A saída inteira já está no grupo: a cauda não se repete.
     expect(stdout).not.toContain("saída (cauda)");
+  });
+
+  // Guarda 4 (#650): KNOWN_RED está vazia na main, então o caso roda uma cópia
+  // do runner com rls_audit movida de GATE_SUITES para KNOWN_RED, ao lado de
+  // links para os outros scripts e para supabase/.
+  describe("KNOWN_RED só com issue aberta", () => {
+    let root: string;
+
+    // Escreve a cópia do runner com rls_audit em KNOWN_RED e devolve o caminho.
+    function writePatchedRunner(ref: string): string {
+      const source = fs.readFileSync(runner, "utf8");
+      const patched = source
+        .replace("declare -A KNOWN_RED=()", `declare -A KNOWN_RED=([rls_audit]="${ref}")`)
+        .replace(/^  rls_audit\n/m, "");
+      // Se o runner mudar e as trocas não pegarem, o caso falha em vez de
+      // conferir o runner sem a entrada.
+      expect(patched).toContain(`[rls_audit]="${ref}"`);
+      expect(patched.split("\n")).not.toContain("  rls_audit");
+      const script = path.join(root, "scripts/run-db-tests.sh");
+      fs.writeFileSync(script, patched);
+      return script;
+    }
+
+    function runWithKnownRed(ref: string, ghState: string, env: Record<string, string> = {}) {
+      return run(["rls_audit"], { FAKE_GH_STATE: ghState, ...env }, ["rls_audit"], {
+        script: writePatchedRunner(ref),
+      });
+    }
+
+    const ghCalls = () => {
+      const log = path.join(bin, "gh.log");
+      return fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n") : [];
+    };
+    const suitesRan = () => fs.existsSync(path.join(bin, "psql.log"));
+
+    beforeEach(() => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), "run-db-tests-root-"));
+      fs.mkdirSync(path.join(root, "scripts"));
+      fs.symlinkSync(path.join(frontend, "supabase"), path.join(root, "supabase"));
+      for (const name of ["run-sql-test.sh", "run-backend-integration.sh"]) {
+        fs.symlinkSync(path.join(frontend, "scripts", name), path.join(root, "scripts", name));
+      }
+    });
+
+    afterEach(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    it("com a issue aberta, a suíte vermelha é reportada sem reprovar", () => {
+      const { status, stdout } = runWithKnownRed("#123", "OPEN");
+      expect(ghCalls()).toEqual(["issue view 123 --repo bdcdo/dataframeitGUI --json state -q .state"]);
+      expect(stdout).toContain("  RED*  rls_audit (conhecida, #123)");
+      expect(status).toBe(0);
+    });
+
+    it("com a issue fechada, reprova antes de rodar qualquer suíte", () => {
+      const { status, stderr } = runWithKnownRed("#123", "CLOSED");
+      expect(stderr).toContain("KNOWN_RED sem issue aberta");
+      expect(stderr).toContain("rls_audit: #123 está CLOSED");
+      expect(suitesRan()).toBe(false);
+      expect(status).toBe(1);
+    });
+
+    it("entrada sem #N reprova sem consultar o GitHub", () => {
+      const { status, stderr } = runWithKnownRed("consertar depois", "OPEN");
+      expect(stderr).toContain("rls_audit: 'consertar depois' não é referência de issue (#N)");
+      expect(ghCalls()).toEqual([]);
+      expect(suitesRan()).toBe(false);
+      expect(status).toBe(1);
+    });
+
+    it("com a issue inexistente, reprova", () => {
+      const { status, stderr } = runWithKnownRed("#123", "NOTFOUND");
+      expect(stderr).toContain("rls_audit: #123 não existe em bdcdo/dataframeitGUI");
+      expect(suitesRan()).toBe(false);
+      expect(status).toBe(1);
+    });
+
+    it("fora do CI, sem rede ou login, avisa e segue (fail-open)", () => {
+      const { status, stdout, stderr } = runWithKnownRed("#123", "");
+      expect(ghCalls()).toHaveLength(1);
+      expect(stderr).toContain("aviso: não deu para conferir #123 de rls_audit no GitHub");
+      expect(stdout).toContain("  RED*  rls_audit (conhecida, #123)");
+      expect(status).toBe(0);
+    });
+
+    it("no CI, a consulta que falha reprova", () => {
+      const { status, stderr } = runWithKnownRed("#123", "", { GITHUB_ACTIONS: "true" });
+      expect(stderr).toContain(
+        "rls_audit: não deu para conferir #123 no GitHub: error connecting to api.github.com",
+      );
+      expect(suitesRan()).toBe(false);
+      expect(status).toBe(1);
+    });
+
+    it("nome de suíte desconhecido é erro antes de consultar o GitHub", () => {
+      const typo = run([], {}, ["rls_audt"], { script: writePatchedRunner("#123") });
+      expect(typo.status).toBe(2);
+      expect(ghCalls()).toEqual([]);
+    });
   });
 });
