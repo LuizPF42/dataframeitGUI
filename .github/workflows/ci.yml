@@ -1,0 +1,145 @@
+name: CI
+
+# Os gates de pre-push do .pre-commit-config.yaml, rodados no servidor: local,
+# `--no-verify`, `SKIP=`, a edição pela web e uma máquina sem `pre-commit
+# install` os pulam, e PR do Dependabot nunca passou por eles. Sem deploy e
+# sem segredos.
+#
+# A matriz do job `gate` não é escrita aqui: sai do .pre-commit-config.yaml
+# (.github/scripts/ci-gate-matrix.sh), uma célula por hook de pre-push, menos
+# as exceções com motivo de .github/ci-exempt-gates.json. Hook novo vira
+# célula sem tocar neste arquivo (#649).
+#
+# `ci-required` é o único check a marcar como obrigatório no ruleset (#651):
+# uma lista de checks na UI do GitHub seria outra lista à mão, fora do repo.
+#
+# Sem filtro de `paths`, de propósito: workflow que não dispara deixa o check
+# obrigatório em "Expected" para sempre, e o PR trava sem nada vermelho para
+# consertar. O teste de contrato (test-ci-gate-matrix.sh) barra a volta dele.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Só entre pushes do mesmo PR. Na main, cancelar o run do merge anterior
+  # deixaria aquele commit com X vermelho sem nunca ter sido conferido.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    name: Matriz de gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # ruby e jq vêm na imagem ubuntu-latest.
+      - name: Contrato da matriz e deste workflow
+        run: bash .github/scripts/test-ci-gate-matrix.sh
+      - name: Derivar a matriz do .pre-commit-config.yaml
+        id: matrix
+        run: |
+          matrix="$(bash .github/scripts/ci-gate-matrix.sh)"
+          jq -r '.include[].name' <<<"$matrix"
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+
+  gate:
+    name: ${{ matrix.name }}
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # fallow-audit e semgrep medem o que o PR introduz contra origin/main.
+          fetch-depth: 0
+      # Toda célula monta o ambiente inteiro (uv e node_modules): escolher o
+      # ambiente por hook seria uma segunda lista de hooks neste arquivo.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # Mesmo uv do backend/Dockerfile.
+          version: "0.9.18"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+          # Cada hook enche o cache com coisa diferente (só o pre-commit, o
+          # backend inteiro, o semgrep): com uma chave só, vale o primeiro.
+          cache-suffix: ${{ matrix.id }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Instalar o frontend
+        working-directory: frontend
+        run: npm ci
+      # `--all-files`: o hook local mede o delta do push, o CI mede o estado do
+      # repositório (lint-types e mypy rodam em todo arquivo que o `files:` do
+      # hook casa).
+      - name: pre-commit run ${{ matrix.id }}
+        run: uvx pre-commit@4.7.0 run --hook-stage pre-push --all-files "$HOOK_ID"
+        env:
+          HOOK_ID: ${{ matrix.id }}
+          GATE_SHARD: ${{ matrix.shard }}
+          # Gate que no push local libera em erro de infra (semgrep) reprova aqui.
+          GATE_FAIL_OPEN: "0"
+
+  # Fora da matriz porque não são hooks de pre-push: o ruff é hook de
+  # pre-commit, e o eslint não tem hook.
+  lint:
+    name: Lint (ruff e eslint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.9.18"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      # Os hooks do ruff, e não o comando reescrito aqui. O `--fix` e o format
+      # reprovam do mesmo jeito: o pre-commit falha quando o hook altera arquivo.
+      - name: Backend — ruff
+        run: |
+          uvx pre-commit@4.7.0 run --all-files ruff-check
+          uvx pre-commit@4.7.0 run --all-files ruff-format
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Frontend — instalar
+        working-directory: frontend
+        run: npm ci
+      - name: Frontend — eslint
+        working-directory: frontend
+        run: npm run lint
+
+  ci-required:
+    name: ci-required
+    # always(): sem ele, um job vermelho acima deixaria este como "skipped",
+    # que o GitHub aceita como check obrigatório cumprido.
+    if: always()
+    needs: [discover, gate, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Todos os jobs passaram
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null
+        env:
+          NEEDS: ${{ toJSON(needs) }}
