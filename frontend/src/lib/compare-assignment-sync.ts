@@ -26,7 +26,11 @@ import {
 } from "@/lib/compare-assignment-status";
 import { versionGate, type ProjectVersionRow } from "@/lib/compare-version";
 import { reviewIsValid, type ValidatableReview } from "@/lib/review-validity";
-import { fetchAllPaged } from "@/lib/supabase/fetch-all-paged";
+import {
+  fetchAllAfterId,
+  fetchByDocumentChunks,
+  type PagedRead,
+} from "@/lib/supabase/fetch-all-paged";
 import { groupBy } from "@/lib/utils";
 
 const PG_UNIQUE_VIOLATION = "23505";
@@ -200,6 +204,7 @@ interface AssignmentRow extends ReopenCandidate {
 }
 
 interface ReviewRow extends ValidatableReview {
+  id: string;
   document_id: string;
   reviewer_id: string | null;
 }
@@ -225,12 +230,6 @@ interface PlannedChange {
   row: AssignmentRow;
 }
 
-// Lote do `.in("document_id", ...)`: uma lista longa de UUIDs vai na URL do
-// PostgREST, e cem ficam bem abaixo do limite.
-const DOCUMENT_CHUNK = 100;
-
-type PagedRead<T> = Promise<{ data: T[]; error: { message: string } | null }>;
-
 // Leitura do projeto inteiro ou, com `documentIds`, só desses documentos, em
 // lotes. Duas fábricas porque o builder do PostgREST não se deixa tipar como
 // genérico sem estourar a inferência.
@@ -240,14 +239,7 @@ async function readProjectRows<T>(
   fetchChunk: (ids: string[]) => PagedRead<T>,
 ): PagedRead<T> {
   if (documentIds === null) return fetchAll();
-  const chunks: string[][] = [];
-  for (let i = 0; i < documentIds.length; i += DOCUMENT_CHUNK) {
-    chunks.push(documentIds.slice(i, i + DOCUMENT_CHUNK));
-  }
-  const results = await Promise.all(chunks.map(fetchChunk));
-  const failed = results.find((result) => result.error);
-  if (failed) return failed;
-  return { data: results.flatMap((result) => result.data), error: null };
+  return fetchByDocumentChunks(documentIds, fetchChunk);
 }
 
 // Quatro leituras paginadas do projeto em vez de quatro por assignment, para
@@ -271,9 +263,9 @@ async function loadProjectCompareState(
   if (!project?.current_round_id) return null;
 
   const onlyDocuments = onlyDocumentIds === null ? null : new Set(onlyDocumentIds);
-  const assignments = rowsOrThrow("assignments", await fetchAllPaged<AssignmentRow>(() => supabase
+  const assignments = rowsOrThrow("assignments", await fetchAllAfterId<AssignmentRow>(() => supabase
     .from("assignments").select("id, document_id, user_id, status, completed_at")
-    .eq("project_id", projectId).eq("type", "comparacao").eq("round_id", project.current_round_id), ["id"]))
+    .eq("project_id", projectId).eq("type", "comparacao").eq("round_id", project.current_round_id)))
     .filter((row) => onlyDocuments === null || onlyDocuments.has(row.document_id));
   if (assignments.length === 0) return null;
 
@@ -283,17 +275,17 @@ async function loadProjectCompareState(
   const [responses, reviews, equivalences] = await Promise.all([
     readProjectRows<ResponseRow>(
       documentIds,
-      () => fetchAllPaged<ResponseRow>(() => supabase
-        .from("responses").select(COMPARE_RESPONSE_SELECT).eq("project_id", projectId), ["id"]),
-      (ids) => fetchAllPaged<ResponseRow>(() => supabase
-        .from("responses").select(COMPARE_RESPONSE_SELECT).eq("project_id", projectId).in("document_id", ids), ["id"]),
+      () => fetchAllAfterId<ResponseRow>(() => supabase
+        .from("responses").select(COMPARE_RESPONSE_SELECT).eq("project_id", projectId)),
+      (ids) => fetchAllAfterId<ResponseRow>(() => supabase
+        .from("responses").select(COMPARE_RESPONSE_SELECT).eq("project_id", projectId).in("document_id", ids)),
     ),
     readProjectRows<ReviewRow>(
       documentIds,
-      () => fetchAllPaged<ReviewRow>(() => supabase
-        .from("reviews").select(reviewColumns).eq("project_id", projectId), ["id"]),
-      (ids) => fetchAllPaged<ReviewRow>(() => supabase
-        .from("reviews").select(reviewColumns).eq("project_id", projectId).in("document_id", ids), ["id"]),
+      () => fetchAllAfterId<ReviewRow>(() => supabase
+        .from("reviews").select(reviewColumns).eq("project_id", projectId)),
+      (ids) => fetchAllAfterId<ReviewRow>(() => supabase
+        .from("reviews").select(reviewColumns).eq("project_id", projectId).in("document_id", ids)),
     ),
     fetchProjectValueEquivalences(supabase, projectId),
   ]);

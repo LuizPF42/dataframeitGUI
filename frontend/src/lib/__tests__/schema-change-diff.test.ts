@@ -120,10 +120,26 @@ describe("diffPydanticField", () => {
     expect(diffs[0].after).toEqual(["a", "b", "c"]);
   });
 
+  // Entradas gravadas antes do resolvedor guardam `[]` onde não havia opção.
+  it("não acusa mudança entre lista de opções vazia e ausente", () => {
+    expect(diffPydanticField({ options: null }, { options: [] })).toEqual([]);
+    expect(diffPydanticField({ options: [] }, {})).toEqual([]);
+  });
+
   it("não duplica diff quando help_text é null vs undefined", () => {
     const diffs = diffPydanticField(
       { help_text: null },
       { help_text: undefined },
+    );
+    expect(diffs).toEqual([]);
+  });
+
+  // Mesma normalização de `snapshotOf` e `diffFields` (`resolveOptionalText`):
+  // texto vazio e nulo geram o mesmo código, então não são mudança (#503).
+  it("texto vazio e nulo são o mesmo valor em help_text e justification_prompt", () => {
+    const diffs = diffPydanticField(
+      { help_text: "", justification_prompt: "" },
+      { help_text: null, justification_prompt: null },
     );
     expect(diffs).toEqual([]);
   });

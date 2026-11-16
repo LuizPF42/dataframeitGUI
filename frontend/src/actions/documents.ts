@@ -7,10 +7,20 @@ import {
   requireCoordinator,
   resolveProjectMemberActor,
 } from "@/lib/auth";
-import { revalidatePath, revalidateTag } from "next/cache";
+import { revalidatePath } from "next/cache";
 import { md5 } from "@/lib/hash";
 import { sanitizeStoredAnswers } from "@/lib/response-snapshot";
 import type { DocumentMetadata, PydanticField } from "@/lib/types";
+import { serverErrorScope, type ServerError } from "@/lib/server-error";
+
+// Erro do Postgres ou PostgREST: o texto vai para o log, e o toast recebe a
+// copy pt-BR do fluxo (#502). A guarda de `replace_and_add_documents` sobre o
+// texto de documento já respondido levanta copy pt-BR própria com 55000
+// (20260927160000): essa passa como veio.
+const UPLOAD_FAILED = "Não foi possível gravar os documentos. Tente novamente.";
+const ANSWERED_TEXT_GUARD_SQLSTATE = "55000";
+
+const documentsServerError = serverErrorScope("documents");
 
 export interface DocumentRow {
   external_id?: string;
@@ -235,20 +245,17 @@ async function filterActiveExternalIdConflicts<
 // Exportada (não client-callable — é uma "use server" function, mas seu uso
 // pretendido é só server-to-server) para outras actions deste app que já
 // fizeram o próprio gate de autorização (ex: project-comments.ts) reusarem a
-// mesma invalidação em vez de duplicar revalidatePath/revalidateTag. Chamadas
+// mesma invalidação em vez de duplicar os revalidatePath. Chamadas
 // client-side desautenticadas ainda passam pelo wrapper `revalidateProjectDocuments`
 // abaixo, que faz o gate de acesso antes de delegar aqui.
 export async function revalidateProjectDocumentsCache(projectId: string) {
   try {
     revalidatePath(`/projects/${projectId}/config/documents`);
-    // A tag `project-${projectId}-documents` saiu junto com o unstable_cache da
-    // página de Atribuições (#664): sem produtor, revalidá-la seria invalidar
-    // nada e sugerir uma garantia que não existe. A rota entra aqui pelo path,
-    // e não pela tag: a lista passou a ser lida direto do banco, mas o Router
-    // Cache do cliente ainda pode servir uma renderização anterior — é o que
-    // faria um documento recém-excluído seguir aparecendo como atribuível.
+    // A rota de Atribuições entra pelo path: a lista é lida direto do banco
+    // (sem unstable_cache desde o #664), mas o Router Cache do cliente ainda
+    // pode servir uma renderização anterior — é o que faria um documento
+    // recém-excluído seguir aparecendo como atribuível.
     revalidatePath(`/projects/${projectId}/analyze/assignments`);
-    revalidateTag(`project-${projectId}-progress`, { expire: 60 });
   } catch (e) {
     console.error("[revalidateProjectDocuments] falha ao revalidar cache", e);
   }
@@ -305,7 +312,7 @@ export async function uploadDocuments(
 
     if (rows.length > 0) {
       const { error } = await supabase.from("documents").insert(rows);
-      if (error) return { error: error.message };
+      if (error) return { error: documentsServerError("inserção dos documentos", error, UPLOAD_FAILED) };
     }
 
     if (revalidate) await revalidateProjectDocumentsCache(projectId);
@@ -362,7 +369,14 @@ export async function uploadDocuments(
       p_duplicate_updates: duplicateUpdates,
       p_new_documents: rows,
     });
-    if (error) return { error: error.message };
+    if (error) {
+      return {
+        error:
+          error.code === ANSWERED_TEXT_GUARD_SQLSTATE
+            ? error.message
+            : documentsServerError("substituição de documentos", error, UPLOAD_FAILED),
+      };
+    }
 
     if (revalidate) await revalidateProjectDocumentsCache(projectId);
     return { count: documents.length - skipped, skipped };
@@ -384,7 +398,7 @@ export async function uploadDocuments(
 
   if (rows.length > 0) {
     const { error } = await supabase.from("documents").insert(rows);
-    if (error) return { error: error.message };
+    if (error) return { error: documentsServerError("inserção dos documentos", error, UPLOAD_FAILED) };
   }
 
   if (revalidate) await revalidateProjectDocumentsCache(projectId);
@@ -604,10 +618,10 @@ export async function getDocumentText(
 // os call sites em useDocumentActions.ts fazem `result?.error` sem narrowing.
 async function finishDocumentsMutation(
   projectId: string,
-  error: { message: string } | null,
+  error: ServerError | null,
   count: number,
 ) {
-  if (error) return { error: error.message };
+  if (error) return { error: documentsServerError("alteração dos documentos", error, "Não foi possível alterar os documentos. Tente novamente.") };
   await revalidateProjectDocumentsCache(projectId);
   return { count };
 }

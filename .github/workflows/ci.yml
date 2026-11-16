@@ -1,0 +1,198 @@
+name: CI
+
+# Os gates de pre-push do .pre-commit-config.yaml, rodados no servidor: local,
+# `--no-verify`, `SKIP=`, a edição pela web e uma máquina sem `pre-commit
+# install` os pulam, e PR do Dependabot nunca passou por eles. Sem deploy e
+# sem segredos.
+#
+# Os hooks do estágio pre-commit rodam todos no job `lint`, numa chamada só,
+# menos as exceções do mesmo .github/ci-exempt-gates.json. O banco entra pelo
+# job `database`, que chama o database-tests.yml, e o gitleaks pelo job
+# `secret-scan`, que chama o secret-scan.yml.
+#
+# A matriz do job `gate` não é escrita aqui: sai do .pre-commit-config.yaml
+# (.github/scripts/ci-gate-matrix.sh), uma célula por hook de pre-push, menos
+# as exceções com motivo de .github/ci-exempt-gates.json. Hook novo vira
+# célula sem tocar neste arquivo (#649).
+#
+# `ci-required` é o único check a marcar como obrigatório no ruleset (#651):
+# uma lista de checks na UI do GitHub seria outra lista à mão, fora do repo.
+#
+# Sem filtro de `paths`, de propósito: workflow que não dispara deixa o check
+# obrigatório em "Expected" para sempre, e o PR trava sem nada vermelho para
+# consertar. O teste de contrato (test-ci-gate-matrix.sh) barra a volta dele.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Um grupo por PR e, na main, um por commit: no grupo único da main, o
+  # terceiro push seguido tirava da fila o run pendente do segundo, e os
+  # commits daquele push ficavam sem o gitleaks, que só lê os do próprio push.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  # Só entre pushes do mesmo PR. Na main, cancelar o run do merge anterior
+  # deixaria aquele commit com X vermelho sem nunca ter sido conferido.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    name: Matriz de gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # ruby e jq vêm na imagem ubuntu-latest. O contrato roda também como
+      # hook no `lint`; aqui ele impede a matriz de sair de config inválida.
+      - name: Contrato da matriz e deste workflow
+        run: bash .github/scripts/test-ci-gate-matrix.sh
+      - name: Derivar a matriz do .pre-commit-config.yaml
+        id: matrix
+        run: |
+          matrix="$(bash .github/scripts/ci-gate-matrix.sh)"
+          jq -r '.include[].name' <<<"$matrix"
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+
+  gate:
+    name: ${{ matrix.name }}
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # fallow-audit e semgrep medem o que o PR introduz contra origin/main.
+          fetch-depth: 0
+      # Toda célula monta o ambiente inteiro (uv e node_modules): escolher o
+      # ambiente por hook seria uma segunda lista de hooks neste arquivo.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # Mesmo uv do backend/Dockerfile.
+          version: "0.9.18"
+          enable-cache: true
+          cache-dependency-glob: |
+            backend/uv.lock
+            .github/ci-tools/uv.lock
+          # Cada hook enche o cache com coisa diferente (só o pre-commit, o
+          # backend inteiro, o semgrep): com uma chave só, vale o primeiro.
+          cache-suffix: ${{ matrix.id }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Instalar o frontend
+        working-directory: frontend
+        run: npm ci
+      # `--all-files`: o hook local mede o delta do push, o CI mede o estado do
+      # repositório (lint-types e mypy rodam em todo arquivo que o `files:` do
+      # hook casa).
+      # O pre-commit é o do .github/ci-tools/uv.lock, que o Dependabot de
+      # `uv` atualiza: um `pre-commit@x.y.z` escrito aqui ficava fora do alcance
+      # dele (test_toolchain_pins.py barra a volta).
+      - name: pre-commit run ${{ matrix.id }}
+        run: uv run --locked --project .github/ci-tools pre-commit run --hook-stage pre-push --all-files "$HOOK_ID"
+        env:
+          HOOK_ID: ${{ matrix.id }}
+          GATE_SHARD: ${{ matrix.shard }}
+          # Gate que no push local libera em erro de infra (semgrep) reprova aqui.
+          GATE_FAIL_OPEN: "0"
+
+  # Os hooks do estágio pre-commit numa chamada só: são leves, e uma célula por hook
+  # pagaria o ambiente inteiro para cada um. Hook novo de pre-commit entra
+  # sozinho; o que não mede nada no servidor ganha motivo em
+  # ci-exempt-gates.json. O eslint não tem hook.
+  lint:
+    name: Lint (hooks de pre-commit e eslint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.9.18"
+          enable-cache: true
+          cache-dependency-glob: |
+            backend/uv.lock
+            .github/ci-tools/uv.lock
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # Antes dos hooks, como nas células: hook de pre-commit que precise do
+      # node_modules encontra o mesmo ambiente do push local.
+      - name: Instalar o frontend
+        working-directory: frontend
+        run: npm ci
+      # Os ambientes dos hooks de repositório remoto (o actionlint, compilado
+      # em Go, e o pre-commit-hooks): sem o cache, cada execução os remonta. A
+      # chave muda com o `rev` de qualquer hook e com o pre-commit do CI; o
+      # `restore-keys` aproveita o cache anterior quando o arquivo muda em hook
+      # local, que não tem ambiente (o pre-commit só monta o que faltar).
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml', '.github/ci-tools/uv.lock') }}
+          restore-keys: pre-commit-${{ runner.os }}-
+      # ruby, jq, python3 e go (o actionlint) vêm na imagem ubuntu-latest. O
+      # `--fix` e o format do ruff reprovam do mesmo jeito: o pre-commit falha
+      # quando o hook altera arquivo.
+      - name: Hooks de pre-commit
+        run: |
+          SKIP="$(jq -r 'keys | join(",")' .github/ci-exempt-gates.json)"
+          export SKIP
+          uv run --locked --project .github/ci-tools pre-commit run --hook-stage pre-commit --all-files
+      - name: eslint
+        working-directory: frontend
+        run: npm run lint
+
+  # Supabase local em Docker, com o mesmo runner do hook `db-tests`. Roda em
+  # todo PR, sem escolher por caminho: o job que fosse pulado deixaria o
+  # `ci-required` sem ter o que exigir dele.
+  database:
+    name: Banco
+    permissions:
+      # As mesmas do workflow chamado (o contrato confere).
+      contents: read
+      issues: read
+    uses: ./.github/workflows/database-tests.yml
+
+  # O gitleaks sobre o diff do PR e os commits do push: o hook local lê só o
+  # diff staged, vazio no servidor (exceção `gitleaks` de ci-exempt-gates.json).
+  secret-scan:
+    name: Segredos
+    permissions:
+      # As mesmas do workflow chamado (o contrato confere).
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/secret-scan.yml
+
+  ci-required:
+    name: ci-required
+    # always(): sem ele, um job vermelho acima deixaria este como "skipped",
+    # que o GitHub aceita como check obrigatório cumprido.
+    if: always()
+    needs: [discover, gate, lint, database, secret-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Todos os jobs passaram
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null
+        env:
+          NEEDS: ${{ toJSON(needs) }}

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { warmUpJsdom } from "@/test-utils/jsdom-warm-up";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const mocks = vi.hoisted(() => ({
@@ -19,6 +19,8 @@ vi.mock("sonner", () => ({
 
 import { EditPendingEmailDialog } from "@/components/members/EditPendingEmailDialog";
 import type { MemberRow } from "@/components/members/member-list-utils";
+import { maskedServerError } from "@/test-utils/masked-server-error";
+import { ACTION_TIMEOUT_MESSAGE, ACTION_TIMEOUT_MS } from "@/lib/action-timeout";
 
 // Exigido pela regra test-jsdom-warm-up (eslint-rules/test-jsdom-warm-up.mjs).
 beforeAll(() => warmUpJsdom(), 30_000);
@@ -32,6 +34,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 const member = {
@@ -71,19 +74,35 @@ describe("EditPendingEmailDialog", () => {
   });
 
   it("libera o botão e informa erro quando a action rejeita", async () => {
-    mocks.updatePendingMemberEmail.mockRejectedValue(new Error("network failure"));
+    mocks.updatePendingMemberEmail.mockRejectedValue(maskedServerError());
     const { onOpenChange } = renderDialog();
 
     await userEvent.setup().click(screen.getByRole("button", { name: "Salvar" }));
 
     await waitFor(() =>
       expect(mocks.toastError).toHaveBeenCalledWith(
-        "Não foi possível corrigir o e-mail. Tente novamente.",
+        "Não foi possível corrigir o e-mail. Tente novamente. — código 1bkm1w6",
       ),
     );
     expect(console.error).toHaveBeenCalled();
     const button = screen.getByRole("button", { name: "Salvar" });
     expect((button as HTMLButtonElement).disabled).toBe(false);
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  it("libera o botão e avisa quando a action nunca responde", async () => {
+    mocks.updatePendingMemberEmail.mockReturnValue(new Promise(() => {}));
+    const { onOpenChange } = renderDialog();
+    const button = screen.getByRole("button", { name: "Salvar" }) as HTMLButtonElement;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fireEvent.click(button);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(button.disabled).toBe(true);
+
+    await act(() => vi.advanceTimersByTimeAsync(ACTION_TIMEOUT_MS));
+
+    expect(mocks.toastError).toHaveBeenCalledWith(ACTION_TIMEOUT_MESSAGE);
+    expect(button.disabled).toBe(false);
     expect(onOpenChange).not.toHaveBeenCalled();
   });
 });

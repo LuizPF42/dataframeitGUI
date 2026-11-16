@@ -614,6 +614,62 @@ class Analysis(BaseModel):
     assert f["options"] == ["Não identificável"]
 
 
+def test_text_field_options_round_trip():
+    """As respostas padronizadas de campo de texto vêm de json_schema_extra,
+    como as sentinelas de data, e entram no hash do campo (#747)."""
+    code = """from pydantic import BaseModel, Field
+
+class Analysis(BaseModel):
+    motivo: str = Field(
+        description="Motivo",
+        json_schema_extra={"options": ["Não consta", "Outro"]},
+    )
+    livre: str = Field(description="Livre")
+"""
+    result = compile_pydantic(code, generate_missing_ids=True)
+    assert result["valid"], result["errors"]
+    motivo = _field(result, "motivo")
+    assert motivo["type"] == "text"
+    assert motivo["options"] == ["Não consta", "Outro"]
+    assert motivo["hash"] == _field_hash(
+        "motivo", "text", ["Não consta", "Outro"], "Motivo"
+    )
+    assert motivo["hash"] != _field_hash("motivo", "text", None, "Motivo")
+    assert _field(result, "livre")["options"] is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    ["[1, 2]", '["Não consta", None]', '["Não consta", 3.5]', '"Não consta"', "{}"],
+)
+@pytest.mark.parametrize("field_type", ["text", "date"])
+def test_extra_options_that_are_not_strings_are_refused(field_type, options):
+    """Só código escrito à mão chega aqui: antes o `str()` reconstruía o campo
+    com opções que ninguém escreveu (`1` virava `"1"`), em silêncio."""
+    extra = f'"options": {options}'
+    if field_type == "date":
+        extra += ', "field_type": "date"'
+    code = f"""from pydantic import BaseModel, Field
+
+class Analysis(BaseModel):
+    motivo: str = Field(description="Motivo", json_schema_extra={{{extra}}})
+"""
+    result = compile_pydantic(code, generate_missing_ids=True)
+    assert not result["valid"]
+    assert result["errors"] == ['Campo "motivo": "options" deve ser lista de strings.']
+
+
+def test_empty_extra_options_are_absent():
+    code = """from pydantic import BaseModel, Field
+
+class Analysis(BaseModel):
+    motivo: str = Field(description="Motivo", json_schema_extra={"options": []})
+"""
+    result = compile_pydantic(code, generate_missing_ids=True)
+    assert result["valid"], result["errors"]
+    assert _field(result, "motivo")["options"] is None
+
+
 def test_date_description_strips_generated_suffixes():
     """generatePydanticCode appends ". Formato: DD/MM/AAAA..." and, when
     options exist, ". Caso não seja possível informar a data, usar um dos

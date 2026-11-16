@@ -2,10 +2,18 @@
 
 import { createSupabaseServer } from "@/lib/supabase/server";
 import { getAuthUser, type AuthUser } from "@/lib/auth";
-import { errorMessage } from "@/lib/utils";
 import { revalidatePath } from "next/cache";
 import type { LlmErrorSource } from "@/lib/llm-error-metrics";
+import { caughtErrorCopy, serverErrorScope } from "@/lib/server-error";
+import { ambiguityCommentBody } from "@/lib/reviews/ambiguity-comment";
+import { fetchProfileNames, withProfileNames } from "@/lib/respondent-names";
 import { carriesValue, decisionDependsOnSource, errorResolutionInputSchema, errorResolutionContextSchema, type ErrorDecision, type ErrorResolutionInput, type ErrorResolutionContext } from "@/lib/error-resolution";
+
+// Erro do Postgres ou PostgREST: o texto vai para o log, e o toast recebe a
+// copy pt-BR do fluxo (#502). `set_error_resolution` fica de fora: a RPC levanta
+// copy pt-BR própria ("A decisão mudou. Recarregue antes de confirmar.").
+const statsServerError = serverErrorScope("stats");
+const GABARITO_FAILED = "Não foi possível carregar as respostas do gabarito. Tente novamente.";
 
 async function withResolutionAction(
   projectId: string,
@@ -22,50 +30,104 @@ async function withResolutionAction(
     if (result.success) revalidatePath(`/projects/${projectId}/reviews`);
     return result;
   } catch (e) {
-    return { success: false, error: errorMessage(e) || "Erro desconhecido" };
+    // O texto do erro vai para o log, e o toast recebe a copy (#502). As
+    // ações devolvem o caso de nenhuma linha como `{ error }`, sem lançar.
+    return {
+      success: false,
+      error: caughtErrorCopy("[stats] resolução falhou", e, "Não foi possível concluir a ação. Tente novamente."),
+    };
   }
+}
+
+const REVIEW_CELL_COLUMNS = "id, project_id, document_id, field_name, verdict, comment";
+
+type ResolutionPatch = { resolved_at: string | null; resolved_by: string | null };
+
+// O card da revisão "Ambíguo" esconde o comentário kind='ambiguity' da célula
+// que repete a nota dele (`mergeAmbiguityRepeats`, comments-mapper.ts), e o
+// leva junto ao ser resolvido ou reaberto. Pelo cliente do usuário: a RLS de
+// project_comments decide, e sem permissão nenhuma linha muda. Ao resolver, só
+// o comentário ainda aberto: um já resolvido mantém quem o resolveu.
+async function syncCoveredAmbiguityComment(
+  supabase: Awaited<ReturnType<typeof createSupabaseServer>>,
+  review: { project_id: string; document_id: string; field_name: string; verdict: string; comment: string | null },
+  patch: ResolutionPatch,
+): Promise<{ success: boolean; error?: string }> {
+  if (review.verdict !== "ambiguo") return { success: true };
+  let query = supabase
+    .from("project_comments")
+    .update(patch)
+    .eq("project_id", review.project_id)
+    .eq("document_id", review.document_id)
+    .eq("field_name", review.field_name)
+    .eq("kind", "ambiguity")
+    .eq("body", ambiguityCommentBody(review.comment));
+  if (patch.resolved_at !== null) query = query.is("resolved_at", null);
+  const { error } = await query;
+  if (error) {
+    return {
+      success: false,
+      error: statsServerError(
+        "comentário de ambiguidade da revisão",
+        error,
+        "O comentário da revisão foi atualizado, mas o de ambiguidade do campo não. Tente novamente.",
+      ),
+    };
+  }
+  return { success: true };
+}
+
+// Resolver e reabrir o comentário de uma revisão são o mesmo UPDATE com valores
+// opostos, e o mesmo patch vai ao comentário de ambiguidade que ele cobre.
+async function setReviewCommentResolution(
+  supabase: Awaited<ReturnType<typeof createSupabaseServer>>,
+  reviewId: string,
+  patch: ResolutionPatch,
+  copy: { step: string; failed: string; forbidden: string },
+): Promise<{ success: boolean; error?: string }> {
+  const { data, error } = await supabase
+    .from("reviews")
+    .update(patch)
+    .eq("id", reviewId)
+    .select(REVIEW_CELL_COLUMNS);
+
+  if (error) return { success: false, error: statsServerError(copy.step, error, copy.failed) };
+  if (!data || data.length === 0) return { success: false, error: copy.forbidden };
+  return syncCoveredAmbiguityComment(supabase, data[0], patch);
 }
 
 export async function resolveReviewComment(
   reviewId: string,
   projectId: string,
 ): Promise<{ success: boolean; error?: string }> {
-  return withResolutionAction(projectId, async (user, supabase) => {
-    const { data, error } = await supabase
-      .from("reviews")
-      .update({
-        resolved_at: new Date().toISOString(),
-        resolved_by: user.id,
-      })
-      .eq("id", reviewId)
-      .select("id");
-
-    if (error) return { success: false, error: error.message };
-    if (!data || data.length === 0)
-      return { success: false, error: "Sem permissão para resolver este comentário" };
-    return { success: true };
-  });
+  return withResolutionAction(projectId, (user, supabase) =>
+    setReviewCommentResolution(
+      supabase,
+      reviewId,
+      { resolved_at: new Date().toISOString(), resolved_by: user.id },
+      {
+        step: "resolver comentário",
+        failed: "Não foi possível resolver o comentário. Tente novamente.",
+        forbidden: "Sem permissão para resolver este comentário",
+      },
+    ));
 }
 
 export async function reopenReviewComment(
   reviewId: string,
   projectId: string,
 ): Promise<{ success: boolean; error?: string }> {
-  return withResolutionAction(projectId, async (_user, supabase) => {
-    const { data, error } = await supabase
-      .from("reviews")
-      .update({
-        resolved_at: null,
-        resolved_by: null,
-      })
-      .eq("id", reviewId)
-      .select("id");
-
-    if (error) return { success: false, error: error.message };
-    if (!data || data.length === 0)
-      return { success: false, error: "Sem permissão para reabrir este comentário" };
-    return { success: true };
-  });
+  return withResolutionAction(projectId, (_user, supabase) =>
+    setReviewCommentResolution(
+      supabase,
+      reviewId,
+      { resolved_at: null, resolved_by: null },
+      {
+        step: "reabrir comentário",
+        failed: "Não foi possível reabrir o comentário. Tente novamente.",
+        forbidden: "Sem permissão para reabrir este comentário",
+      },
+    ));
 }
 
 export async function resolveNote(
@@ -81,7 +143,7 @@ export async function resolveNote(
       note: note || null,
     });
 
-    if (error) return { success: false, error: error.message };
+    if (error) return { success: false, error: statsServerError("resolver anotação", error, "Não foi possível resolver a anotação. Tente novamente.") };
     return { success: true };
   });
 }
@@ -102,7 +164,7 @@ async function deleteResolutionByResponse(
     .eq("response_id", responseId)
     .select("response_id");
 
-  if (error) return { success: false, error: error.message };
+  if (error) return { success: false, error: statsServerError(`reabrir ${table}`, error, "Não foi possível reabrir a resolução. Tente novamente.") };
   if (!data || data.length === 0) return { success: false, error: nothingReopened };
   return { success: true };
 }
@@ -123,7 +185,7 @@ async function setDuvidaResolution(
     .eq("respondent_id", respondentId)
     .select("review_id");
 
-  if (error) return { success: false, error: error.message };
+  if (error) return { success: false, error: statsServerError("resolução da dúvida", error, "Não foi possível atualizar a dúvida. Tente novamente.") };
   if (!data || data.length === 0) return { success: false, error: forbidden };
   return { success: true };
 }
@@ -174,7 +236,7 @@ export async function resolveDifficulty(
       note: note || null,
     });
 
-    if (error) return { success: false, error: error.message };
+    if (error) return { success: false, error: statsServerError("resolver dificuldade", error, "Não foi possível resolver a dificuldade. Tente novamente.") };
     return { success: true };
   });
 }
@@ -209,18 +271,27 @@ export async function fetchGabaritoForComment(
 
     const supabase = await createSupabaseServer();
 
-    const { data: responses } = await supabase
-      .from("responses")
-      .select("id, respondent_name, respondent_type, answers")
-      .eq("project_id", projectId)
-      .eq("document_id", documentId)
-      // Só respostas ativas: humanas rebaixadas (is_latest=false) ou LLM antigo
-      // não devem aparecer no gabarito do comentário.
-      .eq("is_latest", true);
+    const [{ data: responses, error }, profileNames] = await Promise.all([
+      supabase
+        .from("responses")
+        .select("id, respondent_id, respondent_name, respondent_type, answers")
+        .eq("project_id", projectId)
+        .eq("document_id", documentId)
+        // Só respostas ativas: humanas rebaixadas (is_latest=false) ou LLM
+        // antigo não devem aparecer no gabarito do comentário.
+        .eq("is_latest", true),
+      fetchProfileNames(supabase, projectId),
+    ]);
 
+    // Sem este retorno, a leitura que falha mostrava um gabarito vazio, como
+    // se ninguém tivesse respondido (P3).
+    if (error) return { answers: [], error: statsServerError("leitura do gabarito", error, GABARITO_FAILED) };
     if (!responses) return { answers: [] };
 
-    const result: GabaritoRespondentAnswer[] = responses.map((r) => ({
+    const result: GabaritoRespondentAnswer[] = withProfileNames(
+      responses,
+      profileNames,
+    ).map((r) => ({
       id: r.id,
       respondentName: r.respondent_name || "Anônimo",
       respondentType: r.respondent_type as "humano" | "llm",
@@ -230,7 +301,7 @@ export async function fetchGabaritoForComment(
 
     return { answers: result };
   } catch (e) {
-    return { answers: [], error: errorMessage(e) || "Erro desconhecido" };
+    return { answers: [], error: caughtErrorCopy("[stats] leitura do gabarito falhou", e, GABARITO_FAILED) };
   }
 }
 
@@ -296,11 +367,17 @@ export async function prepareErrorResolution(input: {
         approved_value: input.decision === "both_correct" ? input.bothCorrectValue?.value ?? null : null,
       }),
     });
-    if (error) return { error: error.message };
+    if (error) return { error: statsServerError("contexto do erro do LLM", error, "Não foi possível carregar as fontes da decisão. Tente novamente.") };
     const parsed = errorResolutionContextSchema.safeParse(data);
     return parsed.success ? { context: parsed.data } : { error: "As fontes mudaram ou não estão disponíveis. Recarregue a página." };
   } catch (e) {
-    return { error: errorMessage(e) };
+    return {
+      error: caughtErrorCopy(
+        "[stats] contexto do erro do LLM falhou",
+        e,
+        "Não foi possível carregar as fontes da decisão. Tente novamente.",
+      ),
+    };
   }
 }
 

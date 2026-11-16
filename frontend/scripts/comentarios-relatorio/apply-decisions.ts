@@ -153,8 +153,9 @@ async function applySchemaChanges(
 
   // `help_text` alterado aqui vale como "Só esclarece": ver `question_revision`
   // em references/decisions-format.md.
-  const { changeType, bumped, logEntries, code, hash, fieldsWithHash } =
+  const { changeType, bumped, logEntries, code, codeSizeError, hash, fieldsWithHash } =
     planSchemaPersistence(oldFields, validatedFields, current);
+  if (codeSizeError) throw new Error(codeSizeError);
 
   const summary = {
     changeType,
@@ -711,14 +712,14 @@ async function main() {
   }
 
   // Este script roda fora do runtime Next, então não pode chamar
-  // revalidatePath/revalidateTag como saveSchemaFromGUI faz — o cache da GUI
-  // (revalidateTag com expire:60) pode continuar servindo o schema/versão
-  // antigos por até ~60s após um --yes que aplicou mudança de schema.
+  // revalidatePath como saveSchemaFromGUI faz. As páginas leem o schema direto
+  // do banco a cada requisição (não há unstable_cache nem tag de cache, #668),
+  // mas uma tela já aberta no navegador segue mostrando o schema/versão
+  // antigos até ser recarregada.
   if (write && (schemaResult as { applied?: boolean }).applied) {
     console.log(
-      "\n[aviso] Schema atualizado no banco. A GUI pode levar até ~60s para " +
-        "refletir a mudança (cache do Next) — se precisar ver o resultado " +
-        "imediatamente, recarregue a página específica com Ctrl+Shift+R.",
+      "\n[aviso] Schema atualizado no banco. Telas da GUI já abertas seguem " +
+        "mostrando a versão anterior até serem recarregadas.",
     );
   }
 }

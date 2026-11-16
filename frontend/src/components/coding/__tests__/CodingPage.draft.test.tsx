@@ -169,6 +169,12 @@ function plantDraft(draftAnswers: Record<string, unknown>, base = {}) {
 
 const storedDraft = () => parseCodingDraft(window.localStorage.getItem(KEY));
 
+// A região live da oferta (#635): a cópia da faixa que o leitor de tela lê. A
+// visível é `aria-hidden`, e há outras regiões `status` na tela (o indicador
+// de não enviado), daí o filtro.
+const offerRegion = () =>
+  screen.getAllByRole("status").find((el) => el.classList.contains("sr-only"));
+
 // O campo de resposta não tem `label` associado no `FieldRenderer`; é o
 // primeiro textbox do painel (o segundo é a caixa de notas).
 const answerInput = () => screen.getAllByRole("textbox")[0];
@@ -277,8 +283,10 @@ describe("recuperação — oferecer, nunca aplicar em silêncio", () => {
 
     await waitFor(() => expect(answerInput()).toBeTruthy());
     expect(answerInput()).toHaveProperty("value", "do servidor");
-    // Mas a existência do rascunho é anunciada.
-    expect(screen.getByText(/alterações não enviadas neste documento/i)).toBeTruthy();
+    // Mas a existência do rascunho é anunciada, na região live (#635).
+    await waitFor(() =>
+      expect(offerRegion()?.textContent).toMatch(/alterações não enviadas neste documento/i),
+    );
   });
 
   it("`Retomar` aplica o rascunho e acende o indicador de não enviado", async () => {
@@ -322,14 +330,73 @@ describe("recuperação — oferecer, nunca aplicar em silêncio", () => {
     plantDraft({ q1: "do rascunho" }, { q1: "antigo" });
     renderPage({ [DOC]: { q1: "servidor-novo" } });
 
-    expect(await screen.findByText(/foi salvo depois/i)).toBeTruthy();
+    await waitFor(() => expect(offerRegion()?.textContent).toMatch(/foi salvo depois/i));
     // Nomeia a pergunta pelo RÓTULO, não pelo nome interno do campo (`q1`). A
-    // busca é escopada ao `<strong>` da faixa porque o mesmo texto também é o
+    // busca é escopada ao `<strong>` da região porque o mesmo texto também é o
     // enunciado da pergunta no formulário.
-    const emphasized = screen.getByText(
+    const emphasized = within(offerRegion()!).getByText(
       (_, el) => el?.tagName === "STRONG" && el.textContent === "Qual o medicamento?",
     );
     expect(emphasized).toBeTruthy();
+  });
+});
+
+// A região live da oferta precisa existir antes de a oferta chegar (#635). Em
+// fullscreen a faixa não se aplica; se ela desmontasse ali (como era), a região
+// voltaria a nascer populada na saída. Mutação vermelha: devolver o
+// `!isFullscreen &&` em volta de `CodingDraftBanner` no `CodingPage`.
+describe("região live da oferta atravessa o fullscreen", () => {
+  it("entrar e sair do fullscreen não remonta a região", async () => {
+    const user = userEvent.setup();
+    plantDraft({ q1: "do rascunho" });
+    renderPage({ [DOC]: { q1: "do servidor" } });
+
+    await waitFor(() =>
+      expect(offerRegion()?.textContent).toMatch(/alterações não enviadas/i),
+    );
+    const live = offerRegion();
+
+    await user.keyboard("{Control>}{Shift>}F{/Shift}{/Control}");
+    expect(screen.queryByRole("button", { name: /retomar rascunho/i })).toBeNull();
+    expect(offerRegion()).toBe(live);
+    expect(live?.textContent).toBe("");
+
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("button", { name: /retomar rascunho/i })).toBeTruthy();
+    expect(offerRegion()).toBe(live);
+    expect(live?.textContent).toMatch(/alterações não enviadas/i);
+  });
+});
+
+// Em fullscreen a faixa fica sem oferta; a saída é a chegada dela à tela, e a
+// idade é medida dali. Medida do instante em que a oferta chegou ao hook (a
+// abertura do documento), ela ficava parada no valor daquele momento, e horas
+// em fullscreen sumiam da frase. Só o `Date` é falso: os timers da região live
+// e do `waitFor` seguem reais.
+describe("idade do rascunho depois do fullscreen", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("conta o tempo passado em fullscreen, na faixa e na região live", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-16T09:00:00Z"));
+    const user = userEvent.setup();
+    plantDraft({ q1: "do rascunho" });
+    renderPage({ [DOC]: { q1: "do servidor" } });
+
+    await waitFor(() => expect(offerRegion()?.textContent).toMatch(/há 5 minutos/));
+
+    await user.keyboard("{Control>}{Shift>}F{/Shift}{/Control}");
+    vi.setSystemTime(new Date("2026-11-16T12:00:00Z"));
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(offerRegion()?.textContent).toMatch(/há 3 horas/));
+    // A cópia visível (`aria-hidden`) diz o mesmo que a região live.
+    const visible = screen
+      .getAllByText(/salvas neste navegador há 3 horas/)
+      .filter((el) => !offerRegion()?.contains(el));
+    expect(visible).toHaveLength(1);
   });
 });
 

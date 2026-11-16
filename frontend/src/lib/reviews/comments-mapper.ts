@@ -1,6 +1,8 @@
+import { ambiguityCommentBody } from "@/lib/reviews/ambiguity-comment";
 import type { PydanticField } from "@/lib/types";
 import type { ReviewComment } from "@/components/stats/comment-card-utils";
 import { invalidReasonOf } from "@/lib/review-validity";
+import { profileDisplayName } from "@/lib/respondent-names";
 import { acknowledgmentIsCurrent } from "@/lib/reviews/verdict-acknowledgment";
 
 /* ── Raw row shapes (subset de colunas realmente usadas por cada mapper) ── */
@@ -20,6 +22,12 @@ export interface ReviewCommentRow {
   field_hash: string | null;
 }
 
+interface AuthorProfile {
+  email: string | null;
+  first_name: string | null;
+  last_name: string | null;
+}
+
 export interface NoteResponseRow {
   id: string;
   document_id: string;
@@ -36,7 +44,7 @@ export interface SuggestionRow {
   status: string;
   resolved_at: string | null;
   created_at: string;
-  profiles: { email: string | null } | null;
+  profiles: AuthorProfile | null;
 }
 
 export interface LlmResponseRow {
@@ -73,7 +81,7 @@ export interface ProjectCommentRow {
   kind: "note" | "exclusion_request" | "ambiguity";
   rejected_at: string | null;
   rejected_reason: string | null;
-  profiles: { email: string | null } | null;
+  profiles: AuthorProfile | null;
 }
 
 /* ── Mapping functions ── */
@@ -86,10 +94,6 @@ function resolveFieldMeta(fieldMap: Map<string, PydanticField>, fieldName: strin
     fieldOptions: field?.options,
     fieldType: field?.type,
   };
-}
-
-export function nameFromEmail(email: string | null | undefined): string {
-  return email?.split("@")[0] || "Anônimo";
 }
 
 export function mapReviewComments(
@@ -164,7 +168,7 @@ export function mapSuggestionComments(
       ...resolveFieldMeta(fieldMap, s.field_name),
       verdict: "sugestao",
       comment: s.reason || "Sem motivo",
-      reviewerName: nameFromEmail(s.profiles?.email),
+      reviewerName: profileDisplayName(s.profiles),
       resolvedAt: s.resolved_at,
       createdAt: s.created_at,
       chosenResponseId: null,
@@ -272,6 +276,12 @@ export function mapDuvidaComments(
 // exclusao. Para sugestoes aprovadas, o doc esta excluido — o titulo vem de
 // excludedDocTitles (buscado a parte pelo caller, ja que documents exclui
 // registros com excluded_at != null do docMap principal).
+//
+// Ambiguidade (kind='ambiguity') e o comentario que o veredito "Ambiguo" da aba
+// Comparar cria para o campo (`syncAmbiguityComment` em actions/reviews.ts).
+// Mora na mesma tabela das anotacoes e resolve/reabre pelo mesmo caminho (dai
+// `source: "anotacao"`), mas leva veredito proprio para ter rotulo e filtro
+// proprios na aba, em vez de se perder entre as notas (#680).
 export function mapProjectComments(
   rows: { exclusionRows: ProjectCommentRow[]; noteRows: ProjectCommentRow[] },
   docMap: Map<string, string>,
@@ -293,9 +303,9 @@ export function mapProjectComments(
     fieldDescription: c.field_name
       ? fieldMap.get(c.field_name)?.description || c.field_name
       : "Anotação livre",
-    verdict: "anotacao",
+    verdict: c.kind === "ambiguity" ? "ambiguidade" : "anotacao",
     comment: c.body,
-    reviewerName: nameFromEmail(c.profiles?.email),
+    reviewerName: profileDisplayName(c.profiles),
     resolvedAt: c.resolved_at,
     createdAt: c.created_at,
     chosenResponseId: null,
@@ -317,7 +327,7 @@ export function mapProjectComments(
       fieldDescription: "Sugestão de exclusão",
       verdict: "exclusao",
       comment: c.body,
-      reviewerName: nameFromEmail(c.profiles?.email),
+      reviewerName: profileDisplayName(c.profiles),
       resolvedAt: c.resolved_at,
       createdAt: c.created_at,
       chosenResponseId: null,
@@ -333,6 +343,50 @@ export function mapProjectComments(
   return { annotationComments, exclusionComments };
 }
 
+// O veredito "Ambíguo" com comentário cria também o comentário kind='ambiguity'
+// da célula, cujo corpo repete a nota (`ambiguityCommentBody`): os dois cards
+// diriam a mesma coisa (#680). Fica o da revisão, que tem o snapshot das
+// respostas, a validade do veredito, a resolução própria e entra na revisão
+// por documento; ele passa a responder também pelo filtro "Campos ambíguos".
+// O comentário de ambiguidade só sai quando algum card da revisão na célula
+// tem exatamente o texto dele e o mesmo estado (os dois abertos ou os dois
+// resolvidos); senão, segue como card próprio. Resolver ou reabrir o card
+// leva o comentário junto (`syncCoveredAmbiguityComment`, actions/stats.ts),
+// mas pelas permissões de quem clica, que podem não alcançar `project_comments`;
+// e o comentário também se resolve à parte. Como a Comparação conta o
+// comentário aberto da célula, escondido sob um card já resolvido ele ficaria
+// aberto sem card na aba para resolvê-lo.
+function cellKey(c: ReviewComment): string {
+  return `${c.documentId}\u0000${c.fieldName}`;
+}
+
+function mergeAmbiguityRepeats(
+  reviewComments: ReviewComment[],
+  annotationComments: ReviewComment[],
+): { reviewComments: ReviewComment[]; annotationComments: ReviewComment[] } {
+  const ambiguityComments = new Map(
+    annotationComments
+      .filter((c) => c.verdict === "ambiguidade")
+      .map((c) => [cellKey(c), c]),
+  );
+  const coveredCells = new Set<string>();
+  const reviews = reviewComments.map((r) => {
+    if (r.verdict !== "ambiguo") return r;
+    const key = cellKey(r);
+    const ambiguity = ambiguityComments.get(key);
+    if (ambiguity?.comment !== ambiguityCommentBody(r.comment)) return r;
+    if (Boolean(ambiguity.resolvedAt) !== Boolean(r.resolvedAt)) return r;
+    coveredCells.add(key);
+    return { ...r, coversAmbiguityComment: true as const };
+  });
+  return {
+    reviewComments: reviews,
+    annotationComments: annotationComments.filter(
+      (c) => c.verdict !== "ambiguidade" || !coveredCells.has(cellKey(c)),
+    ),
+  };
+}
+
 // Pending suggestions e exclusoes primeiro, demais por data.
 export function buildOrderedComments(input: {
   reviewComments: ReviewComment[];
@@ -344,14 +398,16 @@ export function buildOrderedComments(input: {
   exclusionComments: ReviewComment[];
 }): ReviewComment[] {
   const {
-    reviewComments,
     noteComments,
     difficultyComments,
     duvidaComments,
-    annotationComments,
     suggestionComments,
     exclusionComments,
   } = input;
+  const { reviewComments, annotationComments } = mergeAmbiguityRepeats(
+    input.reviewComments,
+    input.annotationComments,
+  );
 
   const pendingSuggestions = suggestionComments.filter(
     (s) => s.suggestionStatus === "pending",

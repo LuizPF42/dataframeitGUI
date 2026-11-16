@@ -11,6 +11,7 @@ import { DocumentReader } from "@/components/coding/DocumentReader";
 import { Loader2 } from "lucide-react";
 import { acknowledgeVerdict } from "@/actions/verdicts";
 import { toast } from "sonner";
+import { withErrorCode } from "@/lib/server-error";
 import { useDocumentText } from "@/hooks/useDocumentText";
 import { useUrlState } from "@/hooks/useUrlState";
 import {
@@ -38,7 +39,6 @@ interface MyVerdictsViewProps {
   projectId: string;
   items: VerdictItem[];
   fields: PydanticField[];
-  userName: string;
   isCoordinator?: boolean;
   respondents?: RespondentOption[];
   currentViewUserId?: string;
@@ -58,7 +58,6 @@ function MyVerdictsViewInner({
   projectId,
   items,
   fields,
-  userName,
   isCoordinator,
   respondents = EMPTY_RESPONDENTS,
   currentViewUserId,
@@ -184,10 +183,10 @@ function MyVerdictsViewInner({
             refresh();
             resolve(true);
           }
-        } catch {
+        } catch (error) {
           // Server action rejeitou (rede/auth) — sem catch, a Promise nunca
           // resolveria e o input de dúvida ficaria pendente para sempre.
-          toast.error("Não foi possível registrar. Tente novamente.");
+          toast.error(withErrorCode(error, "Não foi possível registrar. Tente novamente."));
           resolve(false);
         }
       });
@@ -226,8 +225,7 @@ function MyVerdictsViewInner({
         isPending={isPending}
         docCount={docGroups.length}
         docIndex={docIndex}
-        onPrev={() => goToIndex(docIndex - 1)}
-        onNext={() => goToIndex(docIndex + 1)}
+        onNavigate={goToIndex}
       />
 
       {docGroups.length === 0 || !currentGroup ? (
@@ -253,7 +251,6 @@ function MyVerdictsViewInner({
               fieldFilter={fieldFilter}
               onFieldFilterChange={setFieldFilter}
               projectId={projectId}
-              userName={userName}
               isPending={isPending}
               onAcknowledge={handleAcknowledge}
             />

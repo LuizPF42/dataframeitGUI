@@ -2,7 +2,7 @@
 
 import { createSupabaseServer } from "@/lib/supabase/server";
 import { getAuthUser } from "@/lib/auth";
-import { revalidatePath, revalidateTag } from "next/cache";
+import { revalidatePath } from "next/cache";
 import { fetchFastAPIServer } from "@/lib/api-server";
 import { ApiError } from "@/lib/api";
 import type {
@@ -17,15 +17,19 @@ import {
   PROJECT_LOG_FIELD_NAME,
   type SchemaPersistencePlan,
 } from "@/lib/schema-utils";
-import { updateOrThrow, ZeroRowsError } from "@/lib/supabase/rls-guard";
+import { updateOrThrow } from "@/lib/supabase/rls-guard";
 import { resyncProjectCompareAssignments } from "@/lib/compare-assignment-sync";
 import { errorMessage } from "@/lib/utils";
-import { serverErrorCopy, type ServerError, type ServerErrorCopy } from "@/lib/server-error";
+import { caughtErrorCopy, serverErrorCopy, type ServerError, type ServerErrorCopy } from "@/lib/server-error";
 import {
   generateFieldId,
   parsePydanticFields,
   parseSaveablePydanticFields,
 } from "@/lib/pydantic-field";
+import {
+  deriveProjectVersionContext,
+  formatVersion,
+} from "@/lib/compare-version";
 import {
   buildKwargsForCapabilities,
   getModelCapabilities,
@@ -79,22 +83,6 @@ function projectReadFailed(error: ServerError): string {
   });
 }
 
-function projectVersion(project: Partial<SchemaProjectRow>): {
-  major: number;
-  minor: number;
-  patch: number;
-} {
-  return {
-    major: project.schema_version_major ?? 0,
-    minor: project.schema_version_minor ?? 1,
-    patch: project.schema_version_patch ?? 0,
-  };
-}
-
-function versionString(version: { major: number; minor: number; patch: number }): string {
-  return `${version.major}.${version.minor}.${version.patch}`;
-}
-
 function projectSnapshot(
   project: Pick<
     SchemaProjectRow,
@@ -107,7 +95,7 @@ function projectSnapshot(
 ): SchemaSnapshot {
   return {
     fields: project.pydantic_fields,
-    version: versionString(projectVersion(project)),
+    version: formatVersion(deriveProjectVersionContext(project).version),
     revision: project.schema_revision,
   };
 }
@@ -182,7 +170,7 @@ async function loadSchemaSaveContext(
     context: {
       project,
       oldFields: persistedFields,
-      current: projectVersion(project),
+      current: deriveProjectVersionContext(project).version,
     },
   };
 }
@@ -217,7 +205,7 @@ function commitSnapshot(row: SchemaCommitRow): SchemaSnapshot | null {
   return {
     fields,
     revision: row.schema_revision,
-    version: versionString({
+    version: formatVersion({
       major: row.schema_version_major,
       minor: row.schema_version_minor,
       patch: row.schema_version_patch,
@@ -327,7 +315,6 @@ function revalidateSchemaConsumers(projectId: string): void {
   revalidatePath(`/projects/${projectId}/analyze/compare`);
   revalidatePath(`/projects/${projectId}/reviews`);
   revalidatePath(`/projects/${projectId}/llm/configure`);
-  revalidateTag(`project-${projectId}-progress`, { expire: 60 });
 }
 
 // `fields` é o que o FastAPI devolveu, não um `PydanticField[]` provado: o
@@ -376,28 +363,18 @@ export async function recoverFieldsFromStoredCode(
     return { fields };
   } catch (e) {
     // O 4xx do backend já vem com copy pt-BR acionável (projeto sem código,
-    // acesso negado). Falha de rede ou 5xx ("fetch failed", "Internal Server
-    // Error") é diagnóstico: vai para o log, e o toast recebe copy pt-BR.
-    if (e instanceof ApiError && e.status < 500) return { error: e.message };
-    return {
-      error: serverErrorCopy(
-        "[schema] recuperação dos campos falhou",
-        { message: errorMessage(e) },
-        { generic: "Não foi possível recuperar os campos do código armazenado. Tente novamente." },
-      ),
-    };
+    // acesso negado). O 5xx o fetchFastAPI já levou ao log, com status e
+    // detail, e a mensagem dele traz o código daquela linha: vai como está.
+    // Falha de rede ("fetch failed") é diagnóstico que ainda não foi ao log e
+    // dá a copy pt-BR do fluxo.
+    const generic = "Não foi possível recuperar os campos do código armazenado. Tente novamente.";
+    if (e instanceof ApiError) return { error: e.message };
+    return { error: caughtErrorCopy("[schema] recuperação dos campos falhou", e, generic) };
   }
 }
 
 // As actions tratam erros na fronteira: o Next mascara mensagens lançadas em
 // Server Actions em produção, então a copy pt-BR precisa voltar no resultado.
-
-// `updateOrThrow` lança dois tipos de erro: ZeroRowsError, que já traz a copy de
-// permissão do fluxo, e o texto cru do Postgres, que vai para o log.
-function projectUpdateFailed(e: unknown, scope: string, generic: string): string {
-  if (e instanceof ZeroRowsError) return e.message;
-  return serverErrorCopy(scope, { message: errorMessage(e) }, { generic });
-}
 
 export async function savePrompt(
   projectId: string,
@@ -414,9 +391,9 @@ export async function savePrompt(
     );
   } catch (e) {
     return {
-      error: projectUpdateFailed(
-        e,
+      error: caughtErrorCopy(
         "[schema] save do prompt falhou",
+        e,
         "Não foi possível salvar o prompt. Tente novamente.",
       ),
     };
@@ -473,6 +450,11 @@ function prepareSchemaCommit(
   );
   if (!plan.changeType && plan.logEntries.length === 0) {
     return { unchanged: true };
+  }
+  // O backend recusa código acima do teto ao compilar; sem esta checagem o
+  // save passava e o projeto só falhava depois, ao rodar o LLM.
+  if (plan.codeSizeError) {
+    return { result: { status: "error", message: plan.codeSizeError } };
   }
   return {
     plan,
@@ -542,6 +524,7 @@ async function persistSchema(
   if ("result" in prepared) return prepared.result;
   if ("unchanged" in prepared) {
     if (!suggestionId) {
+      revalidateSchemaConsumers(projectId);
       return { status: "saved", snapshot: projectSnapshot(context.project) };
     }
     const resolved = await resolveSuggestionWithoutCommit(
@@ -621,6 +604,11 @@ export type BackfillSchemaResult =
   | { status: "conflict"; current: SchemaSnapshot }
   | { status: "error"; message: string };
 
+// Falha da paginação, que o fetchAllPages já levou ao log e cuja mensagem é a
+// copy pt-BR do toast. O resto que o runBackfill lança é exceção inesperada: o
+// texto vai para o log, não ao usuário.
+class BackfillFailure extends Error {}
+
 export async function backfillSchemaVersionHistory(
   projectId: string,
   expectedBaseline: SchemaBaselineIdentity,
@@ -628,9 +616,14 @@ export async function backfillSchemaVersionHistory(
   try {
     return await runBackfill(projectId, expectedBaseline);
   } catch (e) {
+    if (e instanceof BackfillFailure) return { status: "error", message: e.message };
     return {
       status: "error",
-      message: errorMessage(e) || "Erro ao reconstruir o histórico de versões",
+      message: caughtErrorCopy(
+        "[schema] backfill falhou",
+        e,
+        SCHEMA_RPC_COPY.apply_schema_backfill.generic,
+      ),
     };
   }
 }
@@ -657,7 +650,7 @@ async function fetchAllPages<T>(
       // Postgres ao toast pt-BR ("canceling statement due to statement
       // timeout", num projeto grande). Vale a mesma regra do mapRpcError: o
       // texto é diagnóstico de desenvolvedor e vai para o log do servidor.
-      throw new Error(
+      throw new BackfillFailure(
         serverErrorCopy("[schema] paginação do backfill falhou", error, {
           generic: SCHEMA_RPC_COPY.apply_schema_backfill.generic,
         }),
@@ -708,7 +701,7 @@ async function runBackfill(
   expectedBaseline: SchemaBaselineIdentity,
 ): Promise<BackfillSchemaResult> {
   const user = await getAuthUser();
-  if (!user) throw new Error("Não autenticado");
+  if (!user) return { status: "error", message: "Não autenticado" };
 
   const supabase = await createSupabaseServer();
 
@@ -725,8 +718,8 @@ async function runBackfill(
     .eq("id", projectId)
     .maybeSingle();
 
-  if (projectError) throw new Error(projectReadFailed(projectError));
-  if (!project) throw new Error("Projeto não encontrado ou sem permissão");
+  if (projectError) return { status: "error", message: projectReadFailed(projectError) };
+  if (!project) return { status: "error", message: "Projeto não encontrado ou sem permissão" };
 
   // O CAS compara contra a revisão que a ABA observou, como em
   // publishMajorVersion — não contra a leitura fresca deste request. Ler o
@@ -831,7 +824,7 @@ export async function publishMajorVersion(
         "Este projeto ainda não tem um schema salvo para publicar. Salve o schema antes de publicar uma versão MAJOR.",
     };
   }
-  const current = projectVersion(typedProject);
+  const current = deriveProjectVersionContext(typedProject).version;
   const bumped = bumpVersion(current, "major");
   const fields = typedProject.pydantic_fields;
   const { data, error } = await supabase
@@ -846,7 +839,7 @@ export async function publishMajorVersion(
       p_change_type: "major",
       p_log_entries: [{
         field_name: PROJECT_LOG_FIELD_NAME,
-        change_summary: `Nova versão MAJOR publicada: ${versionString(bumped)}`,
+        change_summary: `Nova versão MAJOR publicada: ${formatVersion(bumped)}`,
         before_value: current,
         after_value: bumped,
       }],
@@ -868,21 +861,30 @@ export async function toggleLlmField(
   enabled: boolean,
   expectedBaseline: SchemaBaselineIdentity,
 ): Promise<SchemaSaveResult> {
-  const loaded = await loadAuthenticatedSchemaContext(projectId, expectedBaseline);
-  if ("result" in loaded) return loaded.result;
-  let fields = loaded.context.oldFields;
-
-  if (enabled) {
-    if (!fields.some((f) => f.name === fieldDef.name)) {
-      // A definição padrão não carrega identidade: o id nasce aqui, quando o
-      // campo entra no schema deste projeto.
-      fields = [...fields, { ...fieldDef, id: generateFieldId() }];
+  let baseline = expectedBaseline;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const loaded = await loadAuthenticatedSchemaContext(projectId, baseline);
+    let result: SchemaSaveResult;
+    if ("result" in loaded) {
+      result = loaded.result;
+    } else {
+      let fields = loaded.context.oldFields;
+      if (enabled) {
+        if (!fields.some((f) => f.name === fieldDef.name)) {
+          // A definição padrão não carrega identidade: o id nasce aqui, quando
+          // o campo entra no schema deste projeto.
+          fields = [...fields, { ...fieldDef, id: generateFieldId() }];
+        }
+      } else {
+        fields = fields.filter((f) => f.name !== fieldDef.name);
+      }
+      // react-doctor-disable-next-line react-doctor/async-await-in-loop
+      result = await persistSchema(projectId, fields, baseline, loaded);
     }
-  } else {
-    fields = fields.filter((f) => f.name !== fieldDef.name);
+    if (result.status !== "conflict" || attempt === 1) return result;
+    baseline = { revision: result.current.revision };
   }
-
-  return persistSchema(projectId, fields, expectedBaseline, loaded);
+  throw new Error("retry de schema esgotado");
 }
 
 /**
@@ -937,9 +939,9 @@ export async function saveLlmConfig(
     });
   } catch (e) {
     return {
-      error: projectUpdateFailed(
-        e,
+      error: caughtErrorCopy(
         "[schema] save da configuração do LLM falhou",
+        e,
         "Não foi possível salvar a configuração do LLM. Tente novamente.",
       ),
     };

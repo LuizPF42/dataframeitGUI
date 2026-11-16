@@ -99,8 +99,11 @@ CHECKS_JSON='{"machine-1":[{"name":"servicecheck-00-http-8000","status":"critica
 expect_failure run_checker post
 
 # O workflow usa o mesmo contrato executável antes e depois do deploy e nunca
-# permite que o default de alta disponibilidade recrie a segunda Machine.
-ruby -ryaml -e '
+# permite que o default de alta disponibilidade recrie a segunda Machine. O
+# segundo argumento, opcional, substitui o timeout-minutes da espera para testar
+# o piso sem editar o workflow.
+check_workflow() {
+  ruby -ryaml -e '
   workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
   trigger = workflow["on"] || workflow[true]
   paths = trigger.fetch("push").fetch("paths")
@@ -138,8 +141,18 @@ ruby -ryaml -e '
   wait_step = steps.select { |s| s["run"] }.fetch(wait_jobs)
   # Sem `shell: bash` explícito o Actions roda `bash -e` sem pipefail.
   abort("a espera precisa de shell: bash (pipefail)") unless wait_step["shell"] == "bash"
-  abort("timeout da espera abaixo do prazo de 4 h") unless wait_step.fetch("timeout-minutes") > 240
-' "$workflow"
+  # Depois do prazo de 4 h cabe mais uma volta da espera, de cerca de 4,5 min
+  # (conta no comentário do passo em fly-deploy.yml): abaixo de 245 o Actions
+  # mataria o passo antes de ela terminar.
+  timeout = ARGV[1] ? Integer(ARGV[1]) : wait_step.fetch("timeout-minutes")
+  abort("timeout da espera abaixo de 4 h mais a última volta (245 min)") unless timeout >= 245
+' "$@"
+}
+
+check_workflow "$workflow"
+# O piso é 245, e não só "acima de 240".
+expect_failure check_workflow "$workflow" 244
+check_workflow "$workflow" 245
 
 # Comportamento da espera: o `run` do passo é extraído do YAML e executado com
 # curl, sleep e date falsos, na mesma invocação que o Actions usa para
@@ -148,7 +161,9 @@ ruby -ryaml -e '
 # stdout com status 0. O relógio é um arquivo que `date +%s` lê: cada sleep o
 # avança pelos segundos pedidos e cada leitura por 60 s, o pior caso do
 # `--max-time`. Assim o prazo de 4 h vence sem esperar, e um prazo contado em
-# voltas, e não em segundos de relógio, daria outro número de sleeps.
+# voltas, e não em segundos de relógio, daria outro número de sleeps. O
+# `timeout 120` só pega laço infinito: a run sem fim gasta uns 480 processos
+# falsos, e com 20 s o caso reprovava a main em máquina carregada.
 wait_script="$tmp_dir/wait-jobs.sh"
 ruby -ryaml -e '
   workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
@@ -190,7 +205,7 @@ run_wait() {
   touch "$tmp_dir/wait.sleep"
   echo 1700000000 >"$tmp_dir/wait.clock"
   if ! wait_output="$(env "PATH=$wait_bin:$PATH" WAIT_LOG="$tmp_dir/wait" CURL_RESPONSES="$tmp_dir/curl-responses" \
-    timeout 20 bash --noprofile --norc -eo pipefail "$wait_script" 2>&1)"; then
+    timeout 120 bash --noprofile --norc -eo pipefail "$wait_script" 2>&1)"; then
     printf 'a espera falhou ou estourou o tempo:\n%s\n' "$wait_output" >&2
     exit 1
   fi
@@ -232,52 +247,53 @@ mapfile -t endless_run < <(yes '{"status":"ok","active_jobs":1}' | head -n 121)
 run_wait "${endless_run[@]}"
 assert_wait "Runs ainda em curso depois de 4 h; o deploy segue" "$(yes 60 | head -n 120 | paste -sd' ')"
 
-# Mesma comparação por linha inteira, sem comentários, do contrato do frontend:
-# o arquivo cita em prosa formas que estas asserções rejeitam, e um grep de
-# substring casaria a documentação em vez da diretiva. A checagem roda em
-# subshell para que o `exit` reprove só a chamada e os casos vermelhos rodem.
+# Contrato estático do fly.toml, conferido bloco a bloco sobre o TOML parseado
+# (regras e porquês em fly-toml-contract.py, compartilhado com o contrato do
+# frontend). Cada diretiva nomeia o bloco: `[[vm]]` tem de ser um só e ter só
+# estas chaves.
 expected_directives=(
-  'size = "shared-cpu-1x"'
-  'memory = "512mb"'
-  'auto_stop_machines = "off"'
-  'auto_start_machines = true'
-  'min_machines_running = 1'
+  '[[vm]] size = "shared-cpu-1x"'
+  '[[vm]] memory = "512mb"'
+  '[http_service] auto_stop_machines = "off"'
+  '[http_service] auto_start_machines = true'
+  '[http_service] min_machines_running = 1'
 )
 
-check_fly_config() (
-  fly_directives="$(sed 's/#.*//; s/[[:space:]]*$//; s/^[[:space:]]*//' "$1")"
-  for directive in "${expected_directives[@]}"; do
-    grep -Fxq "$directive" <<<"$fly_directives" \
-      || { echo "backend/fly.toml sem a diretiva esperada: $directive" >&2; exit 1; }
-  done
-  # Nenhuma forma de scale-to-zero: "stop" derrubou o site em 2026-08-10 e
-  # "suspend" em 2026-11-03 (motivos no comentário do auto_stop_machines em
-  # frontend/fly.toml). Toda linha de auto_stop_machines, inclusive num bloco
-  # [[services]] separado que a asserção acima não vê, tem de ser "off" ou false.
-  # Lista do que se aceita, e não do que se proíbe: o flyctl também lê 'stop'
-  # (string literal do TOML) e true (o stop legado), e uma lista de proibidos
-  # deixava as duas passarem.
-  if grep -E '^auto_stop_machines[[:space:]]*=' <<<"$fly_directives" \
-    | grep -Evxq 'auto_stop_machines[[:space:]]*=[[:space:]]*("off"|false)'; then
-    echo "backend/fly.toml com scale-to-zero: todo auto_stop_machines tem de ser \"off\"" >&2
+check_fly_config() {
+  python3 "$repo_root/.github/scripts/fly-toml-contract.py" "$1" "${expected_directives[@]}"
+}
+
+# Caso vermelho do contrato: reprova, e pela mensagem do contrato
+# ("<arquivo>: ..."), para que um traceback do script não passe por recusa.
+expect_contract_failure() {
+  local output
+  if output="$(check_fly_config "$1" 2>&1)"; then
+    echo "o contrato deveria reprovar $1" >&2
     exit 1
   fi
-)
+  [[ $output == "$1: "* ]] || { printf 'o contrato reprovou %s sem a própria mensagem:\n%s\n' "$1" "$output" >&2; exit 1; }
+}
 
 check_fly_config "$fly_config"
 
-# Casos vermelhos: cada diretiva esperada que sobra só num comentário reprova
-# (um grep de substring a aprovaria), e um scale-to-zero num bloco separado
-# também. O awk normaliza a linha como o sed acima para achar a diretiva.
+# Casos vermelhos de cada diretiva. As regras que não dependem deste arquivo
+# (tipo, [[vm]] a mais e seus aliases, scale-to-zero em outro bloco, TOML
+# inválido, `#` dentro de string) estão em test-fly-toml-contract.sh. O awk
+# acha a linha da diretiva normalizando-a (sem comentário e sem indentação;
+# nenhuma diretiva esperada tem `#`).
 mutated_config="$tmp_dir/fly.toml"
-for directive in "${expected_directives[@]}"; do
-  awk -v d="$directive" '{ t = $0; sub(/#.*/, "", t); gsub(/^[[:space:]]+|[[:space:]]+$/, "", t); print (t == d ? "# " : "") $0 }' \
-    "$fly_config" >"$mutated_config"
-  expect_failure check_fly_config "$mutated_config"
-done
-for scale_to_zero in '"stop"' "'stop'" '"suspend"' true; do
-  { cat "$fly_config"; printf '\n[[services]]\n  auto_stop_machines = %s\n' "$scale_to_zero"; } >"$mutated_config"
-  expect_failure check_fly_config "$mutated_config"
+for entry in "${expected_directives[@]}"; do
+  directive="${entry#* }"
+  line="$(awk -v d="$directive" '{ t = $0; sub(/#.*/, "", t); gsub(/^[[:space:]]+|[[:space:]]+$/, "", t) } t == d { print NR; exit }' "$fly_config")"
+  [[ -n $line ]] || { echo "$fly_config sem a linha $directive" >&2; exit 1; }
+  # A diretiva que sobra só num comentário reprova (um grep de substring a
+  # aprovaria)...
+  sed "${line}s/^/# /" "$fly_config" >"$mutated_config"
+  expect_contract_failure "$mutated_config"
+  # ...e a que sai do bloco certo também: aqui ela vai para a raiz do arquivo,
+  # onde o Fly não a lê, e a linha continua idêntica.
+  { printf '%s\n' "$directive"; sed "${line}d" "$fly_config"; } >"$mutated_config"
+  expect_contract_failure "$mutated_config"
 done
 
 echo "Contrato de Machines do backend validado."

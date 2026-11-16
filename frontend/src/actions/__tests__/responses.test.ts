@@ -1,5 +1,6 @@
 import { beforeAll, describe, it, expect, vi, beforeEach } from "vitest";
-import { revalidatePath, revalidateTag } from "next/cache";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
+import { revalidatePath } from "next/cache";
 import { isCodingComplete } from "@/lib/coding-completeness";
 import { responseQualifiesForVersion } from "@/lib/compare-version";
 import type { VersionedResponse } from "@/lib/compare-version";
@@ -12,11 +13,11 @@ const drainAutoReviewReconciliationRequests = vi.hoisted(() => vi.fn(async () =>
   failed: 0,
   remaining: 0,
 })));
+const createAutoComparisonIfDiverges = vi.hoisted(() => vi.fn(async () => {}));
 
 // Mocks precisam ser declarados antes do import dinamico do modulo sob teste.
 vi.mock("next/cache", () => ({
   revalidatePath: vi.fn(),
-  revalidateTag: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -29,6 +30,7 @@ vi.mock("@/lib/auth", () => ({
 vi.mock("@/lib/auto-review-reconciler", () => ({
   drainAutoReviewReconciliationRequests,
 }));
+vi.mock("@/lib/auto-comparison", () => ({ createAutoComparisonIfDiverges }));
 
 interface State {
   responseInsertPayload: Record<string, unknown> | null;
@@ -52,6 +54,9 @@ interface State {
   // Erros devolvidos pelo INSERT, na ordem das tentativas.
   responseInsertErrorQueue: Array<{ message: string; code?: string }>;
   currentAssignmentStatus: string | null;
+  // Erros do PostgREST na leitura e no UPDATE do assignment de codificação.
+  assignmentReadError: { message: string; code?: string } | null;
+  assignmentUpdateError: { message: string; code?: string } | null;
   pydanticFields: Array<{
     name: string;
     type: string;
@@ -63,6 +68,8 @@ interface State {
   schemaVersion: { major: number; minor: number; patch: number };
   documentExcludedAt: string | null;
   automationMode: string | null;
+  // Linha de `profiles` de quem grava; `null` = leitura sem linha.
+  profile: { first_name: string | null; last_name: string | null; email?: string } | null;
 }
 
 let state: State;
@@ -80,25 +87,28 @@ beforeEach(() => {
     responseUpdateMatchedRows: () => state.existingResponse !== null,
     responseInsertErrorQueue: [],
     currentAssignmentStatus: "pendente",
+    assignmentReadError: null,
+    assignmentUpdateError: null,
     pydanticFields: [
       { name: "q1", type: "single", required: true, options: ["a", "b"] },
     ],
     schemaVersion: { major: 1, minor: 0, patch: 0 },
     documentExcludedAt: null,
     automationMode: null,
+    profile: { first_name: "Test", last_name: "User" },
   };
   vi.mocked(revalidatePath).mockClear();
-  vi.mocked(revalidateTag).mockClear();
   drainAutoReviewReconciliationRequests.mockClear();
+  createAutoComparisonIfDiverges.mockClear();
 });
 
 // Builder generico awaitable: usado quando o resultado final eh `{ error: null }`
 // e o encadeamento termina em await (sem `.single()`).
-function thenableOk() {
+function thenableOk(error: { message: string; code?: string } | null = null) {
   const chain: Record<string, unknown> = {};
   chain.eq = () => chain;
-  chain.then = (resolve: (v: { error: null }) => unknown) =>
-    resolve({ error: null });
+  chain.then = (resolve: (v: { error: typeof error }) => unknown) =>
+    resolve({ error });
   return chain;
 }
 
@@ -109,9 +119,7 @@ vi.mock("@/lib/supabase/server", () => ({
         return {
           select: () => ({
             eq: () => ({
-              single: async () => ({
-                data: { first_name: "Test", last_name: "User" },
-              }),
+              single: async () => ({ data: state.profile }),
             }),
           }),
         };
@@ -201,15 +209,17 @@ vi.mock("@/lib/supabase/server", () => ({
             const c: Record<string, unknown> = {};
             c.eq = () => c;
             c.maybeSingle = async () => ({
-              data: state.currentAssignmentStatus
-                ? { status: state.currentAssignmentStatus }
-                : null,
+              data:
+                !state.assignmentReadError && state.currentAssignmentStatus
+                  ? { status: state.currentAssignmentStatus }
+                  : null,
+              error: state.assignmentReadError,
             });
             return c;
           },
           update: (payload: Record<string, unknown>) => {
             state.assignmentUpdatePayload = payload;
-            return thenableOk();
+            return thenableOk(state.assignmentUpdateError);
           },
         };
       }
@@ -645,13 +655,12 @@ describe("saveResponse — gravação pelo envio explícito", () => {
     expect(state.assignmentUpdatePayload).toBeNull();
   });
 
-  it("o envio dispara revalidatePath e revalidateTag das rotas relevantes", async () => {
+  it("o envio dispara revalidatePath das rotas relevantes", async () => {
     const saveResponse = await loadSaveResponse();
     await saveResponse("proj-1", "doc-1", { q1: "a" });
     expect(revalidatePath).toHaveBeenCalledWith("/projects/proj-1/analyze/code");
     expect(revalidatePath).toHaveBeenCalledWith("/projects/proj-1/analyze/compare");
     expect(revalidatePath).toHaveBeenCalledWith("/projects/proj-1/reviews");
-    expect(revalidateTag).toHaveBeenCalledWith("project-proj-1-progress", { expire: 60 });
   });
 
   it("opts.notes serializa em justifications._notes", async () => {
@@ -682,6 +691,57 @@ describe("saveResponse — documento excluído (fora do escopo aprovado)", () =>
     const saveResponse = await loadSaveResponse();
     const r = await saveResponse("proj-1", "doc-1", { q1: "a" });
     expect(r.success).toBe(true);
+  });
+});
+
+describe("saveResponse — autoria acompanha o perfil (#622)", () => {
+  // `respondent_name` da linha corrente, que é o que as telas exibem.
+  function displayedAuthorship(): unknown {
+    return {
+      ...state.responseInsertPayload,
+      ...state.responseUpdatePayload,
+    }.respondent_name;
+  }
+
+  it("quem grava antes de preencher o perfil troca o e-mail pelo nome ao gravar de novo", async () => {
+    state.profile = { first_name: null, last_name: null };
+    const saveResponse = await loadSaveResponse();
+    await saveResponse("proj-1", "doc-1", { q1: "a" });
+    expect(displayedAuthorship()).toBe("u@test.com");
+
+    state.profile = { first_name: "Ana", last_name: "Lima" };
+    state.existingResponse = { id: "resp-1", is_partial: false, answers: { q1: "a" } };
+    const r = await saveResponse("proj-1", "doc-1", { q1: "b" });
+
+    expect(r.success).toBe(true);
+    expect(displayedAuthorship()).toBe("Ana Lima");
+  });
+
+  // Conta vinculada grava como o membro canônico: sem nome no perfil, a
+  // autoria caía no e-mail da conta logada, e o membro aparecia sob um
+  // endereço que não é o dele.
+  it("sem nome no perfil, a autoria é o e-mail do membro, e não o da conta logada", async () => {
+    state.profile = { first_name: null, last_name: null, email: "membro@test.com" };
+    const saveResponse = await loadSaveResponse();
+    const r = await saveResponse("proj-1", "doc-1", { q1: "a" });
+
+    expect(r.success).toBe(true);
+    expect(displayedAuthorship()).toBe("membro@test.com");
+  });
+
+  it.each([
+    // Leitura do perfil sem linha, ou que falhou.
+    ["ausente", null],
+    ["só com espaços", { first_name: " ", last_name: null }],
+  ])("perfil %s não sobrescreve a autoria já gravada", async (_caso, profile) => {
+    state.profile = profile;
+    state.existingResponse = { id: "resp-1", is_partial: false, answers: { q1: "a" } };
+    const saveResponse = await loadSaveResponse();
+    const r = await saveResponse("proj-1", "doc-1", { q1: "b" });
+
+    expect(r.success).toBe(true);
+    expect(state.responseUpdatePayload).not.toBeNull();
+    expect(state.responseUpdatePayload).not.toHaveProperty("respondent_name");
   });
 });
 
@@ -783,19 +843,39 @@ describe("saveResponse — unicidade da resposta corrente (#609)", () => {
     expect(state.existingReadCount).toBe(1);
   });
 
-  it("erro do trigger (23514) propaga sem retry", async () => {
+  it("recusa do gatilho de comparação (23514) chega ao toast como veio, sem retry", async () => {
     state.existingResponse = null;
     state.responseInsertErrorQueue = [
-      { code: "23514", message: "codificador não pode responder documento em comparação" },
+      { code: "23514", message: "o revisor da comparação não pode codificar o mesmo documento" },
     ];
     const saveResponse = await loadSaveResponse();
     const r = await saveResponse("proj-1", "doc-1", { q1: "a" });
 
     expect(r).toEqual({
       success: false,
-      error: "codificador não pode responder documento em comparação",
+      error: "o revisor da comparação não pode codificar o mesmo documento",
     });
     expect(state.existingReadCount).toBe(1);
+  });
+
+  // Outro 23514 é falha real: o texto vai ao log e o toast recebe a copy (#502).
+  it("outro 23514 na escrita vira copy pt-BR com código e log", async () => {
+    state.existingResponse = null;
+    state.responseInsertErrorQueue = [
+      { code: "23514", message: "new row violates check constraint \"responses_x\"" },
+    ];
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const saveResponse = await loadSaveResponse();
+    const r = await saveResponse("proj-1", "doc-1", { q1: "a" });
+
+    expect(r).toEqual({
+      success: false,
+      error: copyWithRef("Não foi possível salvar a codificação. Tente novamente."),
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[responses] gravação da codificação falhou", { code: "23514" }),
+    );
+    consoleError.mockRestore();
   });
 
   // O SQLSTATE aqui é contrato, não detalhe: 40001 (serialization_failure) faz
@@ -826,7 +906,10 @@ describe("saveResponse — unicidade da resposta corrente (#609)", () => {
     const saveResponse = await loadSaveResponse();
     const r = await saveResponse("proj-1", "doc-1", { q1: "a" });
 
-    expect(r).toEqual({ success: false, error: "could not serialize access" });
+    expect(r).toEqual({
+      success: false,
+      error: copyWithRef("Não foi possível salvar a codificação. Tente novamente."),
+    });
   });
 
   it("conflito nas DUAS tentativas devolve erro explícito, sem girar", async () => {
@@ -859,12 +942,106 @@ describe("saveResponse — unicidade da resposta corrente (#609)", () => {
   it("falha ao LER a resposta corrente aborta o save — não cria linha nova", async () => {
     // O bug que transformava uma duplicata em série: o erro do SELECT era
     // descartado, `existing` vinha nulo e o save seguia para o INSERT.
+    // E o texto do Postgres vai ao log, não ao toast pt-BR (#502).
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     state.existingResponseError = { message: "timeout ao ler responses" };
     const saveResponse = await loadSaveResponse();
     const r = await saveResponse("proj-1", "doc-1", { q1: "a" });
 
-    expect(r).toEqual({ success: false, error: "timeout ao ler responses" });
+    expect(r).toEqual({
+      success: false,
+      error: copyWithRef("Não foi possível carregar a codificação para salvar. Tente novamente."),
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[responses] leitura da resposta corrente falhou", { message: "timeout ao ler responses" }),
+    );
+    consoleError.mockRestore();
     expect(state.responseInsertPayload).toBeNull();
     expect(state.responseUpdatePayload).toBeNull();
+  });
+});
+
+describe("saveResponse — falha ao sincronizar o assignment de codificação", () => {
+  // Copy pt-BR no toast e texto do PostgREST só no log (#502).
+  const SYNC_FAILED =
+    "Resposta salva, mas o status da codificação não pôde ser atualizado. Tente salvar novamente.";
+
+  it("UPDATE que conclui o assignment falha: copy pt-BR, texto do banco só no log", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    state.assignmentUpdateError = { message: "canceling statement due to statement timeout", code: "57014" };
+    const saveResponse = await loadSaveResponse();
+    const r = await saveResponse("proj-1", "doc-1", { q1: "a" });
+
+    expect(r).toEqual({ success: false, error: copyWithRef(SYNC_FAILED) });
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[coding-sync] conclusão do assignment falhou", {
+        code: "57014",
+        message: "canceling statement due to statement timeout",
+      }),
+    );
+    consoleError.mockRestore();
+    expect(state.assignmentUpdatePayload?.status).toBe("concluido");
+    // A resposta foi gravada: as telas que a mostram são revalidadas.
+    expect(revalidatePath).toHaveBeenCalledWith("/projects/proj-1/analyze/code");
+  });
+
+  it("segundo envio conclui o assignment e dispara comparação após falha no primeiro UPDATE", async () => {
+    state.automationMode = "compare_humans";
+    state.assignmentUpdateError = { message: "falha temporária", code: "57014" };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const saveResponse = await loadSaveResponse();
+
+    const first = await saveResponse("proj-1", "doc-1", { q1: "a" });
+    expect(first.success).toBe(false);
+    expect(state.responseInsertPayload?.is_partial).toBe(false);
+    expect(createAutoComparisonIfDiverges).not.toHaveBeenCalled();
+
+    state.existingResponse = {
+      id: "resp-1", is_partial: false, answers: { q1: "a" }, answer_field_hashes: null,
+    };
+    state.assignmentUpdateError = null;
+    const second = await saveResponse("proj-1", "doc-1", { q1: "a" });
+
+    expect(second.success).toBe(true);
+    expect(state.assignmentUpdatePayload?.status).toBe("concluido");
+    expect(createAutoComparisonIfDiverges).toHaveBeenCalledTimes(1);
+    state.currentAssignmentStatus = "concluido";
+    const third = await saveResponse("proj-1", "doc-1", { q1: "a" });
+    expect(third.success).toBe(true);
+    expect(createAutoComparisonIfDiverges).toHaveBeenCalledTimes(1);
+    consoleError.mockRestore();
+  });
+
+  it("UPDATE que mantém o assignment em andamento falha: copy pt-BR, texto do banco só no log", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    state.assignmentUpdateError = { message: "permission denied for table assignments", code: "42501" };
+    const saveResponse = await loadSaveResponse();
+    const r = await saveResponse("proj-1", "doc-1", {});
+
+    expect(r).toEqual({ success: false, error: copyWithRef(SYNC_FAILED) });
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[coding-sync] assignment em andamento falhou", {
+        code: "42501",
+        message: "permission denied for table assignments",
+      }),
+    );
+    consoleError.mockRestore();
+    expect(state.assignmentUpdatePayload?.status).toBe("em_andamento");
+  });
+
+  it("falha ao LER o assignment antes de mantê-lo em andamento avisa em vez de seguir calada", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    state.assignmentReadError = { message: "timeout ao ler assignments" };
+    const saveResponse = await loadSaveResponse();
+    const r = await saveResponse("proj-1", "doc-1", {});
+
+    expect(r).toEqual({ success: false, error: copyWithRef(SYNC_FAILED) });
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[coding-sync] leitura do assignment falhou", {
+        message: "timeout ao ler assignments",
+      }),
+    );
+    consoleError.mockRestore();
+    expect(state.assignmentUpdatePayload).toBeNull();
   });
 });

@@ -1,17 +1,19 @@
-"""Teste de integração de run_llm (issue #377).
+"""Testes de integração de run_llm (issues #377 e #828).
 
 Pré-requisito bloqueante do refactor: hoje nenhum teste chama `run_llm`
 diretamente (os outros arquivos `test_llm_runner_*` só cobrem os helpers já
-extraídos). Mocka só a fronteira externa — cliente Supabase e `dataframeit` —
+extraídos). Os testes de #377 mockam cliente Supabase e `dataframeit` —
 e deixa rodar de verdade a compilação Pydantic, o flatten/filtro de campos e a
 classificação de cobertura, para servir de rede de segurança antes de extrair
 o laço de pós-processamento por linha (linhas 970-1120).
 
 Cobre os 4 cenários pedidos pela issue: happy path, run parcial (não falha),
 run comprometida (RuntimeError) e exceção não tratada persistida.
+Os testes de #828 atravessam o dataframeit instalado com cliente LLM local.
 """
 
 import inspect
+import logging
 import sys
 import warnings
 from collections.abc import Callable
@@ -22,18 +24,25 @@ from typing import Any
 
 import pandas as pd
 import pytest
+from pydantic import BaseModel, Field
 from supabase import PostgrestAPIError
 
+from routes.llm_routes import StatusResponse
 from services.llm_runner import (
     _PROBE_DOC_ID,
     DEFAULT_LLM_CALL_TIMEOUT_SECONDS,
     DEFAULT_PARALLEL_REQUESTS,
     _jobs,
+    _persist_run_error,
+    _persist_run_progress,
+    _persist_run_progress_now,
+    _persist_run_progress_throttled,
     _prepare_llm_model,
     _process_and_save_rows,
     _row_from_result,
     _RowPublisher,
     _RunMetadata,
+    _status_from_row,
     get_job_status,
     init_job,
     run_llm,
@@ -58,6 +67,21 @@ class Doenca(BaseModel):
 
 class Analysis(BaseModel):
     q5: Doenca = Field(description="Q5")
+"""
+
+# Campo composto com condição, como generatePydanticCode o emite: a classe dos
+# subcampos e o pai `Optional[...] = None` com `visible_if` (#525).
+CONDITIONAL_NESTED_PYDANTIC_CODE = """from pydantic import BaseModel, Field
+from typing import Literal, Optional
+
+
+class _doc_fields(BaseModel):
+    part_a: str = Field(description="Parte A")
+    part_b: Optional[str] = Field(default=None, description="Parte B")
+
+class Analysis(BaseModel):
+    has_doc: Literal["Sim", "Não"] = Field(description="Tem documento?")
+    doc: Optional[_doc_fields] = Field(default=None, description="Doc", json_schema_extra={"visible_if": {"field": "has_doc", "equals": "Sim"}})
 """
 
 SPLIT_PYDANTIC_CODE = """from pydantic import BaseModel, Field
@@ -827,6 +851,116 @@ def test_run_llm_routes_kwargs_without_leaking_internal_options(monkeypatch):
         assert internal_key not in kwargs["model_kwargs"]
 
 
+@pytest.mark.parametrize("temperature", [None, 0])
+def test_run_llm_with_real_dataframeit_preserves_provider_kwargs_and_justifications(
+    monkeypatch, temperature
+):
+    """Exercise the installed package through chat creation, without network I/O."""
+    from langchain import chat_models
+
+    client_kwargs = []
+    model_fields = []
+
+    class FakeChat:
+        def with_structured_output(self, model, *, include_raw):
+            assert include_raw is True
+            model_fields.append(set(model.model_fields))
+
+            class FakeStructuredChat:
+                def invoke(self, _messages):
+                    values = {name: f"resposta {name}" for name in model.model_fields}
+                    return {"parsed": model.model_validate(values), "raw": None}
+
+            return FakeStructuredChat()
+
+    def create_chat(_model, **kwargs):
+        client_kwargs.append(kwargs)
+        return FakeChat()
+
+    monkeypatch.setattr(chat_models, "init_chat_model", create_chat)
+    project_kwargs = {"include_justifications": True}
+    if temperature is not None:
+        project_kwargs["temperature"] = temperature
+    sb = _build_supabase(
+        _project_row(
+            llm_provider="openai", llm_model="fake", llm_kwargs=project_kwargs
+        ),
+        _docs(1),
+    )
+    monkeypatch.setattr("services.llm_runner.get_supabase", lambda: sb)
+    monkeypatch.setattr(
+        "services.llm_runner.wake_auto_review_reconciliation_sync", lambda: True
+    )
+
+    init_job(JOB_ID, PROJECT_ID, "all")
+    run_llm(JOB_ID, PROJECT_ID)
+
+    assert _jobs[JOB_ID]["status"] == "completed"
+    assert len(client_kwargs) == 1
+    assert client_kwargs[0].get("temperature") == temperature
+    assert ("temperature" in client_kwargs[0]) is (temperature is not None)
+    assert "include_justifications" not in client_kwargs[0]
+    assert "campo_a_justification" in model_fields[0]
+    published = _published_responses(sb)
+    assert len(published) == 1
+    assert published[0]["justifications"]["campo_a"] == "resposta campo_a_justification"
+
+
+def test_real_dataframeit_rejects_legacy_condition_and_text_column_collision(
+    monkeypatch,
+):
+    from dataframeit import dataframeit
+    from langchain import chat_models
+
+    monkeypatch.setattr(
+        chat_models,
+        "init_chat_model",
+        lambda *_args, **_kwargs: pytest.fail("nenhum cliente LLM deve ser criado"),
+    )
+
+    class LegacyCondition(BaseModel):
+        campo: str = Field(
+            json_schema_extra={"condition": {"field": "id", "equals": "1"}}
+        )
+
+    class CollidingField(BaseModel):
+        texto: str
+
+    frame = pd.DataFrame([{"id": "1", "texto": "documento"}])
+    with pytest.raises(ValueError, match="condition.*use_search"):
+        dataframeit(
+            frame.copy(), LegacyCondition, "{texto}", model="fake", provider="openai"
+        )
+    with pytest.raises(ValueError, match="campo 'texto'.*coluna de texto"):
+        dataframeit(
+            frame.copy(), CollidingField, "{texto}", model="fake", provider="openai"
+        )
+
+
+def test_real_dataframeit_marks_blank_text_without_calling_provider(monkeypatch):
+    from dataframeit import dataframeit
+    from langchain import chat_models
+
+    def unexpected_chat(*_args, **_kwargs):
+        pytest.fail("texto vazio não deve chegar ao cliente LLM")
+
+    monkeypatch.setattr(chat_models, "init_chat_model", unexpected_chat)
+
+    class Answer(BaseModel):
+        campo: str
+
+    with pytest.warns(UserWarning, match=r"1 linha\(s\) sem texto"):
+        result = dataframeit(
+            pd.DataFrame([{"id": "1", "texto": "  "}]),
+            Answer,
+            "{texto}",
+            model="fake",
+            provider="openai",
+        )
+    assert result.at[0, "_dataframeit_status"] == "error"
+    assert result.at[0, "_error_details"] == "Texto ausente"
+
+
 def test_run_llm_repassa_timeout_do_projeto_em_vez_do_default(monkeypatch):
     """`timeout` gravado em llm_kwargs vence o default do runner.
 
@@ -862,6 +996,12 @@ def test_run_llm_faz_uma_chamada_so_depois_do_canario(monkeypatch):
         _project_row(llm_kwargs={"parallel_requests": 2}),
         docs,
     )
+    # Relógio que anda 5 s a cada leitura: o throttle de 2 s, que a gravação
+    # da fase `processing` abre, já passou quando o canário publica.
+    relogio = iter(range(0, 10_000, 5))
+    monkeypatch.setattr(
+        "services.llm_runner.time", SimpleNamespace(time=lambda: float(next(relogio)))
+    )
 
     _run_llm_sync(monkeypatch, sb, row_specs, dataframeit_calls=dataframeit_calls)
 
@@ -876,7 +1016,7 @@ def test_run_llm_faz_uma_chamada_so_depois_do_canario(monkeypatch):
     assert _jobs[JOB_ID]["status"] == "completed"
     assert _jobs[JOB_ID]["progress"] == 5
     assert _published_doc_ids(sb) == [d["id"] for d in docs]
-    # Heartbeat persistido logo depois do canário, que é o primeiro publicado.
+    # A publicação do canário, a primeira, passa pelo heartbeat com throttle.
     assert any(
         update.get("progress") == 1 for update in sb.table("llm_runs").update_calls
     )
@@ -993,7 +1133,7 @@ def test_run_llm_linha_do_callback_publica_o_mesmo_que_o_laco_do_frame():
     }
     row_specs["doc-1"] = {"campo_a": "a"}
     frame = pd.DataFrame([{"id": d["id"], "texto": d["text"]} for d in docs])
-    prepared = _prepare_llm_model(PYDANTIC_CODE, [], True)
+    prepared = _prepare_llm_model(PYDANTIC_CODE, True)
     resultados: list[RowResult] = []
     fake = _make_fake_dataframeit(
         row_specs,
@@ -1246,7 +1386,7 @@ def test_run_llm_via_de_lotes_de_campos_renova_o_heartbeat_entre_as_chamadas(
 
     def registra(sb_, job_id, jobs_state):
         persistidos.append((len(calls), jobs_state["progress"]))
-        original(sb_, job_id, jobs_state)
+        return original(sb_, job_id, jobs_state)
 
     monkeypatch.setattr("services.llm_runner._persist_run_progress", registra)
 
@@ -1321,6 +1461,22 @@ def test_get_job_status_devolve_copia_do_estado_vivo():
     assert status is not _jobs[JOB_ID]
 
 
+def test_progresso_nao_carrega_campos_de_lote(monkeypatch):
+    # Com a fila contínua (#830) a rodada não se divide em lotes de documentos,
+    # e `current_batch`/`total_batches` ficavam sempre em 0 (#832). Os dois
+    # saíram do estado vivo, do fallback de `llm_runs` e do contrato da rota.
+    sb = _build_supabase(_project_row(), _docs(1))
+    _run_llm_sync(
+        monkeypatch, sb, {"doc-0": {"campo_a": "a", "campo_b": "b", "campo_c": "c"}}
+    )
+
+    campos_de_lote = {"current_batch", "total_batches"}
+    assert _jobs[JOB_ID]["status"] == "completed"
+    assert campos_de_lote.isdisjoint(get_job_status(JOB_ID))
+    assert campos_de_lote.isdisjoint(_status_from_row({"status": "running"}))
+    assert campos_de_lote.isdisjoint(StatusResponse.model_fields)
+
+
 def test_run_llm_zero_failure_threshold_allows_complete_run(monkeypatch):
     docs = _docs(1)
     row_specs = {"doc-0": {"campo_a": "a", "campo_b": "b", "campo_c": "c"}}
@@ -1361,6 +1517,40 @@ def test_run_llm_flattens_nested_model_before_adding_justifications(monkeypatch)
     inserted = _published_responses(sb)[0]
     assert inserted["answers"] == {"q5": {"doenca": "AME"}}
     assert inserted["justifications"] == {"q5": "doenca: O documento identifica AME."}
+
+
+def test_run_llm_flattens_conditional_nested_model_and_prunes_hidden_parent(
+    monkeypatch,
+):
+    """O composto condicional (`Optional[_x_fields]`) também é achatado.
+
+    Sem desembrulhar o `Optional`, o pai ia aninhado ao provider — a falha
+    silenciosa do Gemini que o achatamento existe para evitar. Achatado, o
+    subcampo obrigatório não pode obrigar o LLM a inventar valor quando o pai
+    está oculto, e a condição do pai continua podando a resposta (#525).
+    """
+    docs = _docs(2)
+    row_specs = {
+        "doc-0": {"has_doc": "Sim", "doc__part_a": "A", "doc__part_b": "B"},
+        "doc-1": {"has_doc": "Não", "doc__part_a": "inventado"},
+    }
+    dataframeit_calls: list[dict] = []
+    sb = _build_supabase(
+        _project_row(pydantic_code=CONDITIONAL_NESTED_PYDANTIC_CODE),
+        docs,
+    )
+
+    _run_llm_sync(monkeypatch, sb, row_specs, dataframeit_calls=dataframeit_calls)
+
+    model_fields = dataframeit_calls[0]["model_fields"]
+    answer_fields = {f for f in model_fields if not f.endswith("_justification")}
+    assert answer_fields == {"has_doc", "doc__part_a", "doc__part_b"}
+    by_doc = {r["document_id"]: r for r in _published_responses(sb)}
+    assert by_doc["doc-0"]["answers"] == {
+        "has_doc": "Sim",
+        "doc": {"part_a": "A", "part_b": "B"},
+    }
+    assert by_doc["doc-1"]["answers"] == {"has_doc": "Não"}
 
 
 def test_run_llm_publishes_each_response_atomically_without_bulk_update(monkeypatch):
@@ -2398,3 +2588,216 @@ def test_run_llm_recusa_provider_ou_modelo_vazio_antes_de_chamar(
     error_update = _last_update_where(sb.table("llm_runs"), status="error")
     assert error_update is not None
     assert column in error_update["error_message"]
+
+
+# Código e JSON defasados entre si (#747): no código, `so_humano` é
+# `human_only` e `oculto` é `none`; o `projects.pydantic_fields` diz o
+# contrário em todos os campos.
+TARGETED_PYDANTIC_CODE = """from pydantic import BaseModel, Field
+
+class Analysis(BaseModel):
+    campo_a: str = Field(description="Campo A")
+    so_humano: str = Field(description="Só humano", json_schema_extra={"target": "human_only"})
+    oculto: str = Field(description="Oculto", json_schema_extra={"target": "none"})
+    so_llm: str = Field(description="Só LLM", json_schema_extra={"target": "llm_only"})
+"""
+
+STALE_PYDANTIC_FIELDS = [
+    {"name": "campo_a", "target": "human_only"},
+    {"name": "so_humano", "target": "all"},
+    {"name": "oculto", "target": "all"},
+    {"name": "so_llm", "target": "none"},
+]
+
+
+def test_run_llm_reads_target_from_code_not_from_pydantic_fields(monkeypatch):
+    docs = _docs(1)
+    row_specs = {docs[0]["id"]: {"campo_a": "a", "so_llm": "l"}}
+    sb = _build_supabase(
+        _project_row(
+            pydantic_code=TARGETED_PYDANTIC_CODE,
+            pydantic_fields=STALE_PYDANTIC_FIELDS,
+        ),
+        docs,
+    )
+    calls: list[dict] = []
+
+    _run_llm_sync(monkeypatch, sb, row_specs, dataframeit_calls=calls)
+
+    assert {
+        name for name in calls[0]["model_fields"] if not name.endswith("_justification")
+    } == {"campo_a", "so_llm"}
+    assert _jobs[JOB_ID]["status"] == "completed"
+    (row,) = _published_responses(sb)
+    assert row["answers"] == {"campo_a": "a", "so_llm": "l"}
+
+
+def test_progresso_persistido_carrega_a_fase_da_run(monkeypatch):
+    # Depois de um restart do backend a rota de status lê `llm_runs`. Com a
+    # fase fora do UPDATE de progresso, a linha ficava em `loading` (o valor
+    # do INSERT) até o fim, e o cartão mostrava "Carregando documentos..."
+    # com o progresso já andando.
+    docs = _docs(3)
+    sb = _build_supabase(_project_row(), docs)
+    # Relógio que anda 5 s a cada leitura: desliga o throttle de 2 s.
+    relogio = iter(range(0, 10_000, 5))
+    monkeypatch.setattr(
+        "services.llm_runner.time", SimpleNamespace(time=lambda: float(next(relogio)))
+    )
+
+    _run_llm_sync(
+        monkeypatch,
+        sb,
+        {doc["id"]: {"campo_a": "a", "campo_b": "b", "campo_c": "c"} for doc in docs},
+    )
+
+    assert _jobs[JOB_ID]["status"] == "completed"
+    progressos = [
+        payload
+        for payload in sb.table("llm_runs").update_calls
+        if "heartbeat_at" in payload and "status" not in payload
+    ]
+    # A primeira gravação sai antes do canário, que pode levar minutos.
+    assert progressos[0]["progress"] == 0
+    assert {payload["phase"] for payload in progressos} == {"processing"}
+    # A fase `processing` aparece como "progresso/total": sem o total na
+    # linha, o fallback mostraria "2/0 documentos processados". O total é
+    # constante, então sai uma vez, no snapshot, antes de qualquer progresso.
+    updates = sb.table("llm_runs").update_calls
+    (snapshot,) = [payload for payload in updates if "document_count" in payload]
+    assert snapshot["total"] == 3
+    assert updates.index(snapshot) < updates.index(progressos[0])
+    assert not any("total" in payload for payload in progressos)
+    filtros = [
+        filters
+        for _name, op, payload, filters in sb.operation_log
+        if op == "update" and payload in progressos
+    ]
+    assert all(("eq", "status", "running") in f for f in filtros)
+
+
+def test_gravacao_direta_da_fase_acerta_o_relogio_do_throttle(monkeypatch):
+    # A mudança de fase grava o progresso sem esperar o throttle. Com o
+    # relógio do throttle parado em zero, a primeira linha processada
+    # regravava o mesmo progresso logo em seguida.
+    docs = _docs(3)
+    sb = _build_supabase(_project_row(), docs)
+    # Relógio parado: depois da gravação direta, nenhum intervalo de 2 s passa.
+    monkeypatch.setattr(
+        "services.llm_runner.time", SimpleNamespace(time=lambda: 1_000.0)
+    )
+
+    _run_llm_sync(
+        monkeypatch,
+        sb,
+        {doc["id"]: {"campo_a": "a", "campo_b": "b", "campo_c": "c"} for doc in docs},
+    )
+
+    assert _jobs[JOB_ID]["status"] == "completed"
+    progressos = [
+        payload
+        for payload in sb.table("llm_runs").update_calls
+        if "heartbeat_at" in payload and "status" not in payload
+    ]
+    assert [(p["phase"], p["progress"]) for p in progressos] == [("processing", 0)]
+
+
+def test_gravacao_da_fase_saving_acerta_o_relogio_do_throttle(monkeypatch):
+    # Via de lotes de campos: a fase `saving` é gravada direto e as linhas são
+    # publicadas em seguida. Sem acertar o relógio, a primeira delas regravava
+    # o progresso que a mudança de fase tinha acabado de gravar.
+    docs = _docs(4)
+    campos = ["campo_a", "campo_b", "campo_c", "campo_d"]
+    todos = campos + [f"{c}_justification" for c in campos]
+    sb = _build_supabase(
+        _project_row(
+            pydantic_code=SPLIT_PYDANTIC_CODE,
+            llm_kwargs={"include_justifications": True},
+        ),
+        docs,
+    )
+    # O relógio só anda quando uma gravação de progresso sai, 10 s por vez: a
+    # da fase `saving` encontra o throttle vencido desde a anterior, e depois
+    # dela nenhum intervalo passa.
+    agora = [1_000.0]
+    monkeypatch.setattr(
+        "services.llm_runner.time", SimpleNamespace(time=lambda: agora[0])
+    )
+    from services import llm_runner
+
+    original = llm_runner._persist_run_progress
+    fases: list[str] = []
+
+    def registra(sb_, job_id, jobs_state):
+        agora[0] += 10
+        fases.append(jobs_state["phase"])
+        return original(sb_, job_id, jobs_state)
+
+    monkeypatch.setattr("services.llm_runner._persist_run_progress", registra)
+
+    _run_llm_sync(
+        monkeypatch,
+        sb,
+        {doc["id"]: {c: f"v-{c}" for c in todos} for doc in docs},
+        max_schema_fields=4,
+    )
+
+    assert _jobs[JOB_ID]["status"] == "completed"
+    assert fases.count("saving") == 1
+
+
+def test_gravacao_de_progresso_que_falha_nao_fecha_o_throttle():
+    # A gravação da fase que falha é só logada. Se ela acertasse o relógio, a
+    # linha seguinte pularia a regravação e a fase ficaria para trás no banco.
+    def fora(_table):
+        raise RuntimeError("gateway fora")
+
+    estado = {"phase": "processing", "progress": 0, "last_progress_persist": 0.0}
+
+    _persist_run_progress_now(SimpleNamespace(table=fora), JOB_ID, estado)
+
+    assert estado["last_progress_persist"] == 0.0
+    sb = _build_supabase(_project_row(), [])
+    _persist_run_progress_throttled(sb, JOB_ID, estado)
+    (payload,) = sb.table("llm_runs").update_calls
+    assert payload["phase"] == "processing"
+    assert estado["last_progress_persist"] > 0.0
+
+
+def test_fecho_de_erro_grava_o_progresso_que_o_throttle_segurou():
+    # O canário que volta em menos de 2 s não tem o progresso gravado na hora.
+    # Se a run falha logo depois, o fecho é a única gravação que resta.
+    sb = _build_supabase(_project_row(), [])
+
+    _persist_run_error(
+        sb, JOB_ID, RuntimeError("falhou"), "tb", counters={"progress": 1}
+    )
+
+    (payload,) = sb.table("llm_runs").update_calls
+    assert payload["status"] == "error"
+    assert payload["progress"] == 1
+
+
+def test_progresso_sem_fase_no_estado_ainda_renova_o_heartbeat(caplog):
+    # A leitura da fase ficava dentro do `try` que só loga: um estado sem a
+    # chave perdia o UPDATE inteiro, e a run viva ficava sem heartbeat.
+    sb = _build_supabase(_project_row(), [])
+
+    with caplog.at_level(logging.ERROR, logger="services.llm_runner"):
+        _persist_run_progress(sb, JOB_ID, {"progress": 2})
+
+    (payload,) = sb.table("llm_runs").update_calls
+    assert payload["progress"] == 2
+    assert payload["heartbeat_at"]
+    # Sem fase conhecida, a coluna fica como está, e o defeito vai para o log.
+    assert "phase" not in payload
+    assert "sem fase" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("status", "phase"),
+    [("running", "loading"), ("completed", "completed"), ("error", "error")],
+)
+def test_status_from_row_com_fase_nula_usa_padrao_explicito(status, phase):
+    # `llm_runs.phase` é anulável e `StatusResponse.phase` é `str`.
+    assert _status_from_row({"status": status, "phase": None})["phase"] == phase

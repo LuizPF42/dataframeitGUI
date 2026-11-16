@@ -1,15 +1,25 @@
 // @vitest-environment jsdom
-import { describe, it, expect, afterEach, beforeAll } from "vitest";
+import { describe, it, expect, afterEach, beforeAll, beforeEach, vi } from "vitest";
 import { warmUpJsdom } from "@/test-utils/jsdom-warm-up";
-import { render, screen, cleanup, within } from "@testing-library/react";
-import { CodingDraftBanner } from "@/components/coding/CodingDraftBanner";
+import { act, render, screen, cleanup, within } from "@testing-library/react";
+import {
+  CodingDraftBanner,
+  LIVE_REGION_SETTLE_MS,
+  UnsentChangesBadge,
+} from "@/components/coding/CodingDraftBanner";
 import type { CodingDraftRecovery } from "@/lib/coding-draft";
 import type { PydanticField } from "@/lib/types";
 
 // Exigido pela regra test-jsdom-warm-up (eslint-rules/test-jsdom-warm-up.mjs).
 beforeAll(() => warmUpJsdom(), 30_000);
 
-afterEach(cleanup);
+// Timers falsos: a região live só aceita a primeira oferta depois de assentar
+// (`LIVE_REGION_SETTLE_MS`), e o teste controla esse relógio.
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 const FIELDS: PydanticField[] = [
   { id: "00000000-0000-4000-8000-000000000001", name: "q1", type: "text", options: null, description: "Diagnóstico" },
@@ -36,16 +46,35 @@ const resumable: CodingDraftRecovery = {
   changedFields: ["q1"],
 };
 
-function show(recovery: CodingDraftRecovery) {
-  render(
+const NONE: CodingDraftRecovery = { kind: "none" };
+
+// Monta a faixa e devolve como trocar a oferta. `offeredAt` é o instante em
+// que a oferta chegou; a troca mantém o instante anterior quando omitido.
+function mount(initial: CodingDraftRecovery, offeredAt = Date.now()) {
+  const banner = (recovery: CodingDraftRecovery, arrivedAt: number) => (
     <CodingDraftBanner
       recovery={recovery}
       fields={FIELDS}
       onRestore={() => {}}
       onDiscard={() => {}}
-      now={Date.now()}
-    />,
+      offeredAt={arrivedAt}
+    />
   );
+  const { rerender } = render(banner(initial, offeredAt));
+  return (next: CodingDraftRecovery, nextOfferedAt = offeredAt) =>
+    rerender(banner(next, nextOfferedAt));
+}
+
+function settle() {
+  act(() => {
+    vi.advanceTimersByTime(LIVE_REGION_SETTLE_MS);
+  });
+}
+
+// A região live, já assentada, com a oferta dentro.
+function show(recovery: CodingDraftRecovery) {
+  mount(recovery);
+  settle();
   return screen.getByRole("status");
 }
 
@@ -80,5 +109,144 @@ describe("CodingDraftBanner — o que a região live anuncia", () => {
     show(diverged);
     expect(screen.getByRole("button", { name: "Retomar rascunho" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Descartar" })).toBeTruthy();
+  });
+});
+
+// O leitor de tela anuncia o que MUDA numa região live que já existia; uma
+// região inserida já populada costuma ser lida como conteúdo estático (#635).
+// Afirmar só que a região contém a frase não discrimina nada — isso já valia
+// quando a faixa devolvia `null` sem oferta. O que separa os dois mundos é a
+// região existir, vazia, ANTES de a oferta chegar, e ser o MESMO nó depois.
+describe("CodingDraftBanner — a chegada da oferta é anunciada", () => {
+  // Mutação vermelha: voltar a devolver `null` sem oferta. A região deixa de
+  // existir antes da chegada e este teste cai.
+  it("a região já está montada, vazia, quando ainda não há oferta", () => {
+    mount(NONE);
+    expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  it("na transição none → resumable, a região que se preenche é a que já existia", () => {
+    const update = mount(NONE);
+    const before = screen.getByRole("status");
+    settle();
+    update(resumable);
+    const after = screen.getByRole("status");
+    expect(after).toBe(before);
+    expect(after.textContent).toMatch(/alterações não enviadas/);
+  });
+
+  // A oferta chega no primeiro effect após o mount. Preencher a região no
+  // mesmo frame em que ela nasce é, para o leitor, nascer populada. Mutação
+  // vermelha: anunciar `offer` em vez de `announced`.
+  it("a primeira oferta só entra na região depois de ela assentar; a faixa visível não espera", () => {
+    mount(resumable);
+    const live = screen.getByRole("status");
+    expect(live.textContent).toBe("");
+    expect(screen.getByRole("button", { name: "Retomar rascunho" })).toBeTruthy();
+    settle();
+    expect(live.textContent).toMatch(/alterações não enviadas/);
+  });
+
+  // A frase vive duas vezes no DOM, mas só uma vez na árvore de acessibilidade:
+  // a cópia visível é `aria-hidden`, senão o leitor a leria duas vezes. E a
+  // cópia visível não é uma segunda região live.
+  it("a cópia visível não é região live nem é lida pelo leitor", () => {
+    const live = show(diverged);
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    const copies = screen.getAllByText(/foi salvo depois/);
+    expect(copies).toHaveLength(2);
+    const visible = copies.find((el) => !live.contains(el));
+    expect(visible?.closest("[aria-hidden='true']")).not.toBeNull();
+  });
+
+  it("descartada a oferta, a região esvazia e continua montada", () => {
+    const update = mount(diverged);
+    settle();
+    const live = screen.getByRole("status");
+    update(NONE);
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live.textContent).toBe("");
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+});
+
+describe("CodingDraftBanner — oferta seguinte e idade", () => {
+  it("atualiza a idade visível com a aba parada e ao voltar do segundo plano, sem reanunciar", async () => {
+    const start = resumable.updatedAt + 5 * 60_000;
+    vi.setSystemTime(start);
+    const { unmount } = render(
+      <CodingDraftBanner recovery={resumable} fields={FIELDS} onRestore={() => {}} onDiscard={() => {}} offeredAt={start} />,
+    );
+    settle();
+    const live = screen.getByRole("status");
+    const announced = live.textContent;
+    const visibleAge = () => screen.getAllByText(/alterações não enviadas/).find((el) => !live.contains(el))?.textContent;
+    expect(visibleAge()).toContain("há 5 minutos");
+
+    await act(() => vi.advanceTimersByTime(60_000));
+    expect(visibleAge()).toContain("há 6 minutos");
+    expect(live.textContent).toBe(announced);
+
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    vi.setSystemTime(start + 2 * 60 * 60_000);
+    await act(() => document.dispatchEvent(new Event("visibilitychange")));
+    expect(visibleAge()).toContain("há 6 minutos");
+    visibility.mockReturnValue("visible");
+    await act(() => document.dispatchEvent(new Event("visibilitychange")));
+    expect(visibleAge()).toContain("há 2 horas");
+    expect(live.textContent).toBe(announced);
+    visibility.mockRestore();
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // De um documento com rascunho para outro, a frase pode ser a mesma ("há 2
+  // horas"). Sem trocar os nós, o DOM da região não muda e o leitor de tela
+  // não anuncia a oferta nova.
+  // Uma nova chegada (outro documento aberto) troca os nós da região, mesmo com
+  // a mesma frase; a mesma oferta re-renderizada, não.
+  it.each([
+    ["outra chegada com a mesma frase troca os nós da região", 1, false],
+    ["a mesma chegada não troca os nós", 0, true],
+  ])("%s", (_name, delay, sameNodes) => {
+    const arrived = resumable.updatedAt;
+    const update = mount(resumable, arrived);
+    settle();
+    const live = screen.getByRole("status");
+    const before = live.firstElementChild;
+    update({ ...resumable }, arrived + delay);
+    expect(live.textContent).toBe(before?.textContent);
+    expect(live.firstElementChild === before).toBe(sameNodes);
+  });
+
+  it("a idade é medida do instante em que a oferta chegou", () => {
+    mount(resumable, resumable.updatedAt + 3 * 60 * 60_000);
+    settle();
+    expect(screen.getByRole("status").textContent).toContain("há 3 horas");
+  });
+
+  // O aviso de sobrescrita volta à linha própria, fora da linha dos botões.
+  it("o aviso de sobrescrita fica fora da linha dos botões", () => {
+    mount(diverged);
+    const button = screen.getByRole("button", { name: "Retomar rascunho" });
+    const visibleWarning = screen
+      .getAllByText(/foi salvo depois/)
+      .find((el) => !screen.getByRole("status").contains(el));
+    expect(visibleWarning).toBeDefined();
+    expect(button.parentElement?.contains(visibleWarning!)).toBe(false);
+  });
+});
+
+describe("UnsentChangesBadge — região live", () => {
+  it("a região existe vazia antes da pendência e é ela que se preenche", () => {
+    const { rerender } = render(<UnsentChangesBadge visible={false} />);
+    const live = screen.getByRole("status");
+    expect(live.textContent).toBe("");
+    rerender(<UnsentChangesBadge visible />);
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live.textContent).toBe("Alterações não enviadas");
+    rerender(<UnsentChangesBadge visible={false} />);
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live.textContent).toBe("");
   });
 });

@@ -3,8 +3,16 @@ import {
   buildReviewQueueDocumentMap,
   loadReviewQueueRows,
 } from "@/lib/review-queue";
+import { fetchAllAfterId } from "@/lib/supabase/fetch-all-paged";
 import type { SupabaseServerClient } from "@/lib/supabase/server";
-import { makeFilterAwareSupabaseMock } from "@/test-utils/supabase-mock";
+import {
+  makeFilterAwareSupabaseMock,
+  type ReadCall,
+} from "@/test-utils/supabase-mock";
+
+type QueryErrorForCall = NonNullable<
+  Parameters<typeof makeFilterAwareSupabaseMock>[0]["queryErrorForCall"]
+>;
 
 function makeClient(documents: unknown[]): SupabaseServerClient {
   return makeFilterAwareSupabaseMock({
@@ -16,7 +24,10 @@ function makeClient(documents: unknown[]): SupabaseServerClient {
 describe("loadReviewQueueRows", () => {
   it("não consulta ciclos quando a fila está vazia", async () => {
     const loadFieldReviews = vi.fn(() =>
-      Promise.resolve({ data: [{ id: "unexpected" }] }),
+      Promise.resolve({
+        data: [{ id: "unexpected", document_id: "d1" }],
+        error: null,
+      }),
     );
 
     const result = await loadReviewQueueRows(
@@ -50,15 +61,161 @@ describe("loadReviewQueueRows", () => {
         },
       ]),
       ["active", "excluded"],
-      () => Promise.resolve({ data: [{ id: "review-1" }] }),
+      () =>
+        Promise.resolve({
+          data: [
+            { id: "review-1", document_id: "active" },
+            { id: "review-2", document_id: "excluded" },
+          ],
+          error: null,
+        }),
     );
 
     expect(result).toEqual({
       documents: [
         expect.objectContaining({ id: "active", title: "Ativo" }),
       ],
-      fieldReviews: [{ id: "review-1" }],
+      fieldReviews: [
+        { id: "review-1", document_id: "active" },
+        { id: "review-2", document_id: "excluded" },
+      ],
     });
+  });
+
+  // Na arbitragem os ids vêm dos assignments abertos, e o documento sem campo
+  // pendente sai da fila: o `text` dele não precisa trafegar.
+  it("onlyDocumentsWithReviews: só busca o texto dos documentos que têm ciclo", async () => {
+    const readCalls: ReadCall[] = [];
+    const document = (id: string) => ({
+      id,
+      title: id,
+      external_id: null,
+      text: `texto de ${id}`,
+      excluded_at: null,
+      exclusion_pending_at: null,
+    });
+    const client = makeFilterAwareSupabaseMock({
+      tableData: { documents: ["d1", "d2", "d3"].map(document) },
+      writeCalls: [],
+      readCalls,
+    }) as unknown as SupabaseServerClient;
+
+    const result = await loadReviewQueueRows(
+      client,
+      ["d3", "d2", "d1"],
+      () =>
+        Promise.resolve({
+          data: [
+            { id: "review-1", document_id: "d1" },
+            { id: "review-3", document_id: "d3" },
+          ],
+          error: null,
+        }),
+      { onlyDocumentsWithReviews: true },
+    );
+
+    expect(result.documents.map((row) => row.id).toSorted()).toEqual(["d1", "d3"]);
+    expect(
+      readCalls
+        .filter((call) => call.table === "documents")
+        .map((call) => call.filters.find(([kind]) => kind === "in")?.[2]),
+    ).toEqual([["d3", "d1"]]);
+  });
+
+  it("onlyDocumentsWithReviews: não consulta documentos quando nenhum tem ciclo", async () => {
+    const readCalls: ReadCall[] = [];
+    const client = makeFilterAwareSupabaseMock({
+      tableData: { documents: [] },
+      writeCalls: [],
+      readCalls,
+    }) as unknown as SupabaseServerClient;
+
+    const result = await loadReviewQueueRows(
+      client,
+      ["d1"],
+      () =>
+        Promise.resolve({ data: [] as { document_id: string }[], error: null }),
+      { onlyDocumentsWithReviews: true },
+    );
+
+    expect(result).toEqual({ documents: [], fieldReviews: [] });
+    expect(readCalls).toEqual([]);
+  });
+
+  // A lista inteira num `.in()` só vai na URL do PostgREST: com fila grande a
+  // requisição estoura, e a fila abria vazia.
+  describe("fila grande", () => {
+    const ids = Array.from(
+      { length: 250 },
+      (_, i) => `doc-${String(i).padStart(3, "0")}`,
+    );
+    const tableData = {
+      documents: ids.map((id) => ({
+        id,
+        title: id,
+        external_id: null,
+        text: "texto",
+        excluded_at: null,
+        exclusion_pending_at: null,
+      })),
+      field_reviews: ids.map((id) => ({ id: `review-${id}`, document_id: id })),
+    };
+
+    function load(queryErrorForCall?: QueryErrorForCall) {
+      const readCalls: ReadCall[] = [];
+      const client = makeFilterAwareSupabaseMock({
+        tableData,
+        writeCalls: [],
+        readCalls,
+        queryErrorForCall,
+      }) as unknown as SupabaseServerClient;
+      const result = loadReviewQueueRows(client, ids, (chunk) =>
+        fetchAllAfterId<{ id: string; document_id: string }>(() =>
+          client
+            .from("field_reviews")
+            .select("id, document_id")
+            .in("document_id", chunk),
+        ),
+      );
+      return { result, readCalls };
+    }
+
+    it("lê documentos e ciclos em lotes de até 100 ids, sem perder nenhum", async () => {
+      const { result, readCalls } = load();
+      const { documents, fieldReviews } = await result;
+
+      expect(documents.map((document) => document.id)).toEqual(ids);
+      expect(fieldReviews.map((review) => review.document_id)).toEqual(ids);
+      const inSizes = (table: string) =>
+        readCalls
+          .filter((call) => call.table === table)
+          .map(
+            (call) =>
+              (call.filters.find(([kind]) => kind === "in")?.[2] as string[])
+                .length,
+          );
+      expect(inSizes("documents")).toEqual([100, 100, 50]);
+      expect(inSizes("field_reviews")).toEqual([100, 100, 50]);
+    });
+
+    it.each(["documents", "field_reviews"])(
+      "lote de %s que falha lança em vez de abrir a fila sem ele",
+      async (table) => {
+        const { result } = load((call) =>
+          call.table === table &&
+          call.filters.some(
+            ([kind, , value]) =>
+              kind === "in" && (value as string[]).includes("doc-150"),
+          )
+            ? { message: "timeout" }
+            : undefined,
+        );
+
+        await expect(result).rejects.toThrow(
+          "Não foi possível carregar a fila de revisão: timeout",
+        );
+      },
+    );
   });
 });
 

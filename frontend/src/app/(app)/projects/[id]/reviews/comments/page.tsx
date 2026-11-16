@@ -1,4 +1,7 @@
-import { createSupabaseServer } from "@/lib/supabase/server";
+import {
+  createSupabaseServer,
+  type SupabaseServerClient,
+} from "@/lib/supabase/server";
 import { getProjectAccessContext } from "@/lib/auth";
 import { requirePageAuthUser } from "@/lib/page-auth";
 import { coordinatorGate } from "@/lib/project-access";
@@ -18,6 +21,37 @@ import {
 } from "@/lib/reviews/comments-mapper";
 import { buildReviewLookupMaps } from "@/lib/reviews/lookup-maps";
 import { loadReviewerNames } from "@/lib/reviews/reviewer-names";
+import { fetchProfileNames, withProfileNames } from "@/lib/respondent-names";
+
+// Títulos de docs excluídos referenciados por exclusion_requests resolvidas.
+async function loadExcludedDocTitles(
+  supabase: SupabaseServerClient,
+  exclusionRows: readonly ProjectCommentRow[],
+  docMap: ReadonlyMap<string, string>,
+): Promise<Map<string, string>> {
+  const excludedDocIds = exclusionRows.flatMap((c) =>
+    c.document_id && !docMap.has(c.document_id) ? [c.document_id] : [],
+  );
+  const titles = new Map<string, string>();
+  if (excludedDocIds.length === 0) return titles;
+  const { data: excludedDocs } = await supabase
+    .from("documents")
+    .select("id, title, external_id")
+    .in("id", excludedDocIds);
+  for (const d of excludedDocs || []) {
+    titles.set(d.id, d.title || d.external_id || d.id);
+  }
+  return titles;
+}
+
+function countWithoutAmbiguities(
+  llmResponses: ReadonlyArray<{ answers: unknown }>,
+): number {
+  return llmResponses.filter((r) => {
+    const amb = (r.answers as Record<string, unknown>)?.llm_ambiguidades;
+    return !amb || (typeof amb === "string" && !amb.trim());
+  }).length;
+}
 
 export default async function CommentsPage({
   params,
@@ -42,6 +76,7 @@ export default async function CommentsPage({
     { data: verdictQuestions },
     { data: noteResolutions },
     accessResult,
+    profileNames,
   ] = await Promise.all([
     supabase
       .from("projects")
@@ -65,13 +100,13 @@ export default async function CommentsPage({
       .is("excluded_at", null),
     supabase
       .from("responses")
-      .select("id, document_id, respondent_name, justifications, created_at")
+      .select("id, document_id, respondent_id, respondent_type, respondent_name, justifications, created_at")
       .eq("project_id", id)
       .eq("respondent_type", "humano")
       .not("justifications", "is", null),
     supabase
       .from("schema_suggestions")
-      .select("id, field_name, suggested_changes, reason, status, resolved_at, created_at, profiles!suggested_by(email)")
+      .select("id, field_name, suggested_changes, reason, status, resolved_at, created_at, profiles!suggested_by(email, first_name, last_name)")
       .eq("project_id", id)
       .order("created_at", { ascending: false }),
     supabase
@@ -86,7 +121,7 @@ export default async function CommentsPage({
       .eq("project_id", id),
     supabase
       .from("project_comments")
-      .select("id, document_id, field_name, author_id, body, parent_id, resolved_at, resolved_by, created_at, kind, rejected_at, rejected_reason, profiles!author_id(email)")
+      .select("id, document_id, field_name, author_id, body, parent_id, resolved_at, resolved_by, created_at, kind, rejected_at, rejected_reason, profiles!author_id(email, first_name, last_name)")
       .eq("project_id", id)
       .is("parent_id", null)
       .order("created_at", { ascending: false }),
@@ -104,6 +139,7 @@ export default async function CommentsPage({
       .select("response_id, resolved_at")
       .eq("project_id", id),
     getProjectAccessContext(id, user),
+    fetchProfileNames(supabase, id),
   ]);
 
   const noteResolvedMap = new Map(
@@ -144,7 +180,11 @@ export default async function CommentsPage({
 
   const reviewComments = mapReviewComments(reviews || [], docMap, fieldMap, reviewerMap);
 
-  const noteComments = mapNoteComments(responsesWithNotes || [], docMap, noteResolvedMap);
+  const noteComments = mapNoteComments(
+    withProfileNames(responsesWithNotes, profileNames),
+    docMap,
+    noteResolvedMap,
+  );
 
   const suggestionComments = mapSuggestionComments(
     (suggestions || []) as unknown as SuggestionRow[],
@@ -178,20 +218,11 @@ export default async function CommentsPage({
     (c) => c.kind !== "exclusion_request",
   );
 
-  // Buscar titulos de docs excluidos referenciados por exclusion_requests resolvidas
-  const excludedDocIds = exclusionRows.flatMap((c) =>
-    c.document_id && !docMap.has(c.document_id) ? [c.document_id] : [],
+  const excludedDocTitles = await loadExcludedDocTitles(
+    supabase,
+    exclusionRows,
+    docMap,
   );
-  const excludedDocTitles = new Map<string, string>();
-  if (excludedDocIds.length > 0) {
-    const { data: excludedDocs } = await supabase
-      .from("documents")
-      .select("id, title, external_id")
-      .in("id", excludedDocIds);
-    for (const d of excludedDocs || []) {
-      excludedDocTitles.set(d.id, d.title || d.external_id || d.id);
-    }
-  }
 
   const { annotationComments, exclusionComments } = mapProjectComments(
     { exclusionRows, noteRows },
@@ -210,11 +241,7 @@ export default async function CommentsPage({
     exclusionComments,
   });
 
-  const totalLlmDocs = llmResponses?.length ?? 0;
-  const llmDocsWithoutAmbiguities = (llmResponses ?? []).filter((r) => {
-    const amb = (r.answers as Record<string, unknown>)?.llm_ambiguidades;
-    return !amb || (typeof amb === "string" && !amb.trim());
-  }).length;
+  const llmDocs = llmResponses ?? [];
 
   return (
     <div className="mx-auto max-w-4xl p-6">
@@ -224,8 +251,8 @@ export default async function CommentsPage({
         fields={fields}
         schemaBaseline={schemaBaseline}
         isCoordinator={isCoordinator}
-        totalLlmDocs={totalLlmDocs}
-        llmDocsWithoutAmbiguities={llmDocsWithoutAmbiguities}
+        totalLlmDocs={llmDocs.length}
+        llmDocsWithoutAmbiguities={countWithoutAmbiguities(llmDocs)}
       />
     </div>
   );

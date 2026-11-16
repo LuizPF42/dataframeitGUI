@@ -21,13 +21,11 @@ fornece as variáveis abaixo a partir do `supabase status`. À mão:
 """
 
 import logging
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
 
 import pytest
-from supabase import Client, create_client
+from supabase import Client
 
 import services.llm_runner as llm_runner
 from services.llm_runner import (
@@ -42,57 +40,12 @@ from services.llm_runner import (
 
 pytestmark = pytest.mark.integration
 
-URL_ENV = "INTEGRATION_SUPABASE_URL"
-KEY_ENV = "INTEGRATION_SUPABASE_SERVICE_KEY"
-LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-
 RUN_COLUMNS = (
     "status, phase, filter_mode, progress, total, heartbeat_at, completed_at, "
     "llm_provider, llm_model, document_count, pydantic_code, round_id, "
     "error_message, error_type, error_traceback, error_line, error_column, "
     "processed_complete, processed_partial, processed_empty"
 )
-
-
-@pytest.fixture(scope="module")
-def sb() -> Client:
-    url = os.environ.get(URL_ENV, "")
-    key = os.environ.get(KEY_ENV, "")
-    # Falha, e não skip: um gate que pula por falta de ambiente fica verde
-    # sem ter testado nada.
-    if not url or not key:
-        pytest.fail(
-            f"{URL_ENV} e {KEY_ENV} não definidas — rode por "
-            "`npm run test:db:llm-runs-contract`, com o Supabase local no ar."
-        )
-    # Os testes escrevem e apagam linhas com a service key. Só contra o stack
-    # local: uma URL de produção esquecida no ambiente não pode passar daqui.
-    if urlparse(url).hostname not in LOOPBACK_HOSTS:
-        pytest.fail(f"{URL_ENV} precisa apontar para o Supabase local, não {url}")
-    return create_client(url, key)
-
-
-@pytest.fixture
-def project(sb: Client):
-    """Projeto descartável; o trigger de INSERT cria a rodada corrente."""
-    project_id = str(uuid.uuid4())
-    sb.table("projects").insert(
-        {"id": project_id, "name": f"contrato llm_runs {project_id}"}
-    ).execute()
-    try:
-        row = (
-            sb.table("projects")
-            .select("id, current_round_id")
-            .eq("id", project_id)
-            .single()
-            .execute()
-            .data
-        )
-        assert row["current_round_id"], "trigger não criou a rodada inicial"
-        yield row
-    finally:
-        # O cascade de projects leva rounds e llm_runs junto.
-        sb.table("projects").delete().eq("id", project_id).execute()
 
 
 def _read_run(sb: Client, job_id: str) -> dict:
@@ -179,6 +132,8 @@ def test_snapshot_writes_config_and_captured_round(sb, project):
         llm_provider="google_genai",
         llm_model="gemini-test",
         document_count=7,
+        # O total do cartão sai junto, uma vez: o progresso não o regrava.
+        total=7,
         pydantic_code=code,
         round_id=other_round,
     )
@@ -192,6 +147,7 @@ def test_progress_writes_counters_and_heartbeat(sb, project, caplog):
         "processed_partial": 2,
         "processed_empty": 1,
         "progress": 6,
+        "phase": "processing",
     }
 
     _persist_run_progress(sb, job_id, counters)
@@ -299,3 +255,15 @@ def test_status_fallback_reads_persisted_run(sb, project, caplog, monkeypatch):
         "processed_empty": 0,
     }
     assert {key: status[key] for key in expected} == expected
+
+
+def test_status_fallback_tolerates_null_phase(sb, project, caplog, monkeypatch):
+    # A coluna é anulável; a rota de status exige `phase: str`.
+    job_id = _new_run(sb, project["id"])
+    _patch_run(sb, job_id, phase=None)
+    monkeypatch.setattr(llm_runner, "get_supabase", lambda: sb)
+
+    status = get_job_status(job_id)
+
+    _assert_nothing_swallowed(caplog)
+    assert (status["status"], status["phase"]) == ("running", "loading")

@@ -1,7 +1,7 @@
 -- Regressão da revisão monotônica e das RPCs atômicas de schema.
 --
 -- Como rodar depois de `npx supabase start` e `npx supabase db reset`:
---   npm run test:db:schema-revision-rpcs
+--   npm run test:db -- schema_revision_rpcs
 --
 -- O teste inteiro roda em BEGIN ... ROLLBACK. Os GRANTs compensam o ambiente
 -- local e também são revertidos.
@@ -814,6 +814,20 @@ BEGIN
       AND resolved_by = '81000000-0000-0000-0000-000000000001'
   ) THEN
     RAISE EXCEPTION 'FALHOU sugestão atômica: projeto e sugestão divergiram';
+  END IF;
+
+  -- O par do que o happy path de `commit_project_schema` asserta: sem a linha
+  -- do histórico, a atomicidade projeto+log ficava sem prova neste caminho.
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.schema_change_log
+    WHERE project_id = '82000000-0000-0000-0000-000000000004'
+      AND field_name = 'suggested_field'
+      AND changed_by = '81000000-0000-0000-0000-000000000001'
+      AND change_type = 'patch'
+      AND (version_major, version_minor, version_patch) = (0, 1, 1)
+  ) THEN
+    RAISE EXCEPTION 'FALHOU sugestão atômica: histórico não registrou a mudança aprovada';
   END IF;
 END;
 $$;

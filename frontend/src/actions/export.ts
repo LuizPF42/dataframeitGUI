@@ -7,10 +7,12 @@
 import { createSupabaseServer } from "@/lib/supabase/server";
 import { requireCoordinator } from "@/lib/auth";
 import type { PydanticField } from "@/lib/types";
-import { fetchAllPaged } from "@/lib/supabase/fetch-all-paged";
+import { fetchAllAfterId, fetchAllAfterDocumentField } from "@/lib/supabase/fetch-all-paged";
+import { serverErrorCopy } from "@/lib/server-error";
 import type { ErrorResolutionRow } from "@/lib/error-resolution";
 import { fetchProjectValueEquivalences } from "@/lib/value-equivalence-query";
 import { usesAutoReviewSource } from "@/lib/llm-error-metrics";
+import { readProfileNames, withProfileNames } from "@/lib/respondent-names";
 import {
   assembleExport,
   type ExportDataset,
@@ -28,6 +30,10 @@ export interface ExportOptions {
   /** Ver `AssembleInput.includeDrafts`. */
   includeDrafts?: boolean;
 }
+
+// Erro de leitura do Postgres: o texto vai para o log, e o toast recebe esta
+// copy (#502).
+const EXPORT_READ_FAILED = "Não foi possível carregar os dados da exportação. Tente novamente.";
 
 // Retorna o conjunto completo do projeto (documentos + respostas + gabarito)
 // já montado como planilhas de strings. Gate coordinator-only (fail-closed);
@@ -55,6 +61,7 @@ export async function getExportDataset(
     { data: errorResolutions, error: resolutionsError },
     { data: equivalences, error: equivalencesError },
     { data: comparisons, error: comparisonsError },
+    { data: profileNames, error: profileNamesError },
   ] = await Promise.all([
     supabase
       .from("projects")
@@ -63,47 +70,44 @@ export async function getExportDataset(
       .single(),
     // Base exportada: documentos não excluídos. Exclusão apenas pendente
     // (exclusion_pending_at) continua na base até ser confirmada. Paginado para
-    // não truncar em projetos grandes (ver fetchAllPaged).
-    fetchAllPaged<ExportDocument>(() =>
+    // não truncar em projetos grandes (ver fetch-all-paged.ts).
+    fetchAllAfterId<ExportDocument>(() =>
       supabase
         .from("documents")
         .select("id, external_id, title, created_at, metadata")
         .eq("project_id", projectId)
         .is("excluded_at", null),
-      ["id"],
     ),
     // `is_partial` marca o rascunho (`AssembleInput.includeDrafts`); sem a
     // coluna, toda resposta contaria como rascunho.
-    fetchAllPaged<ExportResponse>(() =>
+    fetchAllAfterId<ExportResponse>(() =>
       supabase
         .from("responses")
         .select("id, document_id, respondent_name, respondent_type, respondent_id, answers, answer_field_hashes, is_partial")
         .eq("project_id", projectId)
         .eq("is_latest", true),
-      ["id"],
     ),
-    fetchAllPaged<ExportReview>(() =>
+    fetchAllAfterId<ExportReview>(() =>
       supabase
         .from("reviews")
         .select("id, document_id, field_name, verdict, comment, created_at, field_hash, chosen_response_id, reviewer_id")
         .eq("project_id", projectId),
-      ["id"],
     ),
-    fetchAllPaged<ErrorResolutionRow>(() => supabase.rpc("read_error_resolutions", { p_project_id: projectId }), ["id"]),
+    fetchAllAfterId<ErrorResolutionRow>(() => supabase.rpc("read_error_resolutions", { p_project_id: projectId })),
     // `field_hash` vem junto: equivalência de outra versão da pergunta não
     // funde nada.
     fetchProjectValueEquivalences(supabase, projectId),
     // Atribuições de comparação de todas as rodadas: a rodada atual vem na
     // leitura do projeto, que corre em paralelo, e o recorte é feito abaixo.
     // Status não filtra: aberta ou concluída, a divergência tem quem a arbitre.
-    fetchAllPaged<{ document_id: string; round_id: string }>(() =>
+    fetchAllAfterId<{ id: string; document_id: string; round_id: string }>(() =>
       supabase
         .from("assignments")
-        .select("document_id, round_id")
+        .select("id, document_id, round_id")
         .eq("project_id", projectId)
         .eq("type", "comparacao"),
-      ["id"],
     ),
+    readProfileNames(supabase, projectId),
   ]);
 
   const error = [
@@ -114,8 +118,9 @@ export async function getExportDataset(
     resolutionsError,
     equivalencesError,
     comparisonsError,
+    profileNamesError,
   ].find(Boolean);
-  if (error) return { error: error.message };
+  if (error) return { error: serverErrorCopy("[export] leitura falhou", error, { generic: EXPORT_READ_FAILED }) };
   if (!project) return { error: "Projeto não encontrado." };
 
   // Fora de 'auto_review_llm', `field_reviews` não é materializado e a view
@@ -123,15 +128,14 @@ export async function getExportDataset(
   // `final_answers` é view sem PK: (documento, campo) é a ordem total, pela
   // invariante de uma única resposta LLM `is_latest` por documento.
   const finalAnswers = usesAutoReviewSource(project.automation_mode)
-    ? await fetchAllPaged<ExportFinalAnswer>(() =>
+    ? await fetchAllAfterDocumentField<ExportFinalAnswer>(() =>
         supabase
           .from("final_answers")
           .select("document_id, field_name, provenance, answer")
           .eq("project_id", projectId),
-        ["document_id", "field_name"],
       )
     : { data: [], error: null };
-  if (finalAnswers.error) return { error: finalAnswers.error.message };
+  if (finalAnswers.error) return { error: serverErrorCopy("[export] leitura do gabarito falhou", finalAnswers.error, { generic: EXPORT_READ_FAILED }) };
 
   // Projeto sem rodada atual não tem como dizer quem foi atribuído: sem o
   // conjunto, a montagem mantém "aguarda arbitragem".
@@ -140,13 +144,15 @@ export async function getExportDataset(
     ? new Set(comparisons.filter((a) => a.round_id === currentRound).map((a) => a.document_id))
     : undefined;
 
-  // documents/responses/reviews já são arrays (fetchAllPaged nunca devolve null).
+  // documents/responses/reviews já são arrays (as leituras paginadas nunca devolvem null).
   return assembleExport({
     projectName: project.name || "Projeto",
     fields: (project.pydantic_fields || []) as PydanticField[],
     minResponses: project.min_responses_for_comparison || 2,
     documents,
-    responses,
+    // A mesma pessoa saía sob dois nomes (e-mail e nome) conforme a data de
+    // cada gravação (#622).
+    responses: withProfileNames(responses, profileNames),
     reviews,
     errorResolutions,
     equivalences,

@@ -3,6 +3,8 @@
 import { type Dispatch, type SetStateAction, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
+import { withErrorCode } from "@/lib/server-error";
+import { withActionTimeout } from "@/lib/action-timeout";
 import { submitAutoReview } from "@/actions/field-reviews";
 import { AutoReviewFieldPanel } from "./AutoReviewFieldPanel";
 import {
@@ -97,10 +99,10 @@ export function AutoReviewPageContent({
     });
     let result: Awaited<ReturnType<typeof submitAutoReview>>;
     try {
-      result = await submitAutoReview(projectId, doc.docId, payload);
+      result = await withActionTimeout(submitAutoReview(projectId, doc.docId, payload));
     } catch (error) {
       console.error("[AutoReviewPageContent] erro ao enviar revisão", error);
-      toast.error("Não foi possível enviar a revisão. Tente novamente.");
+      toast.error(withErrorCode(error, "Não foi possível enviar a revisão. Tente novamente."));
       return;
     } finally {
       setSubmitting(false);

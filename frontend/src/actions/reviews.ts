@@ -7,6 +7,9 @@ import { syncCompareAssignment } from "@/lib/compare-sync";
 import { errorMessage } from "@/lib/utils";
 import { copiedVerdictInDomain, OUT_OF_DOMAIN_VOTE_MESSAGE, reviewIsValid } from "@/lib/review-validity";
 import { fetchFieldDefinition } from "@/lib/reviews/field-definition";
+import { ambiguityCommentBody } from "@/lib/reviews/ambiguity-comment";
+import { caughtErrorCopy } from "@/lib/server-error";
+import { PostgrestWriteError } from "@/lib/supabase/rls-guard";
 import type { PydanticField } from "@/lib/types";
 
 export interface ResponseSnapshotEntry {
@@ -16,6 +19,8 @@ export interface ResponseSnapshotEntry {
   answer: unknown;
   justification?: string;
 }
+
+const VERDICT_FAILED = "Não foi possível salvar o veredito. Tente novamente.";
 
 export interface SubmitVerdictInput {
   projectId: string;
@@ -73,11 +78,13 @@ export async function submitVerdict({
       }
     );
 
-    if (error) throw new Error(error.message);
+    if (error) throw new PostgrestWriteError(error);
 
     await syncAmbiguityComment(supabase, { projectId, documentId, fieldName, field, verdict, comment, authorId: user.id });
   } catch (e) {
-    return { error: errorMessage(e) || "Erro ao salvar o veredito" };
+    // O texto do Postgres (do upsert, da leitura de "ainda ambíguo" ou do
+    // comentário de ambiguidade) vai para o log; o toast recebe a copy (#502).
+    return { error: caughtErrorCopy("[reviews] veredito falhou", e, VERDICT_FAILED) };
   }
 
   // Efeitos pós-commit best-effort: o veredito já foi gravado. Uma falha no
@@ -126,13 +133,6 @@ async function syncAmbiguityComment(
   else await removeOrphanAmbiguityComment(supabase, cell, field);
 }
 
-function ambiguityCommentBody(comment: string | undefined): string {
-  const note = comment?.trim();
-  return note
-    ? `Campo marcado como ambíguo na revisão (aba Comparar): ${note}`
-    : "Campo marcado como ambíguo na revisão (aba Comparar).";
-}
-
 async function ensureAmbiguityComment(
   supabase: SupabaseServerClient,
   { projectId, documentId, fieldName }: ReviewCell,
@@ -168,7 +168,7 @@ async function ensureAmbiguityComment(
   // Ignora violação do índice único (revisor concorrente marcou o mesmo
   // campo+doc) — o comentário já existe, que é o estado desejado.
   if (commentError && commentError.code !== "23505") {
-    throw new Error(commentError.message);
+    throw new PostgrestWriteError(commentError);
   }
 }
 
@@ -183,13 +183,17 @@ async function removeOrphanAmbiguityComment(
   // (`review-validity.ts`): o dado sobre outra versão da pergunta não é
   // mais o veredito de ninguém. Sem `limit(1)`, porque o primeiro pode ser
   // justamente um inválido; são no máximo um por revisor da célula.
-  const { data: ambiguous } = await supabase
+  const { data: ambiguous, error: ambiguousError } = await supabase
     .from("reviews")
     .select("id, field_name, verdict, field_hash, chosen_response_id")
     .eq("project_id", projectId)
     .eq("document_id", documentId)
     .eq("field_name", fieldName)
     .eq("verdict", "ambiguo");
+  // Sem a leitura, não dá para saber se outro revisor ainda marca ambíguo:
+  // apagar o comentário às cegas quebraria "comentário existe sse há ambiguo
+  // válido" (P3).
+  if (ambiguousError) throw new PostgrestWriteError(ambiguousError);
   const stillAmbiguous = (ambiguous ?? []).some((r) => reviewIsValid(r, field));
   if (stillAmbiguous) return;
 
@@ -200,5 +204,5 @@ async function removeOrphanAmbiguityComment(
     .eq("document_id", documentId)
     .eq("field_name", fieldName)
     .eq("kind", "ambiguity");
-  if (deleteError) throw new Error(deleteError.message);
+  if (deleteError) throw new PostgrestWriteError(deleteError);
 }

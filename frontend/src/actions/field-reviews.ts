@@ -8,7 +8,6 @@ import {
   resolveProjectMemberActor,
 } from "@/lib/auth";
 import { buildLoadMap } from "@/lib/load-balancing";
-import { errorMessage } from "@/lib/utils";
 import { resolveBlindVerdict } from "@/lib/arbitration-order";
 import { verdictRequiresJustification } from "@/lib/auto-review-decided";
 import { formatAnswerTechnical } from "@/lib/format-answer";
@@ -17,10 +16,23 @@ import { fetchDocsWithoutLlmCount } from "@/lib/auto-review-backlog-without-llm"
 import { revalidatePath } from "next/cache";
 import { after } from "next/server";
 import { propagateValueEquivalenceChange } from "@/lib/value-equivalence-effects";
+import { caughtErrorCopy, serverErrorScope } from "@/lib/server-error";
+import { PostgrestWriteError } from "@/lib/supabase/rls-guard";
 import type {
   SelfVerdict,
   ArbitrationVerdict,
 } from "@/lib/types";
+
+// Erro do Postgres ou PostgREST: o texto (em inglês, inclusive o das RPCs de
+// veredito, que só levantam invariantes) vai para o log, e o toast recebe a
+// copy pt-BR do fluxo (#502).
+const AUTO_REVIEW_FAILED = "Não foi possível enviar a auto-revisão. Tente novamente.";
+const ARBITRATION_FAILED = "Não foi possível registrar a arbitragem. Tente novamente.";
+const BACKLOG_FAILED = "Não foi possível regenerar o backlog. Tente novamente.";
+const RETRY_ARBITRATIONS_FAILED =
+  "Não foi possível redistribuir as arbitragens pendentes. Tente novamente.";
+
+const reviewServerError = serverErrorScope("field-reviews");
 
 type SupabaseDataClient = ReturnType<typeof createSupabaseAdmin>;
 
@@ -187,7 +199,7 @@ export async function submitAutoReview(
       .is("superseded_at", null)
       .in("id", verdicts.map((verdict) => verdict.fieldReviewId));
     if (requestedReviewsError) {
-      return { success: false, error: requestedReviewsError.message };
+      return { success: false, error: reviewServerError("leitura da auto-revisão", requestedReviewsError, AUTO_REVIEW_FAILED) };
     }
     const requestedById = new Map<string, ReviewAnswerSnapshots>(
       (requestedReviews ?? []).map((review) => [review.id, review]),
@@ -202,7 +214,7 @@ export async function submitAutoReview(
       p_reviewer_id: effectiveId,
       p_rows: rpcRows,
     });
-    if (error) return { success: false, error: error.message };
+    if (error) return { success: false, error: reviewServerError("envio da auto-revisão", error, AUTO_REVIEW_FAILED) };
     const result = (data ?? {}) as { arbitrated?: number; no_pool?: boolean };
     const warning = buildNoArbitratorWarning(result.no_pool, verdicts);
 
@@ -210,7 +222,7 @@ export async function submitAutoReview(
     revalidateAutoReviewSubmission(projectId);
     return { success: true, arbitrated: result.arbitrated ?? 0, warning };
   } catch (e) {
-    return { success: false, error: errorMessage(e) || "Erro" };
+    return { success: false, error: caughtErrorCopy("[field-reviews] auto-revisão falhou", e, AUTO_REVIEW_FAILED) };
   }
 }
 
@@ -244,27 +256,10 @@ async function assignArbitrator(
   documentId: string,
   excludeUserId: string,
   fieldReviewIds: string[],
-  precomputedCoderIds?: Set<string>,
+  // Codificadores humanos do documento, pré-buscados em batch pelo único
+  // chamador (retryPendingArbitrations), cuja query cobre os filtros.
+  coderIds: Set<string>,
 ): Promise<{ count: number; noPool: boolean }> {
-  // Codificadores humanos deste documento — quem já tem resposta registrada
-  // para o doc (recurso de comparação N+). Quando o caller pré-buscou em
-  // batch (retryPendingArbitrations), reusa o set para evitar N queries.
-  let coderIds: Set<string>;
-  if (precomputedCoderIds) {
-    coderIds = precomputedCoderIds;
-  } else {
-    const { data: coders } = await admin
-      .from("responses")
-      .select("respondent_id")
-      .eq("project_id", projectId)
-      .eq("document_id", documentId)
-      .eq("respondent_type", "humano");
-    coderIds = new Set<string>();
-    for (const c of coders ?? []) {
-      if (c.respondent_id) coderIds.add(c.respondent_id as string);
-    }
-  }
-
   // Elegíveis (can_arbitrate) menos o auto-revisor original — esse nunca
   // arbitra, sob nenhuma circunstância, porque julgaria a própria resposta.
   const { data: eligibleMembers } = await admin
@@ -327,7 +322,7 @@ async function assignArbitrator(
       p_field_review_ids: fieldReviewIds,
     },
   );
-  if (assignmentError) throw new Error(assignmentError.message);
+  if (assignmentError) throw new PostgrestWriteError(assignmentError);
 
   return { count: typeof assigned === "number" ? assigned : 0, noPool: false };
 }
@@ -381,7 +376,7 @@ export async function submitBlindVerdicts(
     const failedIndices: number[] = [];
     for (let i = 0; i < results.length; i++) {
       const res = results[i];
-      if (res.error) return { success: false, error: res.error.message };
+      if (res.error) return { success: false, error: reviewServerError("veredito cego", res.error, ARBITRATION_FAILED) };
       if (!res.data || res.data.length === 0) {
         failedIndices.push(i);
       }
@@ -425,7 +420,7 @@ export async function submitBlindVerdicts(
     revalidatePath(`/projects/${projectId}/analyze/arbitragem`);
     return { success: true };
   } catch (e) {
-    return { success: false, error: errorMessage(e) || "Erro" };
+    return { success: false, error: caughtErrorCopy("[field-reviews] veredito cego falhou", e, ARBITRATION_FAILED) };
   }
 }
 
@@ -547,7 +542,7 @@ export async function submitFinalVerdicts(
       .in("id", choices.map((choice) => choice.fieldReviewId))
       .eq("arbitrator_id", effectiveId)
       .is("superseded_at", null);
-    if (frErr) return { success: false, error: frErr.message };
+    if (frErr) return { success: false, error: reviewServerError("leitura da arbitragem", frErr, ARBITRATION_FAILED) };
 
     const frById = new Map<string, FinalReviewState>(
       (frRows ?? []).map((review) => [review.id as string, review]),
@@ -568,12 +563,12 @@ export async function submitFinalVerdicts(
         p_rows: rpcRows,
       },
     );
-    if (submitError) return { success: false, error: submitError.message };
+    if (submitError) return { success: false, error: reviewServerError("veredito final", submitError, ARBITRATION_FAILED) };
 
     revalidateFinalVerdictSubmission(projectId);
     return { success: true };
   } catch (e) {
-    return { success: false, error: errorMessage(e) || "Erro" };
+    return { success: false, error: caughtErrorCopy("[field-reviews] veredito final falhou", e, ARBITRATION_FAILED) };
   }
 }
 
@@ -604,7 +599,7 @@ export async function regenerateAutoReviewBacklog(
       "enqueue_auto_review_reconciliation_for_project",
       { p_project_id: projectId },
     );
-    if (enqueueError) return { success: false, error: enqueueError.message };
+    if (enqueueError) return { success: false, error: reviewServerError("regeneração do backlog", enqueueError, BACKLOG_FAILED) };
 
     // A contagem lê com o cliente do usuário: a RLS de responses, field_reviews
     // e do histórico já deixa coordenador e master verem o projeto inteiro, e
@@ -640,7 +635,7 @@ export async function regenerateAutoReviewBacklog(
       withoutLlm: withoutLlmResult.count,
     };
   } catch (e) {
-    return { success: false, error: errorMessage(e) || "Erro" };
+    return { success: false, error: caughtErrorCopy("[field-reviews] regeneração do backlog falhou", e, BACKLOG_FAILED) };
   }
 }
 
@@ -677,7 +672,7 @@ export async function retryPendingArbitrations(
       .is("superseded_at", null)
       .is("arbitrator_id", null);
     if (error)
-      return { success: false, error: error.message, assigned: 0, stillNoPool: 0 };
+      return { success: false, error: reviewServerError("leitura das arbitragens pendentes", error, RETRY_ARBITRATIONS_FAILED), assigned: 0, stillNoPool: 0 };
     if (!pending || pending.length === 0)
       return { success: true, assigned: 0, stillNoPool: 0 };
 
@@ -699,21 +694,24 @@ export async function retryPendingArbitrations(
     }
 
     // Pré-busca em batch: codificadores humanos de todos os docs pendentes
-    // de uma vez. assignArbitrator originalmente faz 1 SELECT em responses
-    // por chamada — em loop de N groups isso vira N queries. Centralizar
-    // num único SELECT mantém a chamada O(1) em queries de responses
-    // independente do tamanho do backlog.
+    // de uma vez, num único SELECT em responses (O(1) queries independente do
+    // tamanho do backlog). assignArbitrator depende deste set: é ele que tira
+    // os codificadores do documento do pool de árbitros.
     const allDocIds = [
       ...new Set([...groups.values()].map((g) => g.documentId)),
     ];
     const codersByDoc = new Map<string, Set<string>>();
     if (allDocIds.length > 0) {
-      const { data: allCoders } = await supabase
+      const { data: allCoders, error: codersError } = await supabase
         .from("responses")
         .select("document_id, respondent_id")
         .eq("project_id", projectId)
         .in("document_id", allDocIds)
         .eq("respondent_type", "humano");
+      // Sem o set, o codificador do documento entraria no pool como árbitro
+      // "neutro": falha alto em vez de atribuir errado (P3).
+      if (codersError)
+        return { success: false, error: reviewServerError("leitura dos codificadores", codersError, RETRY_ARBITRATIONS_FAILED), assigned: 0, stillNoPool: 0 };
       for (const c of allCoders ?? []) {
         const docId = c.document_id as string;
         const respId = c.respondent_id as string | null;
@@ -757,7 +755,7 @@ export async function retryPendingArbitrations(
   } catch (e) {
     return {
       success: false,
-      error: errorMessage(e) || "Erro",
+      error: caughtErrorCopy("[field-reviews] redistribuição das arbitragens falhou", e, RETRY_ARBITRATIONS_FAILED),
       assigned: 0,
       stillNoPool: 0,
     };

@@ -55,6 +55,8 @@ beforeEach(() => {
         self_reviewer_id: "canonical-member",
         superseded_at: null,
         self_verdict: null,
+        "documents.excluded_at": null,
+        "documents.exclusion_pending_at": null,
       },
     ],
   };
@@ -99,5 +101,90 @@ describe("AnalyzeLayout — identidade efetiva da fila", () => {
       showArbitragem: false,
       showCompare: false,
     });
+  });
+});
+
+// A aba aparecia para uma fila que abria vazia: o probe não descontava
+// documento excluído, e a fila desconta.
+describe("AnalyzeLayout — pendência só de documento fora da fila", () => {
+  it.each(["documents.excluded_at", "documents.exclusion_pending_at"])(
+    "esconde a aba quando a única pendência é de documento com %s",
+    async (column) => {
+      Object.assign(tableData.field_reviews[0] as object, {
+        [column]: "2026-11-01T00:00:00Z",
+      });
+      const layout = await loadLayout();
+
+      const result = await layout({
+        children: <div>Conteúdo</div>,
+        params: Promise.resolve({ id: "project-1" }),
+      });
+
+      expect(getAnalyzeNavProps(result).showAutoReview).toBe(false);
+    },
+  );
+});
+
+// O mesmo defeito no probe da arbitragem: ele só conferia que existia um
+// assignment, e a fila exige assignment aberto, documento ativo e campo
+// contestado do ciclo corrente sem veredito final.
+describe("AnalyzeLayout — arbitragem fora da fila", () => {
+  async function showArbitragem(
+    assignment: Record<string, unknown> = {},
+    fieldReview: Record<string, unknown> = {},
+  ) {
+    tableData.assignments = [
+      {
+        id: "assignment-1",
+        project_id: "project-1",
+        user_id: "canonical-member",
+        type: "arbitragem",
+        status: "pendente",
+        document_id: "doc-1",
+        "documents.excluded_at": null,
+        "documents.exclusion_pending_at": null,
+        ...assignment,
+      },
+    ];
+    tableData.field_reviews = [
+      {
+        id: "review-arbitragem",
+        project_id: "project-1",
+        document_id: "doc-1",
+        arbitrator_id: "canonical-member",
+        self_verdict: "contesta_llm",
+        superseded_at: null,
+        final_verdict: null,
+        "documents.excluded_at": null,
+        "documents.exclusion_pending_at": null,
+        ...fieldReview,
+      },
+    ];
+    const layout = await loadLayout();
+    const result = await layout({
+      children: <div>Conteúdo</div>,
+      params: Promise.resolve({ id: "project-1" }),
+    });
+    return getAnalyzeNavProps(result).showArbitragem;
+  }
+
+  it("mostra a aba para arbitragem aberta de documento ativo", async () => {
+    expect(await showArbitragem()).toBe(true);
+  });
+
+  const excluded = { "documents.excluded_at": "2026-11-01T00:00:00Z" };
+  const exclusionPending = {
+    "documents.exclusion_pending_at": "2026-11-01T00:00:00Z",
+  };
+  it.each([
+    ["o assignment já foi concluído", { status: "concluido" }, {}],
+    ["o documento foi excluído", excluded, excluded],
+    ["o documento está com exclusão pendente", exclusionPending, exclusionPending],
+    ["o campo é de ciclo superado", {}, { superseded_at: "2026-11-01T00:00:00Z" }],
+    ["o campo já tem veredito final", {}, { final_verdict: "humano" }],
+    ["o campo está com outro árbitro", {}, { arbitrator_id: "outro" }],
+    ["o campo pendente é de outro documento", {}, { document_id: "doc-2" }],
+  ])("esconde a aba quando %s", async (_, assignment, fieldReview) => {
+    expect(await showArbitragem(assignment, fieldReview)).toBe(false);
   });
 });

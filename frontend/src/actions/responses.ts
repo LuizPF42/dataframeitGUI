@@ -2,12 +2,14 @@
 
 import { createSupabaseServer, type SupabaseServerClient } from "@/lib/supabase/server";
 import { resolveProjectMemberActor } from "@/lib/auth";
-import { revalidatePath, revalidateTag } from "next/cache";
+import { revalidatePath } from "next/cache";
 import { buildPersistedResponseSnapshot } from "@/lib/response-snapshot";
 import { missingRequiredHumanFields } from "@/lib/coding-completeness";
 import { syncCodingAssignmentStatus } from "@/lib/coding-sync";
 import { deriveProjectVersionContext } from "@/lib/compare-version";
 import type { AnswerFieldHashes, PydanticField } from "@/lib/types";
+import { caughtErrorCopy, serverErrorCopy, type ServerError } from "@/lib/server-error";
+import { profileFullName } from "@/lib/respondent-names";
 
 export interface SaveResponseOpts {
   notes?: string;
@@ -83,7 +85,7 @@ async function fetchSaveContext(
   ] = await Promise.all([
     supabase
       .from("profiles")
-      .select("first_name, last_name")
+      .select("first_name, last_name, email")
       .eq("id", effectiveId)
       .single(),
     existingQuery
@@ -240,7 +242,10 @@ interface PersistResponseRowParams {
   projectId: string;
   documentId: string;
   effectiveId: string;
-  respondentName: string;
+  /** Nome do perfil; `null` enquanto o perfil não tem nome. */
+  profileName: string | null;
+  /** Autoria de quem ainda não tem nome no perfil. Só vale para o INSERT. */
+  fallbackName: string;
   payload: Record<string, unknown>;
   roundId: string;
 }
@@ -250,7 +255,7 @@ interface PersistResponseRowParams {
 type PersistOutcome =
   | { status: "ok" }
   | { status: "conflict" }
-  | { status: "error"; error: string; code?: string };
+  | { status: "error"; error: ServerError };
 
 // O índice único parcial que sustenta o ramo de conflito abaixo. Conferir o
 // nome é o que separa "perdi a corrida, releia" de qualquer outra violação de
@@ -284,16 +289,21 @@ async function persistResponseRow({
   projectId,
   documentId,
   effectiveId,
-  respondentName,
+  profileName,
+  fallbackName,
   payload,
   roundId,
 }: PersistResponseRowParams): Promise<PersistOutcome> {
+  // O UPDATE leva o nome para a autoria acompanhar o perfil preenchido depois
+  // da primeira gravação (#622); sem nome no perfil, não toca a autoria.
+  const updatePayload =
+    profileName === null ? payload : { ...payload, respondent_name: profileName };
   // O payload não toca coluna-chave, então este UPDATE não dispara
   // enforce_comparison_response_actor_trigger, que só observa project_id,
   // document_id, respondent_id, respondent_type e is_latest.
   const { data: updated, error: updErr } = await supabase
     .from("responses")
-    .update(payload)
+    .update(updatePayload)
     .eq("project_id", projectId)
     .eq("document_id", documentId)
     .eq("respondent_id", effectiveId)
@@ -301,7 +311,7 @@ async function persistResponseRow({
     .eq("round_id", roundId)
     .eq("is_latest", true)
     .select("id");
-  if (updErr) return { status: "error", error: updErr.message, code: updErr.code };
+  if (updErr) return { status: "error", error: updErr };
   if (updated && updated.length > 0) return { status: "ok" };
 
   const { error: insErr } = await supabase.from("responses").insert({
@@ -309,7 +319,7 @@ async function persistResponseRow({
     document_id: documentId,
     respondent_id: effectiveId,
     respondent_type: "humano",
-    respondent_name: respondentName,
+    respondent_name: profileName ?? fallbackName,
     is_latest: true,
     ...payload,
   });
@@ -320,7 +330,7 @@ async function persistResponseRow({
   ) {
     return { status: "conflict" };
   }
-  return { status: "error", error: insErr.message, code: insErr.code };
+  return { status: "error", error: insErr };
 }
 
 // Propaga o efeito do envio para as telas que leem a mesma resposta —
@@ -333,7 +343,6 @@ function revalidateAfterSave(projectId: string): void {
   revalidatePath(`/projects/${projectId}/analyze/auto-revisao`);
   revalidatePath(`/projects/${projectId}/analyze/arbitragem`);
   revalidatePath(`/projects/${projectId}/reviews`);
-  revalidateTag(`project-${projectId}-progress`, { expire: 60 });
 }
 
 interface BuildSaveWriteParams {
@@ -395,6 +404,24 @@ function buildSaveWrite({
   return { snapshot, missingRequiredFields, payload };
 }
 
+// Leitura que falha antes do save: o texto do Postgres vai para o log, e o
+// toast recebe esta copy (#502).
+const SAVE_READ_FAILED = "Não foi possível carregar a codificação para salvar. Tente novamente.";
+const SAVE_WRITE_FAILED = "Não foi possível salvar a codificação. Tente novamente.";
+
+// Recusa de enforce_comparison_response_actor (20261113120000): quem revisa a
+// comparação do documento não o codifica. Só ela, entre os 23514 da escrita,
+// é recusa a mostrar; outro CHECK é falha real e vai ao log.
+const COMPARISON_REVIEWER_TRIGGER_MESSAGE =
+  "o revisor da comparação não pode codificar o mesmo documento";
+
+function isComparisonReviewerRefusal(error: ServerError): boolean {
+  return (
+    error.code === "23514" &&
+    error.message.includes(COMPARISON_REVIEWER_TRIGGER_MESSAGE)
+  );
+}
+
 // Os motivos para não gravar, avaliados antes de montar qualquer payload.
 // Nenhum deles depende do que foi digitado — só do estado do projeto, da
 // leitura da resposta corrente e do documento.
@@ -403,17 +430,17 @@ function rejectedSaveContext({
   existingErr,
   doc,
 }: {
-  projErr: { message: string } | null;
-  existingErr: { message: string } | null;
+  projErr: ServerError | null;
+  existingErr: ServerError | null;
   doc: { excluded_at: string | null } | null;
 }): SaveResponseResult | null {
-  if (projErr) return { success: false, error: projErr.message };
+  if (projErr) return { success: false, error: serverErrorCopy("[responses] leitura do projeto falhou", projErr, { generic: SAVE_READ_FAILED }) };
 
   // Falha ao LER a resposta corrente aborta o save. Seguir como se não
   // existisse gravaria por cima dela um snapshot construído sem os valores
   // preservados (#484) — perda silenciosa, sem rastro. Falhar fechado aqui é
   // o que a #609 corrige junto com o índice.
-  if (existingErr) return { success: false, error: existingErr.message };
+  if (existingErr) return { success: false, error: serverErrorCopy("[responses] leitura da resposta corrente falhou", existingErr, { generic: SAVE_READ_FAILED }) };
 
   // Doc já excluído (soft delete) não aceita mais respostas. Pedido de
   // exclusão apenas PENDENTE não bloqueia: é reversível e o dado humano
@@ -479,8 +506,6 @@ async function runSaveAttempt({
     };
   }
 
-  const respondentName = resolveRespondentName(profile, userEmail);
-
   const fields = (project?.pydantic_fields as PydanticField[]) || [];
   const { snapshot, missingRequiredFields, payload } = buildSaveWrite({
     fields,
@@ -496,17 +521,29 @@ async function runSaveAttempt({
     projectId,
     documentId,
     effectiveId,
-    respondentName,
+    profileName: profileFullName(profile),
+    // O e-mail é o do membro por quem a resposta é gravada: com conta
+    // vinculada, o da conta logada poria a autoria sob outro endereço.
+    fallbackName: profile?.email || userEmail,
     payload,
     roundId: expectedRoundId,
   });
   if (outcome.status === "error") {
+    // A recusa do gatilho é a razão real e já vem em pt-BR: passa como veio.
+    if (isComparisonReviewerRefusal(outcome.error)) {
+      return { success: false, error: outcome.error.message };
+    }
+    // O texto do Postgres vai para o log, e o toast recebe a copy (#502). A
+    // rodada trocada é estado esperado, com copy própria e sem log.
     return {
       success: false,
-      error:
-        outcome.code === ROUND_CHANGED_SQLSTATE
-          ? "A rodada mudou enquanto este formulário estava aberto. Recarregue a página."
-          : outcome.error,
+      error: serverErrorCopy("[responses] gravação da codificação falhou", outcome.error, {
+        generic: SAVE_WRITE_FAILED,
+        byCode: {
+          [ROUND_CHANGED_SQLSTATE]:
+            "A rodada mudou enquanto este formulário estava aberto. Recarregue a página.",
+        },
+      }),
     };
   }
   if (outcome.status === "conflict") return { conflict: true };
@@ -522,9 +559,10 @@ async function runSaveAttempt({
     snapshot,
     roundId: expectedRoundId,
   });
-  if (syncErr) return { success: false, error: syncErr };
-
+  // A resposta já está gravada mesmo quando o sync do assignment falha: as
+  // telas que a mostram são revalidadas nos dois casos.
   revalidateAfterSave(projectId);
+  if (syncErr) return { success: false, error: syncErr };
   return { success: true, missingRequiredFields };
 }
 
@@ -566,19 +604,6 @@ async function syncAssignmentAfterSave({
     roundId,
   });
   return error;
-}
-
-// Nome exibido como autoria da resposta. O e-mail é o fallback de quem ainda
-// não preencheu o perfil.
-function resolveRespondentName(
-  profile:
-    { first_name: string | null; last_name: string | null } | null | undefined,
-  userEmail: string,
-): string {
-  return (
-    [profile?.first_name, profile?.last_name].filter(Boolean).join(" ") ||
-    userEmail
-  );
 }
 
 // Duas tentativas, não mais: o conflito só acontece quando outra sessão criou
@@ -635,7 +660,7 @@ export async function saveResponse(
   } catch (e) {
     return {
       success: false,
-      error: e instanceof Error ? e.message : "Erro desconhecido",
+      error: caughtErrorCopy("[responses] save falhou", e, SAVE_WRITE_FAILED),
     };
   }
 }

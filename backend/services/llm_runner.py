@@ -14,10 +14,12 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from typing import Any
+from typing import Any, Optional, Union, get_args, get_origin
 
 import pandas as pd
 
@@ -29,8 +31,17 @@ import pandas as pd
 from supabase import PostgrestAPIError
 
 from services.auto_review_reconciliation import wake_auto_review_reconciliation_sync
-from services.condition_evaluator import evaluate_condition, extract_field_conditions
-from services.pydantic_compiler import build_model_from_code, extract_json_schema_extra
+from services.condition_evaluator import (
+    evaluate_condition,
+    extract_field_conditions,
+    hidden_conditionals,
+)
+from services.pydantic_compiler import (
+    build_model_from_code,
+    extract_json_schema_extra,
+    field_target,
+    unwrap_optional,
+)
 from services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -80,15 +91,17 @@ _MAX_CONSECUTIVE_PUBLISH_FAILURES = 5
 
 def _status_from_row(row: dict) -> dict:
     """Shape a llm_runs row as a StatusResponse-compatible dict."""
+    status = row.get("status", "error")
     return {
-        "status": row.get("status", "error"),
-        "phase": row.get("phase", "error"),
+        "status": status,
+        # `llm_runs.phase` é anulável e `StatusResponse.phase` é `str`: fase
+        # nula derrubava a rota de status com 500. Os status terminais são
+        # também fases válidas; run viva sem fase está na fase do INSERT.
+        "phase": row.get("phase") or ("loading" if status == "running" else status),
         "progress": row.get("progress") or 0,
         "total": row.get("total") or 0,
         "errors": [row["error_message"]] if row.get("error_message") else [],
         "eta_seconds": None,
-        "current_batch": 0,
-        "total_batches": 0,
         "error_traceback": row.get("error_traceback"),
         "error_type": row.get("error_type"),
         "error_line": row.get("error_line"),
@@ -138,8 +151,6 @@ def get_job_status(job_id: str) -> dict:
         "total": 0,
         "errors": ["Job not found"],
         "eta_seconds": None,
-        "current_batch": 0,
-        "total_batches": 0,
         "processed_complete": 0,
         "processed_partial": 0,
         "processed_empty": 0,
@@ -187,25 +198,47 @@ def _persist_run_insert(sb, job_id: str, project_id: str, filter_mode: str) -> N
     ).execute()
 
 
-def _persist_run_progress(sb, job_id: str, jobs_state: dict) -> None:
+def _persist_run_progress(sb, job_id: str, jobs_state: dict) -> bool:
     """Persistir snapshot de counters + heartbeat em llm_runs.
 
-    Chamado periodicamente pelo save loop (throttle 2s). Erros aqui são
-    logados, não re-lançados: a run principal não deve abortar só porque uma
-    atualização de progresso falhou. O próximo tick tenta de novo.
+    Chamado pelo save loop (throttle 2s) e a cada mudança de fase. Erros aqui
+    são logados, não re-lançados: a run principal não deve abortar só porque
+    uma atualização de progresso falhou. O próximo tick tenta de novo. Devolve
+    se a gravação saiu.
+
+    O `total` não entra aqui: é constante durante a run, e quem o grava é
+    `_persist_run_snapshot` (o fecho da run o repete).
     """
+    payload = {
+        "processed_complete": jobs_state.get("processed_complete", 0),
+        "processed_partial": jobs_state.get("processed_partial", 0),
+        "processed_empty": jobs_state.get("processed_empty", 0),
+        "progress": jobs_state.get("progress", 0),
+        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Fase: o fallback de status (backend reiniciado) lê daqui o que o cartão
+    # mostra. Lida fora do `try` que só loga: um estado sem a chave perderia o
+    # UPDATE inteiro, e sem heartbeat a run viva seria marcada como abandonada.
+    # Sem fase, a coluna fica como está e o defeito aparece no log.
+    phase = jobs_state.get("phase")
+    if phase is None:
+        logger.error(
+            "Estado do job %s sem fase: o progresso segue sem atualizar a fase",
+            job_id,
+        )
+    else:
+        payload["phase"] = phase
     try:
-        sb.table("llm_runs").update(
-            {
-                "processed_complete": jobs_state.get("processed_complete", 0),
-                "processed_partial": jobs_state.get("processed_partial", 0),
-                "processed_empty": jobs_state.get("processed_empty", 0),
-                "progress": jobs_state.get("progress", 0),
-                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ).eq("job_id", job_id).execute()
+        # Só em run viva: a fase de uma linha já encerrada (inclusive por
+        # mark_stale_runs_as_error, com a run ainda rodando) não volta
+        # para `processing`.
+        sb.table("llm_runs").update(payload).eq("job_id", job_id).eq(
+            "status", "running"
+        ).execute()
     except Exception:
         logger.exception("Failed to UPDATE llm_runs progress for job %s", job_id)
+        return False
+    return True
 
 
 def mark_stale_runs_as_error(sb, project_id: str) -> int:
@@ -274,6 +307,11 @@ def _persist_run_snapshot(sb, job_id: str, project: dict, doc_count: int) -> Non
             "llm_provider": project.get("llm_provider"),
             "llm_model": project.get("llm_model"),
             "document_count": doc_count,
+            # O total que o cartão mostra em "progresso/total". Constante
+            # durante a run, por isso sai aqui, antes da fase `processing`, e
+            # não a cada gravação de progresso: o fallback de status (backend
+            # reiniciado) nunca lê "5/0 documentos processados".
+            "total": doc_count,
             "pydantic_code": project.get("pydantic_code"),
             # A rodada é capturada junto do restante do snapshot da execução.
             # Mesmo que o coordenador inicie outra rodada enquanto o provider
@@ -345,6 +383,10 @@ def _persist_run_error(
             payload["processed_complete"] = counters.get("processed_complete", 0)
             payload["processed_partial"] = counters.get("processed_partial", 0)
             payload["processed_empty"] = counters.get("processed_empty", 0)
+            # O progresso fecha junto: a última gravação dele pode ter ficado
+            # para trás no throttle, e a linha diria "0/N" com um processado.
+            if "progress" in counters:
+                payload["progress"] = counters["progress"]
         sb.table("llm_runs").update(payload).eq("job_id", job_id).execute()
     except Exception:
         logger.exception("Failed to UPDATE llm_runs error for job %s", job_id)
@@ -485,6 +527,9 @@ class _RunMetadata:
 class _PreparedLlmModel:
     model_class: object
     nested_field_map: dict
+    # Lidas antes do achatamento: o pai de um composto condicional some do
+    # modelo achatado, mas é por ele que a resposta reconstruída é podada.
+    field_conditions: dict
 
 
 @dataclass(frozen=True)
@@ -514,6 +559,24 @@ DATAFRAMEIT_PARAMS = {
     "reprocess_columns",
     "status_column",
 }
+
+
+def _pydantic_code_hash(pydantic_code: str) -> str:
+    """O `pydantic_hash` do código: sha256 do texto UTF-8, 16 primeiros hex.
+
+    É a mesma regra que `commit_project_schema` aplica no banco ao salvar o
+    schema. As duas precisam bater: o runner regrava `projects.pydantic_hash` ao
+    fim da run e carimba o hash em cada resposta LLM, e resposta legada sem
+    `answer_field_hashes` só se liga ao schema por ele. O contrato está em
+    tests/integration/test_pydantic_hash_contract.py.
+    """
+    return hashlib.sha256(pydantic_code.encode()).hexdigest()[:16]
+
+
+def _persist_project_pydantic_hash(sb, project_id: str, pydantic_hash: str) -> None:
+    sb.table("projects").update({"pydantic_hash": pydantic_hash}).eq(
+        "id", project_id
+    ).execute()
 
 
 def _build_llm_response_row(
@@ -634,6 +697,99 @@ def _extend_model_with_justifications(model_class):
     return extended_model
 
 
+# Chaves de `json_schema_extra` que a biblioteca dataframeit lê com sentido
+# próprio. Cópia de `_LIBRARY_EXTRA_KEYS` em `dataframeit/agent.py`, que é
+# privado; o teste de paridade em test_llm_schema_extra.py acusa a divergência
+# quando a biblioteca for atualizada.
+_DATAFRAMEIT_EXTRA_KEYS = frozenset(
+    {
+        "condition",
+        "depends_on",
+        "prompt",
+        "prompt_replace",
+        "prompt_append",
+        "search_depth",
+        "max_results",
+        "max_search_calls",
+    }
+)
+
+
+def _strip_internal_schema_extra(model_class):
+    """Tira do modelo que vai ao provider as chaves internas de `json_schema_extra`.
+
+    O provider serializa o JSON Schema inteiro do modelo, e `json_schema_extra`
+    entra inline em cada propriedade. As chaves que o gerador grava ali (`id`,
+    `help_text`, `visible_if`, `target`, `options`...) são metadado de produto,
+    lido por nós antes e depois da chamada; no schema enviado só inflam o
+    payload (#697). O que o modelo deve ler está em `description`, que fica.
+
+    Ficam apenas as chaves que a própria biblioteca dataframeit lê
+    (`_DATAFRAMEIT_EXTRA_KEYS`): ela as consome e as tira do schema por conta
+    própria, e removê-las aqui desligaria em silêncio a configuração de busca
+    de um código escrito à mão.
+
+    Tem de ser a última etapa de `_prepare_llm_model`: a leitura das condições
+    e de `justification_prompt` depende das chaves que saem aqui. O
+    `pydantic_code` e o `pydantic_fields` não são tocados — o filtro vale só
+    para a classe montada para a chamada. Como em `_filter_model_for_llm`, a
+    classe é refeita sobre `BaseModel`: só campos e anotações sobrevivem.
+    """
+    from pydantic import BaseModel, create_model
+
+    fields: dict = {}
+    changed = False
+    for name, info in model_class.model_fields.items():
+        annotation = _strip_annotation(info.annotation)
+        extra = extract_json_schema_extra(info)
+        kept = {k: v for k, v in extra.items() if k in _DATAFRAMEIT_EXTRA_KEYS}
+        if len(kept) != len(extra):
+            changed = True
+            original = info
+            info = copy(original)
+            info.json_schema_extra = kept or None
+            # copy() compartilha `_attributes_set`, de onde o Pydantic remonta
+            # o campo no create_model; sem ajustar, as chaves voltariam por ali.
+            attributes = dict(getattr(original, "_attributes_set", {}))
+            if kept:
+                attributes["json_schema_extra"] = kept
+            else:
+                attributes.pop("json_schema_extra", None)
+            info._attributes_set = attributes
+        changed = changed or annotation != info.annotation
+        fields[name] = (annotation, info)
+
+    if not changed:
+        return model_class
+
+    stripped = create_model(model_class.__name__, __base__=BaseModel, **fields)
+    setattr(
+        stripped,
+        _GENERATED_JUSTIFICATION_FIELDS_ATTR,
+        _generated_justification_fields(model_class),
+    )
+    return stripped
+
+
+def _strip_annotation(annotation):
+    """A anotação com os submodelos limpos por `_strip_internal_schema_extra`.
+
+    O achatamento só expande `BaseModel` direto ou `Optional[BaseModel]`; o
+    submodelo dentro de lista, que código escrito à mão pode trazer, segue para
+    o provider em `$defs` com o `json_schema_extra` dos seus campos.
+    """
+    from pydantic import BaseModel
+
+    origin = get_origin(annotation)
+    if origin is list:
+        return list[_strip_annotation(get_args(annotation)[0])]
+    if origin is Union:
+        return Union[tuple(_strip_annotation(a) for a in get_args(annotation))]  # type: ignore[misc]
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _strip_internal_schema_extra(annotation)
+    return annotation
+
+
 # Separador usado para achatar nested BaseModels em top-level (ver
 # _flatten_nested_basemodels abaixo). Dois underscores minimizam colisão com
 # nomes de campo reais (q2_id_..., q24a_...).
@@ -661,16 +817,23 @@ def _flatten_nested_basemodels(model_class):
     field_map: dict[str, list[tuple[str, str]]] = {}
 
     for name, info in model_class.model_fields.items():
-        ann = info.annotation
+        # Campo composto com condição sai do gerador como
+        # `Optional[_<nome>_fields] = None` (#525).
+        ann = unwrap_optional(info.annotation)
         if (
             isinstance(ann, type)
             and issubclass(ann, BaseModel)
             and ann is not BaseModel
         ):
+            parent_optional = ann is not info.annotation
             field_map[name] = []
             for sub_name, sub_info in ann.model_fields.items():
                 flat_name = f"{name}{_NESTED_FLATTEN_SEP}{sub_name}"
-                flat_fields[flat_name] = (sub_info.annotation, sub_info)
+                flat_fields[flat_name] = (
+                    _optional_field(sub_info)
+                    if parent_optional and sub_info.is_required()
+                    else (sub_info.annotation, sub_info)
+                )
                 field_map[name].append((flat_name, sub_name))
         else:
             flat_fields[name] = (info.annotation, info)
@@ -686,12 +849,26 @@ def _flatten_nested_basemodels(model_class):
     return flat_model, field_map
 
 
-def _filter_model_for_llm(model_class, pydantic_fields: list[dict]):
+def _optional_field(info):
+    """`(Optional[X], info com default None)`, sem tocar o FieldInfo original.
+
+    O pai opcional podia vir nulo inteiro do LLM. Achatado, cada subcampo
+    herda essa opção: um subcampo `str` obrigatório de um pai oculto obrigaria
+    o provider a inventar um valor que a poda condicional jogaria fora.
+    """
+    optional_info = copy(info)
+    optional_info.default = None
+    return Optional[info.annotation], optional_info
+
+
+def _filter_model_for_llm(model_class):
     """Return a model class excluding fields that should not be sent to the LLM.
 
-    A field is excluded when its ``target`` in ``pydantic_fields`` is either
-    ``"none"`` (hidden from everyone) or ``"human_only"``. Returns the original
-    ``model_class`` unchanged when no fields need to be excluded.
+    A field is excluded when its ``target`` is either ``"none"`` (hidden from
+    everyone) or ``"human_only"``. The target is read from the compiled code
+    (``json_schema_extra``), not from ``projects.pydantic_fields``: the code is
+    the source of truth and the JSON can lag behind it (#747). Returns the
+    original ``model_class`` unchanged when no fields need to be excluded.
 
     Note: the filtered model is created with ``__base__=BaseModel``, so any
     custom ``model_config`` or validators on the original class are not
@@ -702,9 +879,9 @@ def _filter_model_for_llm(model_class, pydantic_fields: list[dict]):
     from pydantic import BaseModel, create_model
 
     excluded_names = {
-        f["name"]
-        for f in (pydantic_fields or [])
-        if f.get("target") in ("none", "human_only")
+        name
+        for name, info in model_class.model_fields.items()
+        if field_target(extract_json_schema_extra(info)) in ("none", "human_only")
     }
     if not excluded_names:
         return model_class
@@ -772,6 +949,17 @@ _SELECT_PAGE_SIZE = 1000
 _ID_BATCH_SIZE = 100
 
 
+# Lotes de ids lidos ao mesmo tempo em `_select_all`. Os lotes são
+# independentes, e em sequência a latência somava uma ida e volta por lote (200
+# lotes numa run de 20 mil documentos escolhidos a dedo). O teto vale para o
+# processo, e não por run: as runs não multiplicam as leituras simultâneas no
+# PostgREST. É um semáforo, e não um pool compartilhado, para que uma run de
+# 200 lotes não ponha a de 2 no fim da fila: os lotes de cada chamada disputam
+# as vagas.
+_ID_BATCH_WORKERS = 4
+_ID_BATCH_SLOTS = threading.BoundedSemaphore(_ID_BATCH_WORKERS)
+
+
 # Fração do escopo escolhida a partir da qual a segunda fase de
 # `_load_documents_for_run` pode ler o escopo paginado e descartar em Python os
 # não escolhidos, em vez de pedir os escolhidos em lotes de `_ID_BATCH_SIZE`.
@@ -786,7 +974,9 @@ def _scope_read_is_cheaper(n_scope: int, n_chosen: int, min_fraction: float) -> 
 
     Conta como `_read_pages` pede: o escopo custa as páginas com linhas mais a
     vazia que encerra a leitura; os lotes, um pedido cada (o lote completo
-    dispensa a página vazia). Num escopo pequeno, um lote só sai mais barato
+    dispensa a página vazia). Conta pedidos, a carga no PostgREST, e não
+    latência: os lotes saem em paralelo, as páginas não, e isso não muda o
+    número de pedidos. Num escopo pequeno, um lote só sai mais barato
     mesmo com quase tudo escolhido.
     """
     scope_requests = math.ceil(n_scope / _SELECT_PAGE_SIZE) + 1
@@ -816,21 +1006,30 @@ def _select_all(
 
     Com `ids`, a leitura se restringe a eles, num filtro `in` fatiado em lotes
     de `id_batch_size`. Os lotes saem dos ids ordenados, então o resultado
-    continua em ordem de `id`. `ids=[]` não lê nada.
+    continua em ordem de `id`. `ids=[]` não lê nada. Os lotes são lidos em
+    paralelo, até `_ID_BATCH_WORKERS` ao mesmo tempo no processo.
     """
     if ids is None:
         return _read_pages(build_query)
     unique_ids = sorted(set(ids))
-    rows: list = []
-    for start in range(0, len(unique_ids), id_batch_size):
-        batch = unique_ids[start : start + id_batch_size]
-        rows.extend(
-            _read_pages(
-                lambda batch=batch: build_query().in_("id", batch),
-                at_most=len(batch),
+    batches = [
+        unique_ids[start : start + id_batch_size]
+        for start in range(0, len(unique_ids), id_batch_size)
+    ]
+
+    def read_batch(batch: list[str]) -> list:
+        with _ID_BATCH_SLOTS:
+            return _read_pages(
+                lambda: build_query().in_("id", batch), at_most=len(batch)
             )
-        )
-    return rows
+
+    if len(batches) <= 1:
+        return read_batch(batches[0]) if batches else []
+    # `map` devolve na ordem dos lotes, e não na de conclusão: o resultado
+    # segue em ordem de `id`. A falha de um lote sobe ao ler o resultado dele.
+    workers = min(_ID_BATCH_WORKERS, len(batches))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return [row for rows in pool.map(read_batch, batches) for row in rows]
 
 
 def _read_pages(build_query: Callable[[], Any], at_most: int | None = None) -> list:
@@ -963,19 +1162,21 @@ def _normalize_llm_kwargs(llm_kwargs: dict) -> _DataframeitRunConfig:
 
 def _prepare_llm_model(
     pydantic_code: str,
-    pydantic_fields: list[dict],
     include_justifications: bool,
 ) -> _PreparedLlmModel:
     model_class = _compile_model(pydantic_code)
     if not model_class:
         raise RuntimeError("Nenhuma classe BaseModel encontrada no código Pydantic.")
-    model_class = _filter_model_for_llm(model_class, pydantic_fields)
+    model_class = _filter_model_for_llm(model_class)
+    field_conditions = extract_field_conditions(model_class)
     model_class, nested_field_map = _flatten_nested_basemodels(model_class)
     if include_justifications:
         model_class = _extend_model_with_justifications(model_class)
+    model_class = _strip_internal_schema_extra(model_class)
     return _PreparedLlmModel(
         model_class=model_class,
         nested_field_map=nested_field_map,
+        field_conditions=field_conditions,
     )
 
 
@@ -1523,8 +1724,6 @@ def init_job(job_id: str, project_id: str, filter_mode: str) -> None:
         "errors": [],
         "started_at": time.time(),
         "eta_seconds": None,
-        "current_batch": 0,
-        "total_batches": 0,
         "error_traceback": None,
         "error_type": None,
         "error_line": None,
@@ -1630,10 +1829,10 @@ def _prune_inactive_conditionals(
     justifications: dict,
     field_conditions: dict,
 ) -> None:
-    for field_name, condition in field_conditions.items():
-        if not evaluate_condition(condition, answers, field_name):
-            answers.pop(field_name, None)
-            justifications.pop(field_name, None)
+    """Tira resposta e justificativa das condicionais que a tela esconde."""
+    for field_name in hidden_conditionals(answers, field_conditions):
+        answers.pop(field_name, None)
+        justifications.pop(field_name, None)
 
 
 def _active_expected_fields(
@@ -1770,7 +1969,20 @@ def _persist_run_progress_throttled(sb, job_id: str, jobs_state: dict) -> None:
     now_ts = time.time()
     if now_ts - jobs_state["last_progress_persist"] >= 2.0:
         _persist_run_progress(sb, job_id, jobs_state)
+        # Conta a tentativa, e não só a que saiu: com o banco fora, cada linha
+        # pagaria uma ida e volta condenada.
         jobs_state["last_progress_persist"] = now_ts
+
+
+def _persist_run_progress_now(sb, job_id: str, jobs_state: dict) -> None:
+    """`_persist_run_progress` sem esperar o throttle, acertando o relógio dele.
+
+    Para a mudança de fase, que não pode esperar 2 s. Sem acertar o relógio, a
+    linha seguinte regravava o mesmo progresso logo depois. A gravação que
+    falha não o acerta: a linha seguinte tenta de novo, pelo throttle.
+    """
+    if _persist_run_progress(sb, job_id, jobs_state):
+        jobs_state["last_progress_persist"] = time.time()
 
 
 class _RowPublisher:
@@ -1812,7 +2024,6 @@ class _RowPublisher:
         self._prepared_model = prepared_model
         self._partial_coverage_threshold = partial_coverage_threshold
         self._run = run
-        self._field_conditions = extract_field_conditions(prepared_model.model_class)
         self._expected_llm_fields = _expected_llm_fields(prepared_model.model_class)
         self._partial_warnings: list[str] = []
         self._dfi_error_samples: dict[str, str] = {}
@@ -1834,7 +2045,7 @@ class _RowPublisher:
                 row,
                 self._prepared_model.model_class,
                 self._prepared_model.nested_field_map,
-                self._field_conditions,
+                self._prepared_model.field_conditions,
                 self._expected_llm_fields,
                 self._partial_coverage_threshold,
             )
@@ -2117,6 +2328,9 @@ def _run_dataframeit_and_publish(
     from dataframeit import dataframeit
 
     jobs_state["phase"] = "processing"
+    # Já aqui, e não só na primeira linha processada: o canário pode levar
+    # minutos, e até ele voltar a linha diria `loading`.
+    _persist_run_progress_now(sb, job_id, jobs_state)
 
     def _call(frame: pd.DataFrame, model, on_row_done=None):
         return dataframeit(
@@ -2230,8 +2444,8 @@ def _run_dataframeit_and_publish(
         # isto só fecha a conta se a biblioteca tiver deixado de chamá-lo em
         # alguma linha.
         jobs_state["progress"] = len(canary_result) + len(result)
-        _persist_run_progress(sb, job_id, jobs_state)
         jobs_state.update(phase="saving", eta_seconds=None)
+        _persist_run_progress_now(sb, job_id, jobs_state)
         _process_and_save_rows(publisher, result)
 
 
@@ -2307,9 +2521,15 @@ def run_llm(
             project["prompt_template"],
         )
         llm_kwargs = project["llm_kwargs"] or {}
-        pydantic_hash = hashlib.sha256(pydantic_code.encode()).hexdigest()[:16]
+        pydantic_hash = _pydantic_code_hash(pydantic_code)
 
-        # Build per-field hash snapshot for staleness detection
+        # Build per-field hash snapshot for staleness detection. Continua vindo
+        # de `pydantic_fields`, e não do código compilado (#747): quem lê o
+        # snapshot (Comparação, `response_answers_current_question`) o compara
+        # com o `hash` gravado nesse JSON, e o código já salvo ainda não
+        # reproduz esse valor em todo campo — as respostas padronizadas de
+        # campo de texto entram no hash e só vão no código a partir do save
+        # seguinte de cada projeto.
         answer_field_hashes = {
             f["name"]: f.get("hash") for f in (project.get("pydantic_fields") or [])
         }
@@ -2340,7 +2560,6 @@ def run_llm(
         include_justifications = bool(llm_kwargs.pop("include_justifications", True))
         prepared_model = _prepare_llm_model(
             pydantic_code,
-            project.get("pydantic_fields") or [],
             include_justifications,
         )
         run_config = _normalize_llm_kwargs(llm_kwargs)
@@ -2378,9 +2597,7 @@ def run_llm(
         outcome = publisher.outcome()
         wake_auto_review_reconciliation_sync()
 
-        sb.table("projects").update({"pydantic_hash": pydantic_hash}).eq(
-            "id", project_id
-        ).execute()
+        _persist_project_pydantic_hash(sb, project_id, pydantic_hash)
 
         _raise_if_publish_failed(outcome)
         _raise_if_run_compromised(

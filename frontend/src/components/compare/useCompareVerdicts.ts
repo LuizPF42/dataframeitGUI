@@ -2,6 +2,8 @@
 
 import { useCallback } from "react";
 import { toast } from "sonner";
+import { withActionTimeout } from "@/lib/action-timeout";
+import { withErrorCode } from "@/lib/server-error";
 import {
   submitVerdict,
   type ResponseSnapshotEntry,
@@ -24,7 +26,6 @@ interface UseCompareVerdictsParams {
   projectId: string;
   currentDoc: CompareDocument | undefined;
   currentFieldName: string;
-  isCurrentFieldDivergent: boolean;
   allDocDivergent: string[];
   localReviews: ReviewsByDoc;
   fieldResponses: FieldResponse[];
@@ -50,23 +51,19 @@ export interface CompareVerdicts {
   handleUnmarkPair: (pairId: string) => Promise<void>;
 }
 
-export const SAVE_TIMEOUT_MS = 15_000;
-const TIMEOUT_MESSAGE =
-  "O salvamento não respondeu. Verifique a conexão e tente novamente.";
-
 /**
  * Resolve a promise de uma server action em "salvou?", exibindo o toast
  * adequado no caminho de erro. Ponto único para os três modos de falha:
  * rejeição da action (fora do try dela, que o `void` do call site
- * descartaria em silêncio) vira log + mensagem genérica; `{ error }`
+ * descartaria em silêncio) vira log + copy de `withErrorCode`; `{ error }`
  * retornado vira toast com a mensagem da própria action; e uma promise que
- * NUNCA settles (fetch dropado num redeploy — issue #430) é resolvida como
- * erro pelo timeout, senão o `await` do chamador ficaria pendurado para
- * sempre com a trava de in-flight presa. Após o timeout, o settle tardio da
- * promise original é ignorado por completo — nenhum efeito pós-save (escrita
- * otimista, toast de sucesso, avanço de campo) roda fora de hora; se o save
- * tardio tiver persistido no servidor, reconfirmar recai no upsert
- * idempotente de `submitVerdict`.
+ * NUNCA settles (fetch dropado num redeploy — issue #430) rejeita pelo prazo
+ * de `withActionTimeout` e cai no mesmo caminho, senão o `await` do chamador ficaria
+ * pendurado para sempre com a trava de in-flight presa. Após o timeout, o
+ * settle tardio da promise original é ignorado por completo — nenhum efeito
+ * pós-save (escrita otimista, toast de sucesso, avanço de campo) roda fora de
+ * hora; se o save tardio tiver persistido no servidor, reconfirmar recai no
+ * upsert idempotente de `submitVerdict`.
  */
 async function actionSucceeded(
   promise: Promise<{ error?: string }>,
@@ -74,30 +71,16 @@ async function actionSucceeded(
   logContext: Record<string, unknown>,
   rejectionMessage: string,
 ): Promise<boolean> {
-  const result = await new Promise<{ error?: string } | void>((resolve) => {
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      resolve({ error: TIMEOUT_MESSAGE });
-    }, SAVE_TIMEOUT_MS);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        // Rejeição tardia: o timeout já reportou o erro; um segundo toast
-        // aqui chegaria fora de contexto.
-        if (timedOut) return;
-        console.error(logLabel, { error, ...logContext });
-        toast.error(rejectionMessage);
-        resolve({ error: "unexpected" });
-      },
-    );
-  });
+  let result: { error?: string } | void;
+  try {
+    result = await withActionTimeout(promise);
+  } catch (error) {
+    console.error(logLabel, { error, ...logContext });
+    toast.error(withErrorCode(error, rejectionMessage));
+    return false;
+  }
   if (result?.error) {
-    if (result.error !== "unexpected") toast.error(result.error);
+    toast.error(result.error);
     return false;
   }
   return true;
@@ -120,12 +103,11 @@ type CompareWriteBlockReason =
   | "read-only"
   | "no-doc"
   | "no-field"
-  | "not-divergent"
   | "origin-mismatch";
 
 /**
  * Resultado do gate de escrita. Discriminado (e não um booleano) porque as
- * cinco razões de recusa levam a mensagens diferentes: colapsá-las num `false`
+ * quatro razões de recusa levam a mensagens diferentes: colapsá-las num `false`
  * era exatamente o que fazia `handleVerdict` retornar sem dizer nada à revisora
  * (#613, "ruídos adjacentes"). O `doc` viaja no ramo `ok` para preservar o
  * estreitamento de tipo que o antigo type guard dava.
@@ -140,8 +122,6 @@ const COMPARE_WRITE_BLOCK_MESSAGE: Record<CompareWriteBlockReason, string> = {
   "read-only": "Modo somente leitura: nenhuma decisão é registrada.",
   "no-doc": "Nenhum parecer selecionado — recarregue a página.",
   "no-field": "Nenhum campo selecionado — recarregue a página.",
-  "not-divergent":
-    "Este campo não está mais divergente e não aceita veredito. Recarregue a página.",
   // Mesma frase da recusa primária no clique (`ComparePage`): as duas camadas
   // são defesa em profundidade da MESMA condição, então compartilham o texto.
   "origin-mismatch": COMPARE_ORIGIN_MISMATCH_MESSAGE,
@@ -157,16 +137,11 @@ function compareWriteGate(
   readOnly: boolean,
   currentDoc: CompareDocument | undefined,
   currentFieldName: string,
-  isCurrentFieldDivergent: boolean,
   origin: VerdictOrigin,
 ): CompareWriteGate {
   if (readOnly) return { ok: false, reason: "read-only" };
   if (currentDoc === undefined) return { ok: false, reason: "no-doc" };
   if (currentFieldName.length === 0) return { ok: false, reason: "no-field" };
-  // Defesa da fronteira de escrita, não ramo de fluxo: com campo, ele é
-  // sempre divergente (ver `useCompareNavigation`), e sem campo `no-field` já
-  // recusou acima. Só dispara se um caminho novo fugir dessa fila (#616).
-  if (!isCurrentFieldDivergent) return { ok: false, reason: "not-divergent" };
   if (
     !verdictOriginMatches(origin, {
       documentId: currentDoc.id,
@@ -212,7 +187,6 @@ export function useCompareVerdicts({
   projectId,
   currentDoc,
   currentFieldName,
-  isCurrentFieldDivergent,
   allDocDivergent,
   localReviews,
   fieldResponses,
@@ -230,7 +204,6 @@ export function useCompareVerdicts({
         readOnly,
         currentDoc,
         currentFieldName,
-        isCurrentFieldDivergent,
         origin,
       );
       if (!gate.ok) {
@@ -298,7 +271,6 @@ export function useCompareVerdicts({
       projectId,
       currentDoc,
       currentFieldName,
-      isCurrentFieldDivergent,
       allDocDivergent,
       localReviews,
       comment,
@@ -323,7 +295,6 @@ export function useCompareVerdicts({
         readOnly,
         currentDoc,
         currentFieldName,
-        isCurrentFieldDivergent,
         origin,
       );
       if (!gate.ok) {
@@ -383,7 +354,6 @@ export function useCompareVerdicts({
       projectId,
       currentDoc,
       currentFieldName,
-      isCurrentFieldDivergent,
       allDocDivergent,
       localReviews,
       comment,

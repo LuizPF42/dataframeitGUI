@@ -7,21 +7,29 @@ import type {
 import {
   normalizeSubfields,
   resolveAllowOther,
+  resolveOptionalText,
+  resolveOptions,
   resolveRequired,
   resolveSubfieldRequired,
   resolveSubfieldRule,
   resolveTarget,
+  stripLikePython,
 } from "@/lib/pydantic-field";
 
 // ---------- Geração de código Pydantic (pure, client-safe) ----------
 
+// O NUL é o único controle que o Python não aceita cru dentro de um literal
+// ("source code string cannot contain null bytes"); os demais, inclusive
+// `\x1c`–`\x1f` e `\x85`, compilam e voltam iguais. Escapar só ele deixa o
+// texto — e o `pydantic_hash` — byte-idêntico para quem não o usa (#525).
 function escapeString(s: string): string {
   return s
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r")
-    .replace(/\t/g, "\\t");
+    .replace(/\t/g, "\\t")
+    .replace(/\0/g, "\\x00");
 }
 
 function subfieldClassName(fieldName: string): string {
@@ -29,11 +37,15 @@ function subfieldClassName(fieldName: string): string {
 }
 
 function baseAnnotation(field: PydanticField): string {
-  if (field.type === "single" && field.options) {
-    return `Literal[${field.options.map((o) => `"${escapeString(o)}"`).join(", ")}]`;
+  // Lista vazia é ausente, como em `snapshotOf`: os dois não podem divergir
+  // sobre o que é "o mesmo campo". (Campo de escolha sem opção não passa na
+  // validação do save.)
+  const options = resolveOptions(field.options);
+  if (field.type === "single" && options) {
+    return `Literal[${options.map((o) => `"${escapeString(o)}"`).join(", ")}]`;
   }
-  if (field.type === "multi" && field.options) {
-    return `list[Literal[${field.options.map((o) => `"${escapeString(o)}"`).join(", ")}]]`;
+  if (field.type === "multi" && options) {
+    return `list[Literal[${options.map((o) => `"${escapeString(o)}"`).join(", ")}]]`;
   }
   if (field.subfields && field.subfields.length > 0) {
     return subfieldClassName(field.name);
@@ -100,17 +112,19 @@ function fieldExtra(field: PydanticField): string {
   }
   if (field.type === "date") {
     extras.push(`"field_type": "date"`);
-    // Date fields carry options as sentinel values (ex: "Não identificável")
-    // rendered alongside the date picker. They must be carried in
-    // json_schema_extra because the annotation itself is `str`, not Literal.
-    if (field.options && field.options.length > 0) {
-      const opts = field.options
-        .map((o) => `"${escapeString(o)}"`)
-        .join(", ");
-      extras.push(`"options": [${opts}]`);
-    }
   }
-  if ((field.type === "single" || field.type === "multi") && field.allow_other) {
+  // Em data (sentinelas como "Não identificável") e em texto (respostas
+  // padronizadas) a anotação é `str`, e não Literal: as opções só chegam ao
+  // código por aqui. Entram no hash do campo, então sem elas o código não
+  // reconstrói o campo (#747). Só a lista não vazia sai, e o texto fica
+  // byte-idêntico para quem não as usa.
+  const extraOptions =
+    field.type === "date" || field.type === "text" ? resolveOptions(field.options) : null;
+  if (extraOptions) {
+    const opts = extraOptions.map((o) => `"${escapeString(o)}"`).join(", ");
+    extras.push(`"options": [${opts}]`);
+  }
+  if ((field.type === "single" || field.type === "multi") && resolveAllowOther(field.allow_other)) {
     extras.push(`"allowOther": True`);
   }
   // A guarda de subcampos fica aqui, e não no resolvedor: quem decide se a chave
@@ -132,8 +146,9 @@ function fieldExtra(field: PydanticField): string {
 // `fieldExtra` só para manter a complexidade dele sob o limiar do fallow.
 function trailingExtras(field: PydanticField): string[] {
   const extras: string[] = [];
-  if (field.help_text?.trim()) {
-    extras.push(`"help_text": "${escapeString(field.help_text.trim())}"`);
+  const helpText = stripLikePython(field.help_text ?? "");
+  if (helpText) {
+    extras.push(`"help_text": "${escapeString(helpText)}"`);
   }
   // `visible_if`, e não `condition`: a biblioteca dataframeit usa `condition`
   // em `json_schema_extra` com outro sentido e recusa o modelo que a traz. Ver
@@ -141,10 +156,9 @@ function trailingExtras(field: PydanticField): string[] {
   if (field.condition) {
     extras.push(`"visible_if": ${conditionToPython(field.condition)}`);
   }
-  if (field.justification_prompt?.trim()) {
-    extras.push(
-      `"justification_prompt": "${escapeString(field.justification_prompt.trim())}"`,
-    );
+  const justificationPrompt = stripLikePython(field.justification_prompt ?? "");
+  if (justificationPrompt) {
+    extras.push(`"justification_prompt": "${escapeString(justificationPrompt)}"`);
   }
   // Por último e só quando existe, pelo mesmo motivo de `required`: o texto do
   // código fica byte-idêntico para campo sem revisão. Sem a chave aqui,
@@ -218,18 +232,16 @@ export function generatePydanticCode(
     if (field.type === "date") {
       desc += ". Formato: DD/MM/AAAA (use XX para partes desconhecidas)";
     }
-    if (
-      field.type === "date" &&
-      field.options &&
-      field.options.length > 0
-    ) {
-      const sentinelList = field.options
+    const sentinels = field.type === "date" ? resolveOptions(field.options) : null;
+    if (sentinels) {
+      const sentinelList = sentinels
         .map((o) => `\\"${escapeString(o)}\\"`)
         .join(", ");
       desc += `. Caso não seja possível informar a data, usar um dos seguintes valores: ${sentinelList}`;
     }
-    if (field.help_text?.trim()) {
-      desc += `. Instrucoes: ${escapeString(field.help_text.trim())}`;
+    const helpText = stripLikePython(field.help_text ?? "");
+    if (helpText) {
+      desc += `. Instrucoes: ${escapeString(helpText)}`;
     }
     const extra = fieldExtra(field);
     // Optional[...] sem default=None continua required no Pydantic v2; o
@@ -570,7 +582,8 @@ export function computeFieldHash(
   questionRevision?: number | null,
 ): string {
   // Lista vazia conta como ausente, como o `if options` do Python.
-  const optionsPart = options && options.length > 0 ? pythonSortedListRepr(options) : "";
+  const resolvedOptions = resolveOptions(options);
+  const optionsPart = resolvedOptions ? pythonSortedListRepr(resolvedOptions) : "";
   const revisionPart =
     questionRevision && questionRevision > 0 ? `|r${questionRevision}` : "";
   const content = `${name}|${type}|${optionsPart}|${description}${revisionPart}`;
@@ -596,7 +609,7 @@ export function helpTextChanged(
   before: Pick<PydanticField, "help_text">,
   after: Pick<PydanticField, "help_text">,
 ): boolean {
-  return (before.help_text || "") !== (after.help_text || "");
+  return resolveOptionalText(before.help_text) !== resolveOptionalText(after.help_text);
 }
 
 export type ChangeType = "major" | "minor" | "patch";
@@ -664,15 +677,15 @@ export function snapshotOf(field: PydanticField): Record<string, unknown> {
     name: field.name,
     type: field.type,
     description: field.description,
-    help_text: field.help_text ?? null,
-    options: field.options ?? null,
+    help_text: resolveOptionalText(field.help_text),
+    options: resolveOptions(field.options),
     target: resolveTarget(field.target),
     required: resolveRequired(field.required),
     subfields: normalizeSubfields(field.subfields),
     subfield_rule: resolveSubfieldRule(field.subfield_rule),
     allow_other: resolveAllowOther(field.allow_other),
     condition: field.condition ?? null,
-    justification_prompt: field.justification_prompt ?? null,
+    justification_prompt: resolveOptionalText(field.justification_prompt),
     question_revision: field.question_revision ?? null,
   };
 }
@@ -818,15 +831,15 @@ export function diffFields(
     }
     if (helpTextChanged(old, f)) {
       diffs.push("instruções");
-      before.help_text = old.help_text || null;
-      after.help_text = f.help_text || null;
+      before.help_text = resolveOptionalText(old.help_text);
+      after.help_text = resolveOptionalText(f.help_text);
     }
-    const oldOpts = JSON.stringify(old.options ?? null);
-    const newOpts = JSON.stringify(f.options ?? null);
-    if (oldOpts !== newOpts) {
+    const oldOpts = resolveOptions(old.options);
+    const newOpts = resolveOptions(f.options);
+    if (JSON.stringify(oldOpts) !== JSON.stringify(newOpts)) {
       diffs.push(f.type === "text" ? "respostas padronizadas" : "opções");
-      before.options = old.options;
-      after.options = f.options;
+      before.options = oldOpts;
+      after.options = newOpts;
     }
     if (old.type !== f.type) {
       diffs.push("tipo");
@@ -869,10 +882,12 @@ export function diffFields(
       before.condition = old.condition ?? null;
       after.condition = f.condition ?? null;
     }
-    if ((old.justification_prompt || "") !== (f.justification_prompt || "")) {
+    const oldPrompt = resolveOptionalText(old.justification_prompt);
+    const newPrompt = resolveOptionalText(f.justification_prompt);
+    if (oldPrompt !== newPrompt) {
       diffs.push("prompt de justificativa");
-      before.justification_prompt = old.justification_prompt || null;
-      after.justification_prompt = f.justification_prompt || null;
+      before.justification_prompt = oldPrompt;
+      after.justification_prompt = newPrompt;
     }
     // Registrado porque entra no hash: o backfill e a invariante de
     // `answer_field_hashes` reconstroem o hash de cada versão a partir de
@@ -932,11 +947,42 @@ export function inheritQuestionRevisions(
   );
 }
 
+// Teto do código Pydantic, o mesmo `_MAX_CODE_LENGTH` de
+// `backend/services/pydantic_compiler.py`: acima dele o backend recusa o
+// código, e o projeto salvo deixaria de compilar (LLM, recuperação de campos).
+export const MAX_PYDANTIC_CODE_LENGTH = 64 * 1024;
+
+// O backend mede com o `len()` do Python, que conta code points; `.length`
+// conta unidades UTF-16 e daria duas por emoji.
+export function pydanticCodeLength(code: string): number {
+  return Array.from(code).length;
+}
+
+// Mensagem de recusa quando o código passa do teto, ou `null`. Um schema que
+// já estava acima dele (gravado antes desta checagem) ainda aceita o save que
+// o encurta: recusar deixaria o coordenador sem caminho de volta pelo
+// `EditFieldDialog`, que salva um campo por vez.
+function pydanticCodeSizeError(code: string, previousCode: () => string): string | null {
+  const length = pydanticCodeLength(code);
+  if (length <= MAX_PYDANTIC_CODE_LENGTH) return null;
+  if (length < pydanticCodeLength(previousCode())) return null;
+  const format = (n: number) => n.toLocaleString("pt-BR");
+  return (
+    `O schema ficou grande demais para salvar: o código gerado tem ${format(length)} caracteres ` +
+    `e o limite é ${format(MAX_PYDANTIC_CODE_LENGTH)}. Encurte descrições, instruções ou opções.`
+  );
+}
+
 export interface SchemaPersistencePlan {
   changeType: ChangeType | null;
   bumped: { major: number; minor: number; patch: number };
   logEntries: SchemaLogEntry[];
   code: string;
+  /**
+   * Preenchido quando o código passa do teto do backend: quem persiste recusa
+   * o save com esta mensagem.
+   */
+  codeSizeError: string | null;
   hash: string;
   fieldsWithHash: PydanticField[];
 }
@@ -964,5 +1010,6 @@ export function planSchemaPersistence(
     ...f,
     hash: fieldHashOf(f),
   }));
-  return { changeType, bumped, logEntries, code, hash, fieldsWithHash };
+  const codeSizeError = pydanticCodeSizeError(code, () => generatePydanticCode(oldFields));
+  return { changeType, bumped, logEntries, code, codeSizeError, hash, fieldsWithHash };
 }

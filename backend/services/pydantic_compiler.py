@@ -135,20 +135,34 @@ def _normalize_optional_str(raw) -> str | None:
     return (raw.strip() if isinstance(raw, str) else None) or None
 
 
+def _parse_extra_options(field_name: str, raw: object) -> list[str] | None:
+    """Valida as `options` de `json_schema_extra`; lista vazia é ausente.
+
+    O gerador só emite lista de strings. Converter com `str()` o que vem de
+    código escrito à mão (`[1, None]` virava `["1", "None"]`) reconstruía um
+    campo com opções que ninguém escreveu, e com outro hash.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or not all(
+        isinstance(option, str) for option in raw
+    ):
+        raise ValueError(f'Campo "{field_name}": "options" deve ser lista de strings.')
+    return list(raw) or None
+
+
 def _resolve_field_type_and_options(
-    field_type: str, options: list[str] | None, extra: dict
+    field_name: str, field_type: str, options: list[str] | None, extra: dict
 ) -> tuple[str, list[str] | None]:
-    """Aplica override explícito de tipo e sentinelas de opções de campo date."""
+    """Aplica override explícito de tipo e as opções que viajam no extra."""
     # Allow json_schema_extra to override the inferred field type (e.g. date)
     explicit_type = extra.get("field_type")
     if explicit_type:
         field_type = explicit_type
-    # Date fields carry options as sentinels in json_schema_extra because the
-    # annotation itself is `str`, not Literal.
-    if field_type == "date":
-        raw_opts = extra.get("options")
-        if isinstance(raw_opts, (list, tuple)) and raw_opts:
-            options = [str(o) for o in raw_opts]
+    # Em data (sentinelas) e em texto (respostas padronizadas) a anotação é
+    # `str`, e não Literal: as opções vêm de json_schema_extra.
+    if field_type in ("date", "text"):
+        options = _parse_extra_options(field_name, extra.get("options")) or options
     return field_type, options
 
 
@@ -255,6 +269,12 @@ def _parse_question_revision(field_name: str, raw: object) -> int | None:
     return raw
 
 
+def field_target(extra: dict) -> str:
+    """`target` do campo, lido do `json_schema_extra` já normalizado
+    (`extract_json_schema_extra`); ausente é `"all"`."""
+    return extra.get("target", "all")
+
+
 def _build_field_dict(
     field_name: str, field_info, *, generate_missing_ids: bool = False
 ) -> dict:
@@ -262,12 +282,12 @@ def _build_field_dict(
     # Desembrulhado uma vez aqui: o `Optional` de campo condicional não carrega
     # nada (obrigatoriedade e visibilidade vêm do `json_schema_extra`), e cada
     # leitor da anotação abaixo teria de lembrar de tirá-lo (#525).
-    annotation = _unwrap_optional(field_info.annotation)
+    annotation = unwrap_optional(field_info.annotation)
     parsed_type, parsed_options = _parse_annotation(annotation)
     extra = extract_json_schema_extra(field_info)
 
     field_type, options = _resolve_field_type_and_options(
-        parsed_type, parsed_options, extra
+        field_name, parsed_type, parsed_options, extra
     )
     description = field_info.description or field_name
     help_text = _normalize_optional_str(extra.get("help_text"))
@@ -281,7 +301,7 @@ def _build_field_dict(
         field_type=field_type,
         options=options,
         description=description,
-        target=extra.get("target", "all"),
+        target=field_target(extra),
         help_text=help_text,
         required=bool(extra.get("required", True)),
         allow_other=bool(extra.get("allowOther", False)),
@@ -790,12 +810,13 @@ def _safe_literal(node: ast.AST):
         raise SchemaError("Valor não literal no schema") from e
 
 
-def _unwrap_optional(annotation: type) -> type:
+def unwrap_optional(annotation: type) -> type:
     """`Optional[X]` -> `X`; qualquer outra anotação volta como está.
 
     Campo com condição de visibilidade sai do gerador como `Optional[...]`
     (`fieldAnnotation` em schema-utils.ts), inclusive o composto
-    `Optional[_<nome>_fields]`.
+    `Optional[_<nome>_fields]`. Usado também pelo achatamento do composto antes
+    do LLM (`_flatten_nested_basemodels` em llm_runner.py).
     """
     if get_origin(annotation) is typing.Union:
         non_none = [a for a in get_args(annotation) if a is not type(None)]

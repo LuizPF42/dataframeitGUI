@@ -1,10 +1,5 @@
 import type { RoundStrategy, Round } from "./types";
-
-export interface SchemaVersion {
-  major: number;
-  minor: number;
-  patch: number;
-}
+import { formatVersion, storedVersion, type SchemaVersion } from "./compare-version";
 
 export interface RoundContext {
   strategy: RoundStrategy;
@@ -21,29 +16,20 @@ export interface ResponseRoundFields {
   is_partial?: boolean | null;
 }
 
-export function versionLabel(v: SchemaVersion): string {
-  return `${v.major}.${v.minor}.${v.patch}`;
-}
-
 export function versionEquals(a: SchemaVersion, b: SchemaVersion): boolean {
   return a.major === b.major && a.minor === b.minor && a.patch === b.patch;
 }
 
-export function responseRoundLabel(
-  ctx: RoundContext,
-  response: ResponseRoundFields | null | undefined,
-  roundsById: Map<string, Round>,
-): string | null {
-  if (!response) return null;
-  if (ctx.strategy === "manual") {
-    if (!response.round_id) return null;
-    return roundsById.get(response.round_id)?.label ?? null;
-  }
-  const m = response.schema_version_major;
-  const n = response.schema_version_minor;
-  const p = response.schema_version_patch;
-  if (m == null || n == null || p == null) return null;
-  return `${m}.${n}.${p}`;
+/**
+ * Rotulo de uma rodada explicita (`round_id`) para exibicao: null vira
+ * "Sem rodada" e id ausente de `roundsById` vira "Rodada removida".
+ */
+export function roundLabel(
+  roundId: string | null | undefined,
+  roundsById: ReadonlyMap<string, Pick<Round, "label">>,
+): string {
+  if (!roundId) return "Sem rodada";
+  return roundsById.get(roundId)?.label ?? "Rodada removida";
 }
 
 export type DocRoundStatus =
@@ -75,22 +61,20 @@ export function classifyDocStatus(
       return { kind: "current_done" };
     }
     // Guardrail: com FK responses.round_id ON DELETE SET NULL, round_id de uma
-    // rodada removida vira null (cai no branch "Sem rodada") — o lookup falhar
-    // com label "Rodada removida" so deve ocorrer em estado intermediario.
-    const label = response.round_id
-      ? roundsById.get(response.round_id)?.label ?? "Rodada removida"
-      : "Sem rodada";
-    return { kind: "previous", label };
+    // rodada removida vira null (cai em "Sem rodada") — o lookup falhar com
+    // "Rodada removida" so deve ocorrer em estado intermediario.
+    return { kind: "previous", label: roundLabel(response.round_id, roundsById) };
   }
 
   // schema_version
-  const m = response.schema_version_major;
-  const n = response.schema_version_minor;
-  const p = response.schema_version_patch;
-  if (m == null || n == null || p == null) return { kind: "current_pending" };
-  const v: SchemaVersion = { major: m, minor: n, patch: p };
+  const v = storedVersion(
+    response.schema_version_major,
+    response.schema_version_minor,
+    response.schema_version_patch,
+  );
+  if (!v) return { kind: "current_pending" };
   if (versionEquals(v, ctx.currentVersion)) return { kind: "current_done" };
-  return { kind: "previous", label: versionLabel(v) };
+  return { kind: "previous", label: formatVersion(v) };
 }
 
 /** Valor do `?round=` que representa "rodada atual" — equivalente a omitir o param. */
@@ -118,18 +102,10 @@ export function getCurrentRoundDescriptor(
     const label = roundsById.get(ctx.currentRoundId)?.label ?? "Sem rodada atual";
     return { key: ctx.currentRoundId, label };
   }
-  const v = versionLabel(ctx.currentVersion);
+  // "Sem rodada atual" acima é a ausência de rodada MANUAL, que não tem
+  // versão; aqui a rodada é a versão do projeto, que sempre existe.
+  const v = formatVersion(ctx.currentVersion);
   return { key: v, label: v };
-}
-
-/**
- * Compara duas versões "X.Y.Z" numericamente (não lexicograficamente).
- * "0.10.0" deve vir DEPOIS de "0.9.0", mas o sort default trataria como antes.
- */
-export function compareVersionLabels(a: string, b: string): number {
-  const [am = 0, an = 0, ap = 0] = a.split(".").map((n) => Number(n) || 0);
-  const [bm = 0, bn = 0, bp = 0] = b.split(".").map((n) => Number(n) || 0);
-  return am - bm || an - bn || ap - bp;
 }
 
 /**

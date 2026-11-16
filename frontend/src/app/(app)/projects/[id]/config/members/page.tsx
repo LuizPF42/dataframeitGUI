@@ -3,8 +3,10 @@ import { readIdentityAccessRows } from "@/lib/identity/access-rows";
 import { getProjectAccessContext } from "@/lib/auth";
 import { requirePageAuthUser } from "@/lib/page-auth";
 import { scanComparisonBacklog } from "@/lib/auto-comparison";
+import { fetchPendingAutoReviews } from "@/lib/auto-review-pending";
 import { MemberList } from "@/components/members/MemberList";
 import { AddMemberDialog } from "@/components/members/AddMemberDialog";
+import { PendingAutoReviewsBanner } from "@/components/members/PendingAutoReviewsBanner";
 import type { MemberEmailLink, ProjectMember, Profile } from "@/lib/types";
 import { requireResolvedProjectAccess } from "@/lib/project-access";
 import {
@@ -17,6 +19,7 @@ import {
   type MemberEmailLinkView,
 } from "@/components/members/member-list-utils";
 import { notFound } from "next/navigation";
+import { Suspense } from "react";
 
 type ServerClient = Awaited<ReturnType<typeof createSupabaseServer>>;
 type MemberQueryRow = ProjectMember & { profiles: Profile };
@@ -109,6 +112,8 @@ export default async function MembersPage({
   );
   if (!access.isCoordinator) notFound();
 
+  // Fora do Promise.all de propósito: ver PendingAutoReviewsBanner.
+  const pendingAutoReviews = fetchPendingAutoReviews(supabase, id);
   const [membersResult, reviewsResult, linksResult, projectResult] =
     await Promise.all([
       supabase
@@ -155,7 +160,7 @@ export default async function MembersPage({
   );
 
   return (
-    <div className="mx-auto max-w-2xl space-y-4 p-6">
+    <div className="mx-auto max-w-4xl space-y-4 p-6">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Membros</h2>
         <AddMemberDialog projectId={id} />
@@ -174,6 +179,13 @@ export default async function MembersPage({
           abaixo para alocá-los.
         </div>
       ) : null}
+      <Suspense fallback={null}>
+        <PendingAutoReviewsBanner
+          projectId={id}
+          pending={pendingAutoReviews}
+          members={typedMembers}
+        />
+      </Suspense>
       <MemberList
         projectId={id}
         members={typedMembers}

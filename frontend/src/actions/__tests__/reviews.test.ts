@@ -1,47 +1,42 @@
 import { beforeAll, describe, it, expect, vi, beforeEach } from "vitest";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
 
-// Mock minimo do supabase: captura insert/delete em project_comments para
-// validar o comportamento do submitVerdict com veredito "ambiguo" sem subir
-// Postgres. Builder chainable e thenable. Os dados retornados por tabela sao
-// controlados por `tableData` (setado por teste).
-type OpCall = { op: string; table: string; payload?: Record<string, unknown> };
-let opCalls: OpCall[];
-let tableData: Record<string, unknown>;
+import {
+  makeFilterAwareSupabaseMock,
+  type QueryError,
+  type WriteCall,
+} from "@/test-utils/supabase-mock";
+
+// Mock filter-aware: aplica os filtros das queries às linhas de `tableData`,
+// então cada linha declara as colunas que submitVerdict filtra (projeto,
+// documento, campo, kind, verdict). Uma linha de outra célula precisa ser
+// descartada como o Postgres descartaria.
+let opCalls: WriteCall[];
+let tableData: Record<string, unknown[]>;
+let queryErrors: Record<string, QueryError | null>;
 
 function makeClient() {
-  return {
-    from: (table: string) => {
-      const builder: Record<string, unknown> = {};
-      for (const m of ["select", "eq", "is", "in", "neq", "not", "order", "limit"]) {
-        builder[m] = () => builder;
-      }
-      builder.upsert = (payload: Record<string, unknown>) => {
-        opCalls.push({ op: "upsert", table, payload });
-        return builder;
-      };
-      builder.insert = (payload: Record<string, unknown>) => {
-        opCalls.push({ op: "insert", table, payload });
-        return builder;
-      };
-      builder.delete = () => {
-        opCalls.push({ op: "delete", table });
-        return builder;
-      };
-      builder.update = (payload: Record<string, unknown>) => {
-        opCalls.push({ op: "update", table, payload });
-        return builder;
-      };
-      builder.maybeSingle = async () => ({
-        data: tableData[table] ?? null,
-        error: null,
-      });
-      builder.single = async () => ({ data: tableData[table] ?? null, error: null });
-      builder.then = (resolve: (v: unknown) => unknown) =>
-        resolve({ data: tableData[table] ?? null, error: null });
-      return builder;
-    },
-  };
+  return makeFilterAwareSupabaseMock({
+    tableData,
+    writeCalls: opCalls,
+    queryErrors,
+  });
 }
+
+const payloadOf = (call: WriteCall | undefined) =>
+  call?.payload as Record<string, unknown> | undefined;
+
+// Linhas da célula (p1, doc1, q1) sob teste.
+const cell = { project_id: "p1", document_id: "doc1", field_name: "q1" };
+const ambiguityComment = (overrides: Record<string, unknown> = {}) => ({
+  id: "pc1", ...cell, kind: "ambiguity", ...overrides,
+});
+const ambiguousReview = (overrides: Record<string, unknown> = {}) => ({
+  id: "r2", ...cell, verdict: "ambiguo", field_hash: "aaaaaaaaaaaa", ...overrides,
+});
+const projectRow = (pydanticFields: unknown[], id = "p1") => ({
+  id, pydantic_fields: pydanticFields,
+});
 
 vi.mock("next/cache", () => ({ revalidatePath: () => {} }));
 vi.mock("@/lib/auth", () => ({
@@ -67,6 +62,7 @@ vi.mock("@/lib/compare-sync", () => ({
 beforeEach(() => {
   opCalls = [];
   tableData = {};
+  queryErrors = {};
   mockSyncCompareAssignment.mockReset();
   mockSyncCompareAssignment.mockImplementation(async () => {});
 });
@@ -81,12 +77,12 @@ beforeAll(async () => {
 }, 30_000);
 
 describe("submitVerdict — veredito ambiguo vira comentario automatico", () => {
-  const PROJECT = {
-    pydantic_fields: [{ id: "00000000-0000-4000-8000-000000000001", name: "q1", type: "text", options: null, description: "", hash: "aaaaaaaaaaaa" }],
-  };
+  const PROJECT = projectRow([
+    { id: "00000000-0000-4000-8000-000000000001", name: "q1", type: "text", options: null, description: "", hash: "aaaaaaaaaaaa" },
+  ]);
 
   it("grava o review no membro canônico e mantém a autoria na conta autenticada", async () => {
-    tableData = { project_comments: null };
+    tableData = { project_comments: [] };
     const submitVerdict = await loadSubmit();
 
     await submitVerdict({
@@ -97,18 +93,17 @@ describe("submitVerdict — veredito ambiguo vira comentario automatico", () => 
     });
 
     expect(
-      opCalls.find((call) => call.op === "upsert" && call.table === "reviews")
-        ?.payload,
+      payloadOf(opCalls.find((call) => call.op === "upsert" && call.table === "reviews")),
     ).toMatchObject({ reviewer_id: "canonical-reviewer" });
     expect(
-      opCalls.find(
+      payloadOf(opCalls.find(
         (call) => call.op === "insert" && call.table === "project_comments",
-      )?.payload,
+      )),
     ).toMatchObject({ author_id: "account-alias" });
   });
 
   it("ambiguo sem comentario existente → insere project_comments kind='ambiguity'", async () => {
-    tableData = { project_comments: null };
+    tableData = { project_comments: [] };
     const submitVerdict = await loadSubmit();
     await submitVerdict({
       projectId: "p1",
@@ -120,7 +115,7 @@ describe("submitVerdict — veredito ambiguo vira comentario automatico", () => 
     const insert = opCalls.find(
       (c) => c.op === "insert" && c.table === "project_comments",
     );
-    expect(insert?.payload).toMatchObject({
+    expect(payloadOf(insert)).toMatchObject({
       project_id: "p1",
       document_id: "doc1",
       field_name: "q1",
@@ -130,7 +125,7 @@ describe("submitVerdict — veredito ambiguo vira comentario automatico", () => 
   });
 
   it("ambiguo com comentario do revisor → preserva o texto trimado no corpo", async () => {
-    tableData = { project_comments: null };
+    tableData = { project_comments: [] };
     const submitVerdict = await loadSubmit();
     await submitVerdict({
       projectId: "p1",
@@ -143,13 +138,13 @@ describe("submitVerdict — veredito ambiguo vira comentario automatico", () => 
     const insert = opCalls.find(
       (c) => c.op === "insert" && c.table === "project_comments",
     );
-    expect(insert?.payload?.body).toBe(
+    expect(payloadOf(insert)?.body).toBe(
       "Campo marcado como ambíguo na revisão (aba Comparar): depende do contexto",
     );
   });
 
   it("ambiguo com comentario ja existente → nao insere de novo (idempotente)", async () => {
-    tableData = { project_comments: { id: "pc1" } };
+    tableData = { project_comments: [ambiguityComment()] };
     const submitVerdict = await loadSubmit();
     await submitVerdict({
       projectId: "p1",
@@ -161,9 +156,31 @@ describe("submitVerdict — veredito ambiguo vira comentario automatico", () => 
     expect(opCalls.some((c) => c.op === "insert")).toBe(false);
   });
 
+  // Cada filtro da busca do comentário existente descarta o de outra célula:
+  // sem ele, o ambíguo desta célula ficaria sem comentário.
+  it.each([
+    ["de outro projeto", { project_id: "p2" }],
+    ["de outro documento", { document_id: "doc2" }],
+    ["de outro campo", { field_name: "q2" }],
+    ["que não é de ambiguidade", { kind: "note" }],
+  ])("ambiguo com comentario %s → insere o desta célula", async (_, overrides) => {
+    tableData = { project_comments: [ambiguityComment(overrides)] };
+    const submitVerdict = await loadSubmit();
+    await submitVerdict({
+      projectId: "p1",
+      documentId: "doc1",
+      fieldName: "q1",
+      verdict: "ambiguo",
+    });
+
+    expect(
+      opCalls.filter((c) => c.op === "insert" && c.table === "project_comments"),
+    ).toHaveLength(1);
+  });
+
   it("verdict nao-ambiguo e nenhum outro revisor ambiguo → deleta o comentario orfao", async () => {
     // reviews query (stillAmbiguous) retorna vazio
-    tableData = { reviews: [], projects: PROJECT };
+    tableData = { reviews: [], projects: [PROJECT] };
     const submitVerdict = await loadSubmit();
     await submitVerdict({
       projectId: "p1",
@@ -181,9 +198,62 @@ describe("submitVerdict — veredito ambiguo vira comentario automatico", () => 
   // sobre outra versão da pergunta não é mais gabarito de ninguém.
   it("verdict nao-ambiguo e o outro ambiguo e de outra versao da pergunta → deleta", async () => {
     tableData = {
-      reviews: [{ id: "r2", field_name: "q1", verdict: "ambiguo", field_hash: "ffffffffffff" }],
-      projects: PROJECT,
+      reviews: [ambiguousReview({ field_hash: "ffffffffffff" })],
+      projects: [PROJECT],
     };
+    const submitVerdict = await loadSubmit();
+    await submitVerdict({
+      projectId: "p1",
+      documentId: "doc1",
+      fieldName: "q1",
+      verdict: "concordo",
+    });
+
+    expect(
+      opCalls.some((c) => c.op === "delete" && c.table === "project_comments"),
+    ).toBe(true);
+  });
+
+  it("falha na leitura de \"ainda ambíguo\" não apaga o comentário às cegas", async () => {
+    // Leitura falha sem linhas, como no PostgREST: o código não tem como
+    // saber se outro revisor ainda marca o campo como ambíguo.
+    tableData = {
+      reviews: [],
+      projects: [PROJECT],
+      project_comments: [ambiguityComment()],
+    };
+    queryErrors = { "reviews:select": { message: "timeout", code: "57014" } };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const submitVerdict = await loadSubmit();
+    const result = await submitVerdict({
+      projectId: "p1",
+      documentId: "doc1",
+      fieldName: "q1",
+      verdict: "concordo",
+    });
+
+    expect(
+      opCalls.some((c) => c.op === "delete" && c.table === "project_comments"),
+    ).toBe(false);
+    // O texto do Postgres vai ao log com o code; o toast recebe a copy (#502).
+    expect(result).toEqual({
+      error: copyWithRef("Não foi possível salvar o veredito. Tente novamente."),
+    });
+    expect(errorSpy).toHaveBeenCalledWith(
+      loggedLine("[reviews] veredito falhou", { code: "57014", message: "timeout" }),
+    );
+    errorSpy.mockRestore();
+  });
+
+  // Cada filtro da busca de "ainda ambíguo" descarta o review que não sustenta
+  // a pendência desta célula: sem ele, o comentário ficaria órfão.
+  it.each([
+    ["de outro projeto", { project_id: "p2" }],
+    ["de outro documento", { document_id: "doc2" }],
+    ["de outro campo", { field_name: "q2" }],
+    ["que não é ambíguo", { verdict: "concordo" }],
+  ])("verdict nao-ambiguo e o outro review e %s → deleta", async (_, overrides) => {
+    tableData = { reviews: [ambiguousReview(overrides)], projects: [PROJECT] };
     const submitVerdict = await loadSubmit();
     await submitVerdict({
       projectId: "p1",
@@ -199,8 +269,8 @@ describe("submitVerdict — veredito ambiguo vira comentario automatico", () => 
 
   it("verdict nao-ambiguo mas outro revisor ainda marca ambiguo → nao deleta", async () => {
     tableData = {
-      reviews: [{ id: "r2", field_name: "q1", verdict: "ambiguo", field_hash: "aaaaaaaaaaaa" }],
-      projects: PROJECT,
+      reviews: [ambiguousReview()],
+      projects: [PROJECT],
     };
     const submitVerdict = await loadSubmit();
     await submitVerdict({
@@ -229,11 +299,29 @@ describe("submitVerdict: voto copiado fora das opções atuais", () => {
     ["opção que saiu do formulário", { ...SINGLE }, "Talvez"],
     ["\"Outro: x\" depois de desligar allow_other", { ...SINGLE, allow_other: false }, "Outro: x"],
   ])("%s é recusado sem gravar", async (_label, field, verdict) => {
-    tableData = { projects: { pydantic_fields: [field] } };
+    tableData = { projects: [projectRow([field])] };
     const submitVerdict = await loadSubmit();
 
     const result = await submitVerdict({
       projectId: "p1", documentId: "doc1", fieldName: "q2", verdict, chosenResponseId: "r1",
+    });
+
+    expect(result.error).toMatch(/não está mais no formulário/);
+    expect(opCalls.filter((c) => c.op === "upsert")).toHaveLength(0);
+  });
+
+  // O domínio vem do schema deste projeto, não do primeiro que a query achar.
+  it("schema de outro projeto não amplia o domínio", async () => {
+    tableData = {
+      projects: [
+        projectRow([{ ...SINGLE, options: ["Sim", "Não", "Talvez"] }], "p2"),
+        projectRow([SINGLE]),
+      ],
+    };
+    const submitVerdict = await loadSubmit();
+
+    const result = await submitVerdict({
+      projectId: "p1", documentId: "doc1", fieldName: "q2", verdict: "Talvez", chosenResponseId: "r1",
     });
 
     expect(result.error).toMatch(/não está mais no formulário/);
@@ -246,7 +334,7 @@ describe("submitVerdict: voto copiado fora das opções atuais", () => {
     // O digitado ("Nenhuma correta") com o hash atual vale fora das opções.
     ["veredito digitado fora das opções", { ...SINGLE }, "Não houve", undefined],
   ])("%s grava", async (_label, field, verdict, chosenResponseId) => {
-    tableData = { projects: { pydantic_fields: [field] } };
+    tableData = { projects: [projectRow([field])] };
     const submitVerdict = await loadSubmit();
 
     const result = await submitVerdict({
@@ -266,7 +354,7 @@ describe("submitVerdict: falha do sync pós-commit", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     mockSyncCompareAssignment.mockRejectedValueOnce(new Error("sync boom"));
     tableData = {
-      projects: { pydantic_fields: [{ id: "00000000-0000-4000-8000-000000000001", name: "q1", type: "text", options: null, description: "", hash: "aaaaaaaaaaaa" }] },
+      projects: [projectRow([{ id: "00000000-0000-4000-8000-000000000001", name: "q1", type: "text", options: null, description: "", hash: "aaaaaaaaaaaa" }])],
       reviews: [],
     };
     const submitVerdict = await loadSubmit();

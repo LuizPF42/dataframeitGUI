@@ -199,17 +199,19 @@ describe("validateGUIFields — unicidade de nome no save", () => {
   });
 });
 
-describe("validateGUIFields — nomes dunder", () => {
+describe("validateGUIFields — nomes que o código gerado não compila", () => {
+  const PRIVATE = 'não pode começar com "_" (o Pydantic não aceita)';
+
   it("rejeita nome de campo que começa e termina com __", () => {
     const fields = [
       baseField({ name: "__class__", type: "text", description: "x" }),
     ];
     expect(validateGUIFields(fields)).toContain(
-      'Campo 1 ("__class__"): nome não pode começar e terminar com "__" (reservado pelo Python)',
+      `Campo 1 ("__class__"): nome ${PRIVATE}`,
     );
   });
 
-  it("aceita nome com __ interno (não é dunder estrito)", () => {
+  it("aceita nome com __ interno", () => {
     const fields = [
       baseField({ name: "my__field", type: "text", description: "x" }),
     ];
@@ -226,22 +228,136 @@ describe("validateGUIFields — nomes dunder", () => {
       }),
     ];
     expect(validateGUIFields(fields)).toContain(
-      'Campo 1 ("doc"): subcampo "__init__" não pode começar e terminar com "__" (reservado pelo Python)',
+      `Campo 1 ("doc"): subcampo "__init__" ${PRIVATE}`,
     );
   });
 
-  // Antes a regex /^__.*__$/ exigia ≥4 chars e NÃO casava "__"/"___", que o
-  // backend (startswith E endswith "__") rejeita — divergência que gerava
-  // código recusado no run. isStrictDunder espelha o backend.
-  it.each(["__", "___", "____"])(
-    "rejeita nome só de underscores %s (alinhado ao backend)",
+  // "__"/"___" já eram recusados como dunder estrito; com a regra do `_`
+  // inicial, também `_x` e `_` (o Pydantic recusa todo nome privado).
+  it.each(["_", "__", "___", "_x", "_x_"])(
+    "rejeita nome com _ inicial %s (o Pydantic recusa campo privado)",
     (name) => {
       const fields = [baseField({ name, type: "text", description: "x" })];
       expect(validateGUIFields(fields)).toContain(
-        `Campo 1 ("${name}"): nome não pode começar e terminar com "__" (reservado pelo Python)`,
+        `Campo 1 ("${name}"): nome ${PRIVATE}`,
       );
     },
   );
+
+  it.each(["class", "def", "if", "lambda", "async", "yield"])(
+    "rejeita palavra reservada do Python %s",
+    (name) => {
+      const fields = [baseField({ name, type: "text", description: "x" })];
+      expect(validateGUIFields(fields)).toContain(
+        `Campo 1 ("${name}"): nome é palavra reservada do Python`,
+      );
+    },
+  );
+
+  it.each(["model_config", "model_dump", "model_validate"])(
+    "rejeita nome reservado pelo Pydantic %s",
+    (name) => {
+      const fields = [baseField({ name, type: "text", description: "x" })];
+      expect(validateGUIFields(fields)).toContain(
+        `Campo 1 ("${name}"): nome é reservado pelo Pydantic`,
+      );
+    },
+  );
+
+  it("rejeita palavra reservada como chave de subcampo", () => {
+    const fields = [
+      baseField({
+        name: "doc",
+        type: "text",
+        description: "doc",
+        subfields: [{ key: "from", label: "De", required: true }],
+      }),
+    ];
+    expect(validateGUIFields(fields)).toContain(
+      'Campo 1 ("doc"): subcampo "from" é palavra reservada do Python',
+    );
+  });
+
+  // Compilam: palavra-chave leve do Python e atributo do BaseModel que o
+  // Pydantic só avisa que sombreia.
+  it.each(["match", "case", "type", "json", "model_fields", "str"])(
+    "aceita %s, que o compilador aceita",
+    (name) => {
+      const fields = [baseField({ name, type: "text", description: "x" })];
+      expect(validateGUIFields(fields)).toEqual([]);
+    },
+  );
+});
+
+// `Literal["x", "x"]` vira `Literal["x"]` no Python: a opção repetida sumia na
+// recuperação (#525). Repetida depois de aparada também conta, porque na tela
+// "x" e "x " são a mesma opção.
+describe("validateGUIFields — opções repetidas", () => {
+  it.each(["single", "multi", "date"] as const)(
+    "rejeita opção repetida em campo %s",
+    (type) => {
+      const fields = [baseField({ name: "q", type, options: ["Sim", "Não", "Sim"] })];
+      expect(validateGUIFields(fields)).toEqual([
+        'Campo 1 ("q"): opção "Sim" duplicada',
+      ]);
+    },
+  );
+
+  it("rejeita opção repetida depois de aparada, como o strip() do Python", () => {
+    const fields = [
+      baseField({ name: "q", options: ["Sim", " Sim\x1f", "Não"] }),
+    ];
+    expect(validateGUIFields(fields)).toEqual([
+      'Campo 1 ("q"): opção "Sim" duplicada',
+    ]);
+  });
+
+  it("aceita opções que só diferem por dentro ou na caixa", () => {
+    const fields = [
+      baseField({ name: "q", options: ["Sim", "sim", "S im", "\ufeffSim"] }),
+    ];
+    expect(validateGUIFields(fields)).toEqual([]);
+  });
+});
+
+// O gerador e `compile_pydantic` aparam `help_text` e `justification_prompt`:
+// gravado com branco na borda, o texto voltava diferente da recuperação (#525).
+describe("validateGUIFields — instruções e prompt de justificativa", () => {
+  it.each([
+    ["help_text", "das instruções"],
+    ["justification_prompt", "do prompt de justificativa"],
+  ] as const)("rejeita %s com branco na borda", (key, of) => {
+    for (const text of [" Leia", "Leia\n", "Leia\x1f", "\x85Leia"]) {
+      const fields = [baseField({ name: "q", type: "text", [key]: text })];
+      expect(validateGUIFields(fields), JSON.stringify(text)).toEqual([
+        `Campo 1 ("q"): espaço em branco no início ou no fim ${of}`,
+      ]);
+    }
+  });
+
+  it.each([
+    ["help_text", "das instruções"],
+    ["justification_prompt", "do prompt de justificativa"],
+  ] as const)("rejeita %s em branco", (key, of) => {
+    for (const text of ["", "  ", "\x1f"]) {
+      const fields = [baseField({ name: "q", type: "text", [key]: text })];
+      expect(validateGUIFields(fields), JSON.stringify(text)).toEqual([
+        `Campo 1 ("q"): texto ${of} está em branco`,
+      ]);
+    }
+  });
+
+  it("aceita texto aparado, com \ufeff na borda (o Python não o apara)", () => {
+    const fields = [
+      baseField({
+        name: "q",
+        type: "text",
+        help_text: "Leia  com\ncalma",
+        justification_prompt: "\ufeffJustifique",
+      }),
+    ];
+    expect(validateGUIFields(fields)).toEqual([]);
+  });
 });
 
 // #502: erro estrutural do Zod (texto em inglês) vira mensagem pt-BR que

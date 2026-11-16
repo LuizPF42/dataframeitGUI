@@ -1,9 +1,10 @@
-import { fetchAllPaged } from "@/lib/supabase/fetch-all-paged";
+import { fetchAllAfterId, fetchByDocumentChunks } from "@/lib/supabase/fetch-all-paged";
 import type { SupabaseServerClient } from "@/lib/supabase/server";
 
 type DataClient = Pick<SupabaseServerClient, "from">;
 
 interface DocRow {
+  id: string;
   document_id: string;
 }
 
@@ -32,14 +33,35 @@ const docIds = (rows: DocRow[]) => new Set(rows.map((row) => row.document_id));
 // Leitura separada da RPC, sem a trava por documento que ela toma: é uma
 // ressalva informativa, não parte do reparo. Paginada porque o teto de 1000
 // linhas do PostgREST truncaria a contagem em silêncio.
+//
+// Nunca rejeita: uma exceção também vira `error`, para que nenhum chamador
+// troque o reparo ou a tela por uma falha por causa da ressalva.
 export async function fetchDocsWithoutLlmCount(
   client: DataClient,
   projectId: string,
-): Promise<{ count: number; error: null } | { count: null; error: { message: string } }> {
+): Promise<CountResult> {
+  try {
+    return await countDocsWithoutLlm(client, projectId);
+  } catch (error) {
+    return {
+      count: null,
+      error: { message: error instanceof Error ? error.message : String(error) },
+    };
+  }
+}
+
+type CountResult =
+  | { count: number; error: null }
+  | { count: null; error: { message: string } };
+
+async function countDocsWithoutLlm(
+  client: DataClient,
+  projectId: string,
+): Promise<CountResult> {
   const [projectResult, humanResult, llmResult] = await Promise.all([
     client.from("projects").select("automation_mode").eq("id", projectId).single(),
     // O filtro de exclusão só vai no lado humano: é ele que define os candidatos.
-    fetchAllPaged<DocRow>(
+    fetchAllAfterId<DocRow>(
       () =>
         client
           .from("responses")
@@ -50,9 +72,8 @@ export async function fetchDocsWithoutLlmCount(
           .eq("is_partial", false)
           .is("documents.excluded_at", null)
           .is("documents.exclusion_pending_at", null),
-      ["id"],
     ),
-    fetchAllPaged<DocRow>(
+    fetchAllAfterId<DocRow>(
       () =>
         client
           .from("responses")
@@ -61,7 +82,6 @@ export async function fetchDocsWithoutLlmCount(
           .eq("respondent_type", "llm")
           .eq("is_latest", true)
           .eq("is_partial", false),
-      ["id"],
     ),
   ]);
   const firstError = projectResult.error ?? humanResult.error ?? llmResult.error;
@@ -74,22 +94,26 @@ export async function fetchDocsWithoutLlmCount(
     return { count: withoutLlm.size, error: null };
   }
 
+  // Só as auto-revisões dos candidatos, não as do projeto inteiro.
+  const candidates = [...withoutLlm];
+  const reviewedCandidates = (
+    table: "field_reviews" | "field_review_cycle_history_entries",
+  ) =>
+    fetchByDocumentChunks(candidates, (ids) =>
+      fetchAllAfterId<DocRow>(
+        () =>
+          client
+            .from(table)
+            .select("id, document_id")
+            .eq("project_id", projectId)
+            .in("document_id", ids),
+      ),
+    );
   const [reviewsResult, historyResult] = await Promise.all([
-    fetchAllPaged<DocRow>(
-      () => client.from("field_reviews").select("id, document_id").eq("project_id", projectId),
-      ["id"],
-    ),
-    fetchAllPaged<DocRow>(
-      () =>
-        client
-          .from("field_review_cycle_history_entries")
-          .select("id, document_id")
-          .eq("project_id", projectId),
-      ["id"],
-    ),
+    reviewedCandidates("field_reviews"),
+    reviewedCandidates("field_review_cycle_history_entries"),
   ]);
   const reviewError = reviewsResult.error ?? historyResult.error;
   if (reviewError) return { count: null, error: reviewError };
-  const reviewed = docIds([...reviewsResult.data, ...historyResult.data]);
-  return { count: withoutLlm.intersection(reviewed).size, error: null };
+  return { count: docIds([...reviewsResult.data, ...historyResult.data]).size, error: null };
 }

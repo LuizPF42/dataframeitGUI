@@ -11,9 +11,12 @@ import {
   fieldDiffIsStructural,
   generatePydanticCode,
   isProjectScopedLogEntry,
+  MAX_PYDANTIC_CODE_LENGTH,
   ORDER_LOG_FIELD_NAME,
   planSchemaPersistence,
   PROJECT_LOG_FIELD_NAME,
+  pydanticCodeLength,
+  serializeSchemaFields,
   stableStringify,
 } from "@/lib/schema-utils";
 import { pydanticFieldNameIssue } from "@/lib/pydantic-field";
@@ -427,6 +430,42 @@ describe("snapshotOf", () => {
     });
     expect(snapshotOf(implicito)).toEqual(snapshotOf(explicito));
   });
+
+  // O dirty do editor compara `serializeSchemaFields` (snapshotOf) e o save
+  // decide pelo `diffFields`. Com `""` persistido e o editor sem a chave, o
+  // primeiro acusava mudança e o segundo não via nenhuma: o editor ficava sujo
+  // para sempre e o save respondia sucesso sem gravar (#503).
+  it("texto opcional vazio e ausente são o mesmo campo para o dirty e para o save", () => {
+    const persistido = baseField({
+      id: "00000000-0000-4000-8000-000000000503",
+      name: "q1",
+      options: ["A"],
+      help_text: "",
+      justification_prompt: "",
+    });
+    const editado = baseField({ id: persistido.id, name: "q1", options: ["A"] });
+    expect(serializeSchemaFields([persistido])).toBe(serializeSchemaFields([editado]));
+    expect(classifyChange([persistido], [editado])).toBeNull();
+  });
+
+  // `options: []` e `options: null` geram o mesmo código e o mesmo hash de
+  // campo, mas o snapshot os distinguia: trocar um pelo outro subia a versão e
+  // gravava histórico de uma mudança que não existe no código.
+  it.each(["text", "date"] as const)(
+    "lista de opções vazia e ausente são o mesmo campo de %s",
+    (type) => {
+      const id = "00000000-0000-4000-8000-000000000989";
+      const ausente = baseField({ id, name: "q1", type, options: null });
+      const vazia = baseField({ id, name: "q1", type, options: [] });
+      expect(generatePydanticCode([vazia])).toBe(generatePydanticCode([ausente]));
+      expect(snapshotOf(vazia)).toEqual(snapshotOf(ausente));
+      expect(serializeSchemaFields([vazia])).toBe(serializeSchemaFields([ausente]));
+      expect(diffFields([ausente], [vazia])).toEqual([]);
+      expect(classifyChange([ausente], [vazia])).toBeNull();
+      expect(planSchemaPersistence([ausente], [vazia], { major: 1, minor: 0, patch: 0 }))
+        .toMatchObject({ changeType: null, logEntries: [] });
+    },
+  );
 });
 
 // classifyChange é derivado de diffFields + fieldDiffIsStructural. Estes casos
@@ -687,6 +726,27 @@ describe("generatePydanticCode round-trip surface", () => {
     expect(code).not.toContain('"condition"');
   });
 
+  // As respostas padronizadas do campo de texto entram no hash do campo, e o
+  // código tem de carregá-las para reconstruí-lo (#747). Sem elas o texto fica
+  // byte-idêntico, porque `pydantic_hash` é sha256 dele.
+  it("emits the options of a text field, only when it has them", () => {
+    const id = "00000000-0000-4000-8000-0000000000ae";
+    const text = { id, name: "q1", type: "text" as const, help_text: "Ajuda" };
+    const semOpcoes = generatePydanticCode([baseField({ ...text, options: null })]);
+    const listaVazia = generatePydanticCode([baseField({ ...text, options: [] })]);
+    const comOpcoes = generatePydanticCode([
+      baseField({ ...text, options: ["Não consta", 'Com "aspas"'] }),
+    ]);
+    expect(semOpcoes).not.toContain('"options"');
+    expect(listaVazia).toBe(semOpcoes);
+    expect(comOpcoes).toContain(
+      `q1: str = Field(description="x. Instrucoes: Ajuda", json_schema_extra={"id": "${id}", "options": ["Não consta", "Com \\"aspas\\""], "help_text": "Ajuda"})`,
+    );
+    expect(
+      comOpcoes.replace(', "options": ["Não consta", "Com \\"aspas\\""]', ""),
+    ).toBe(semOpcoes);
+  });
+
   it("emits required in json_schema_extra when the field is optional", () => {
     const code = generatePydanticCode([
       baseField({ name: "q1", options: ["A", "B"], required: false }),
@@ -791,5 +851,22 @@ describe("generatePydanticCode round-trip surface", () => {
     ]);
     expect(explicito).not.toContain('"required"');
     expect(legado).toBe(explicito);
+  });
+});
+
+describe("teto do código Pydantic", () => {
+  it("é o mesmo do compilador do backend", () => {
+    const compiler = readFileSync(
+      fileURLToPath(
+        new URL("../../../../backend/services/pydantic_compiler.py", import.meta.url),
+      ),
+      "utf8",
+    );
+    expect(compiler).toContain("_MAX_CODE_LENGTH = 64 * 1024\n");
+    expect(MAX_PYDANTIC_CODE_LENGTH).toBe(64 * 1024);
+  });
+
+  it("conta code points, como o len() do Python", () => {
+    expect(pydanticCodeLength("ação 😀")).toBe(6);
   });
 });

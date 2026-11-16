@@ -18,10 +18,12 @@ import {
 } from "@/lib/schema-change-format";
 import { isProjectScopedLogEntry } from "@/lib/schema-utils";
 import {
+  resolveAllowOther,
   resolveRequired,
   resolveSubfieldRequired,
+  resolveSubfieldRule,
   resolveTarget,
-  type PydanticFieldTarget,
+  type PydanticField,
 } from "@/lib/pydantic-field";
 import type { SchemaChangeEntry, FieldCondition, SubfieldDef } from "@/lib/types";
 
@@ -38,6 +40,7 @@ const SUBFIELD_RULE_LABELS: Record<string, string> = {
 // `null` é o lado vazio de um campo adicionado ou removido (`diffPydanticField`),
 // e não "Não": mostra "—", como `formatType` e `formatTarget`.
 const yesNo = (v: unknown) => (v == null ? "—" : v ? "Sim" : "Não");
+const formatSubfieldRule = (v: unknown) => SUBFIELD_RULE_LABELS[v as string] ?? "—";
 
 // Propriedades de valor curto e enumerável: o diff é um par de pílulas
 // antes → depois, e só o formatador muda.
@@ -48,7 +51,7 @@ const PILL_FORMATTERS: Partial<
   target: formatTarget,
   required: yesNo,
   allow_other: yesNo,
-  subfield_rule: (v) => SUBFIELD_RULE_LABELS[v as string] ?? "—",
+  subfield_rule: formatSubfieldRule,
 };
 
 // Entradas de escopo de projeto — `(ordem)` e `(projeto)` — não descrevem o
@@ -506,6 +509,46 @@ function SubfieldsDiff({
   );
 }
 
+type SnapshotField = Partial<PydanticField>;
+const isChoice = (f: SnapshotField) => f.type === "single" || f.type === "multi";
+// Payload legado não passou pelo Zod: lista só é lista se de fato for array.
+const listOf = <T,>(v: T[] | null | undefined): T[] => (Array.isArray(v) ? v : []);
+
+// Uma entrada por propriedade do diff, na ordem das linhas: propriedade nova em
+// `FieldPropertyDiff` sem entrada aqui não compila — foi assim que o snapshot
+// ficou sem `allow_other`, `subfields` e `subfield_rule`. `null` na entrada é
+// "sem linha" (o nome já está no cabeçalho); `null` no retorno, "linha omitida
+// neste campo". Rótulo de `propertyLabel` e formatadores do diff abaixo do
+// snapshot: a mesma propriedade não ganha dois nomes nem duas grafias. Alvo,
+// obrigatoriedade, "permite outro" e regra de subcampos têm default implícito
+// (ausente no payload é um valor, e não "sem valor"): pelo resolvedor, como no
+// diff de propriedades, para o campo legado mostrar o mesmo que o explícito.
+const SNAPSHOT_ROWS: Record<
+  FieldPropertyDiff["property"],
+  ((f: SnapshotField) => string | null) | null
+> = {
+  name: null,
+  question_revision: null,
+  description: (f) => f.description || null,
+  type: (f) => (f.type ? formatType(f.type) : null),
+  target: (f) => formatTarget(resolveTarget(f.target)),
+  required: (f) => yesNo(resolveRequired(f.required)),
+  help_text: (f) => f.help_text || null,
+  options: (f) => listOf(f.options).join(", ") || null,
+  // "Outro" é controle dos campos de escolha (o editor só o mostra neles), e
+  // num texto livre a linha "Não" seria ruído. Ligado, aparece em qualquer
+  // tipo, como no diff, que não olha o tipo.
+  allow_other: (f) => {
+    const allowOther = resolveAllowOther(f.allow_other);
+    return allowOther || isChoice(f) ? yesNo(allowOther) : null;
+  },
+  subfields: (f) => listOf(f.subfields).map(subfieldText).join(", ") || null,
+  subfield_rule: (f) =>
+    listOf(f.subfields).length > 0 ? formatSubfieldRule(resolveSubfieldRule(f.subfield_rule)) : null,
+  condition: (f) => (f.condition ? formatCondition(f.condition) : null),
+  justification_prompt: (f) => f.justification_prompt || null,
+};
+
 function FieldSnapshot({
   data,
   variant,
@@ -518,38 +561,15 @@ function FieldSnapshot({
       ? "border-green-500/30 bg-green-500/5"
       : "border-red-500/30 bg-red-500/5";
 
-  const rows: { label: string; value: string }[] = [];
-  if (data.description)
-    rows.push({ label: "descrição", value: String(data.description) });
-  if (data.type) rows.push({ label: "tipo", value: formatType(data.type) });
-  // Alvo e obrigatoriedade têm default implícito: ausente no payload é "all" e
-  // "obrigatório", e não "sem valor". Pelo resolvedor, como no diff de
-  // propriedades, para o campo legado mostrar o mesmo que o explícito.
-  rows.push({
-    label: "alvo",
-    value: formatTarget(resolveTarget(data.target as PydanticFieldTarget | null | undefined)),
+  // O payload gravado é o campo serializado: as chaves que faltam são o
+  // default implícito, que os resolvedores cobrem.
+  const field = data as SnapshotField;
+  const rows = Object.entries(SNAPSHOT_ROWS).flatMap(([property, format]) => {
+    const value = format?.(field);
+    return value == null
+      ? []
+      : [{ label: propertyLabel(property as FieldPropertyDiff["property"]), value }];
   });
-  rows.push({
-    label: "obrigatório",
-    value: yesNo(resolveRequired(data.required as boolean | null | undefined)),
-  });
-  if (data.help_text)
-    rows.push({ label: "instruções", value: String(data.help_text) });
-  if (Array.isArray(data.options) && (data.options as string[]).length > 0)
-    rows.push({
-      label: "opções",
-      value: (data.options as string[]).join(", "),
-    });
-  if (data.condition)
-    rows.push({
-      label: "condição",
-      value: formatCondition(data.condition as FieldCondition),
-    });
-  if (data.justification_prompt)
-    rows.push({
-      label: "prompt de justificativa",
-      value: String(data.justification_prompt),
-    });
 
   return (
     <div className={cn("space-y-0.5 rounded border px-2 py-1.5", tone)}>

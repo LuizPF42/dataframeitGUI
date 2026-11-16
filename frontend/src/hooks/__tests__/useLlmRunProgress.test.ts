@@ -43,8 +43,6 @@ function statusRes(overrides: Record<string, unknown> = {}) {
     total: 5,
     errors: [],
     eta_seconds: null,
-    current_batch: 0,
-    total_batches: 0,
     error_traceback: null,
     error_type: null,
     error_line: null,
@@ -60,6 +58,7 @@ function statusRes(overrides: Record<string, unknown> = {}) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 describe("useLlmRunProgress", () => {
@@ -75,7 +74,11 @@ describe("useLlmRunProgress", () => {
 
   it("start() dispara o polling e conclui ao receber status completed", async () => {
     getRunningLlmJob.mockResolvedValue(null);
-    fetchFastAPI.mockResolvedValue(statusRes({ status: "completed" }));
+    // Um backend anterior ao #832 ainda manda os campos de lote; o hook os
+    // ignora.
+    fetchFastAPI.mockResolvedValue(
+      statusRes({ status: "completed", current_batch: 2, total_batches: 5 }),
+    );
     const { result } = renderHook(() => useLlmRunProgress("p1", null));
     await waitFor(() => expect(getRunningLlmJob).toHaveBeenCalled());
 
@@ -88,6 +91,8 @@ describe("useLlmRunProgress", () => {
       "test-token",
     );
     expect(result.current.progress).toBe(5);
+    expect(result.current).not.toHaveProperty("currentBatch");
+    expect(result.current).not.toHaveProperty("totalBatches");
     expect(toastSuccess).toHaveBeenCalledWith("LLM concluído!");
     // refresh: uma vez no start (badge) + uma na conclusão.
     expect(refresh).toHaveBeenCalled();
@@ -123,11 +128,19 @@ describe("useLlmRunProgress", () => {
     const { result } = renderHook(() => useLlmRunProgress("p1", null));
     await waitFor(() => expect(getRunningLlmJob).toHaveBeenCalled());
 
+    // Relógio falso, como no teste abaixo: a 2ª tick só vem depois de um
+    // intervalo de polling (2 s de relógio real).
+    vi.useFakeTimers();
     act(() => result.current.start("job-x"));
+    // A 1ª tick roda no start; o avanço de zero deixa a falha dela assentar.
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(fetchFastAPI).toHaveBeenCalledTimes(1);
+    expect(result.current.status).toBe("running");
 
-    await waitFor(() => expect(result.current.status).toBe("completed"), {
-      timeout: 5000,
-    });
+    await act(() => vi.advanceTimersByTimeAsync(2000));
+
+    expect(fetchFastAPI).toHaveBeenCalledTimes(2);
+    expect(result.current.status).toBe("completed");
     expect(toastError).not.toHaveBeenCalled();
   });
 
@@ -137,11 +150,19 @@ describe("useLlmRunProgress", () => {
     const { result } = renderHook(() => useLlmRunProgress("p1", null));
     await waitFor(() => expect(getRunningLlmJob).toHaveBeenCalled());
 
+    // Relógio falso: a 3ª falha só vem depois de dois intervalos de polling
+    // (4 s de relógio real), e com a máquina carregada o teste estourava os
+    // 5 s de timeout. O `waitFor` que havia aqui pedia 7 s, mais que o teste
+    // tinha.
+    vi.useFakeTimers();
     act(() => result.current.start("job-3"));
+    // Cada avanço roda uma tick e deixa a falha dela assentar.
+    for (let tick = 0; tick < 3; tick++) {
+      await act(() => vi.advanceTimersByTimeAsync(2000));
+    }
 
-    await waitFor(() => expect(result.current.status).toBe("error"), {
-      timeout: 7000,
-    });
+    expect(fetchFastAPI).toHaveBeenCalledTimes(3);
+    expect(result.current.status).toBe("error");
     expect(result.current.errorInfo).toMatchObject({
       message: "offline",
       type: "NetworkError",

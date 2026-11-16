@@ -6,6 +6,8 @@ import { requireResolvedProjectAccess } from "@/lib/project-access";
 import { MyVerdictsView } from "@/components/reviews/MyVerdictsView";
 import { resolveViewedRespondentId } from "@/lib/reviews/queries";
 import { buildMyVerdictItems, type MyVerdictReviewRow } from "@/lib/reviews/my-verdicts";
+import { fetchProfileNames, withProfileNames } from "@/lib/respondent-names";
+import { fetchAllAfterId } from "@/lib/supabase/fetch-all-paged";
 import type { PydanticField } from "@/lib/types";
 
 export type { VerdictItem } from "@/lib/reviews/my-verdicts";
@@ -49,14 +51,34 @@ export default async function MyVerdictsPage({
     viewAsUser: sp.viewAsUser,
   });
 
-  // Fetch responses for the effective user
-  const { data: myResponses } = await supabase
-    .from("responses")
-    .select("document_id, answers")
-    .eq("project_id", id)
-    .eq("respondent_id", viewedRespondentId)
-    .eq("respondent_type", "humano")
-    .eq("is_latest", true);
+  // Fetch responses for the effective user. Os ids vêm numa leitura à parte,
+  // sem `is_latest`: o snapshot do veredito guarda o id da resposta que o
+  // árbitro viu, que pode não ser mais a última.
+  const [{ data: myResponses }, ownResponseIdsRead] = await Promise.all([
+    supabase
+      .from("responses")
+      .select("document_id, answers")
+      .eq("project_id", id)
+      .eq("respondent_id", viewedRespondentId)
+      .eq("respondent_type", "humano")
+      .eq("is_latest", true),
+    fetchAllAfterId<{ id: string }>(() =>
+      supabase
+        .from("responses")
+        .select("id")
+        .eq("project_id", id)
+        .eq("respondent_id", viewedRespondentId)
+        .eq("respondent_type", "humano"),
+    ),
+  ]);
+  // A tela segue usável sem os ids: a resposta do próprio respondente só
+  // aparece repetida em "Outras respostas".
+  if (ownResponseIdsRead.error) {
+    console.error(
+      "MyVerdictsPage: leitura dos ids das respostas do respondente falhou",
+      ownResponseIdsRead.error.message,
+    );
+  }
 
   const fields = (project?.pydantic_fields || []) as PydanticField[];
 
@@ -78,6 +100,7 @@ export default async function MyVerdictsPage({
     { data: documents },
     { data: acknowledgments },
     { data: allRespondents },
+    profileNames,
   ] = await Promise.all([
     supabase
       .from("reviews")
@@ -97,17 +120,18 @@ export default async function MyVerdictsPage({
     isCoordinator
       ? supabase
           .from("responses")
-          .select("respondent_id, respondent_name")
+          .select("respondent_id, respondent_type, respondent_name")
           .eq("project_id", id)
           .eq("respondent_type", "humano")
           .eq("is_latest", true)
       : Promise.resolve({ data: null }),
+    isCoordinator ? fetchProfileNames(supabase, id) : new Map<string, string>(),
   ]);
 
   // Deduplicate respondents
   const respondentsList = isCoordinator && allRespondents
     ? [...new Map(
-        allRespondents
+        withProfileNames(allRespondents, profileNames)
           .filter((r) => r.respondent_id && r.respondent_id !== memberUserId)
           .map((r) => [r.respondent_id, { id: r.respondent_id as string, name: r.respondent_name || "Anônimo" }]),
       ).values()]
@@ -122,6 +146,7 @@ export default async function MyVerdictsPage({
     docTitles: new Map(
       documents?.map((d) => [d.id, d.title || d.external_id || d.id]) || [],
     ),
+    ownResponseIds: new Set(ownResponseIdsRead.data.map((r) => r.id)),
     acknowledgments: new Map(
       acknowledgments?.map((a) => [a.review_id, { status: a.status, comment: a.comment, acknowledged_verdict: a.acknowledged_verdict }]) || [],
     ),
@@ -134,7 +159,6 @@ export default async function MyVerdictsPage({
           projectId={id}
           items={verdictItems}
           fields={fields}
-          userName={[user.firstName, user.lastName].filter(Boolean).join(" ") || "Você"}
           isCoordinator={isCoordinator}
           respondents={respondentsList}
           currentViewUserId={

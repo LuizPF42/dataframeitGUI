@@ -2,6 +2,7 @@
 
 import { createSupabaseServer } from "@/lib/supabase/server";
 import { fetchFastAPIServer } from "@/lib/api-server";
+import { PostgrestWriteError } from "@/lib/supabase/rls-guard";
 
 export async function getEligibleDocCount(
   projectId: string,
@@ -34,8 +35,8 @@ export async function getEligibleDocCount(
       .is("documents.exclusion_pending_at", null),
   ]);
 
-  if (totalError) throw new Error(totalError.message);
-  if (llmError) throw new Error(llmError.message);
+  if (totalError) throw new PostgrestWriteError(totalError);
+  if (llmError) throw new PostgrestWriteError(llmError);
 
   const totalDocs = total ?? 0;
 
@@ -95,6 +96,8 @@ export interface LlmRunRecord {
   error_column: number | null;
   started_at: string;
   completed_at: string | null;
+  // NOT NULL desde 20260811120000_llm_runs_round_id.sql.
+  round_id: string;
 }
 
 export async function getLlmRuns(
@@ -108,13 +111,14 @@ export async function getLlmRuns(
     .select(
       "id, job_id, status, phase, llm_provider, llm_model, filter_mode, " +
         "document_count, progress, total, pydantic_code, error_message, " +
-        "error_type, error_traceback, error_line, error_column, started_at, completed_at"
+        "error_type, error_traceback, error_line, error_column, started_at, completed_at, " +
+        "round_id"
     )
     .eq("project_id", projectId)
     .order("started_at", { ascending: false })
     .limit(limit);
 
-  if (error) throw new Error(error.message);
+  if (error) throw new PostgrestWriteError(error);
 
   return (data ?? []) as unknown as LlmRunRecord[];
 }
@@ -126,7 +130,7 @@ export async function getRunningLlmCount(projectId: string): Promise<number> {
     .select("id", { count: "exact", head: true })
     .eq("project_id", projectId)
     .eq("status", "running");
-  if (error) throw new Error(error.message);
+  if (error) throw new PostgrestWriteError(error);
   return count ?? 0;
 }
 
@@ -152,8 +156,8 @@ export async function getLlmRunStats(
       .eq("llm_job_id", jobId)
       .eq("is_partial", true),
   ]);
-  if (completeError) throw new Error(completeError.message);
-  if (partialError) throw new Error(partialError.message);
+  if (completeError) throw new PostgrestWriteError(completeError);
+  if (partialError) throw new PostgrestWriteError(partialError);
   return { current: complete ?? 0, partial: partial ?? 0 };
 }
 
@@ -202,7 +206,7 @@ export async function getLlmResponsesForProject(
 
   const { data, error } = await query;
 
-  if (error) throw new Error(error.message);
+  if (error) throw new PostgrestWriteError(error);
 
   return ((data ?? []) as unknown as Array<{
     id: string;
@@ -293,7 +297,7 @@ export async function getRunningLlmJob(
     .order("started_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-  if (error) throw new Error(error.message);
+  if (error) throw new PostgrestWriteError(error);
   if (!data) return null;
   return { job_id: data.job_id, started_at: data.started_at };
 }
@@ -321,8 +325,8 @@ export async function getDocumentsForSelection(
       .eq("is_latest", true),
   ]);
 
-  if (docsError) throw new Error(docsError.message);
-  if (responsesError) throw new Error(responsesError.message);
+  if (docsError) throw new PostgrestWriteError(docsError);
+  if (responsesError) throw new PostgrestWriteError(responsesError);
 
   const humanDocs = new Set<string>();
   const llmCounts = new Map<string, number>();

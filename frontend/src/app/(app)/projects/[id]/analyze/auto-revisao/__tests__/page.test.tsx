@@ -63,6 +63,8 @@ function seedQueue(ownerId: string) {
         human_answer_snapshot: "A",
         llm_answer_snapshot: "B",
         llm_justification_snapshot: "Justificativa",
+        "documents.excluded_at": null,
+        "documents.exclusion_pending_at": null,
       },
     ],
   };
@@ -72,6 +74,7 @@ type AutoReviewProps = {
   ownQueueUserId: string;
   docs: Array<{ docId: string }>;
   queueUserId: string;
+  docsWithoutLlm?: Promise<number | null>;
 };
 
 function getAutoReviewProps(result: unknown): AutoReviewProps {
@@ -170,5 +173,117 @@ describe("AutoReviewRoute — identidade efetiva", () => {
       docs: [{ docId: "doc-1" }],
     });
     expect(props.queueUserId === props.ownQueueUserId).toBe(false);
+  });
+});
+
+// A pendência é uma linha por campo, e o PostgREST corta a leitura em 1000
+// sem erro: a fila perdia documentos que o contador de /config/members contava.
+describe("AutoReviewRoute — leitura da fila", () => {
+  it("fila com mais de 1000 campos pendentes vem inteira", async () => {
+    seedQueue("canonical-member");
+    const [template] = tableData.field_reviews as Array<Record<string, unknown>>;
+    tableData.field_reviews = [
+      ...Array.from({ length: 1000 }, (_, i) => ({
+        ...template,
+        id: `review-${String(i).padStart(4, "0")}`,
+        field_name: `campo_${i}`,
+      })),
+      { ...template, id: "review-9999", document_id: "doc-2" },
+    ];
+    (tableData.documents as unknown[]).push({
+      ...(tableData.documents[0] as object),
+      id: "doc-2",
+    });
+
+    const props = await renderRoute();
+
+    expect(props.docs.map((doc) => doc.docId)).toEqual(["doc-1", "doc-2"]);
+  });
+
+  it("leitura que falha derruba a página em vez de abrir a fila vazia", async () => {
+    seedQueue("canonical-member");
+    createSupabaseServer.mockImplementation(async () =>
+      makeFilterAwareSupabaseMock({
+        tableData,
+        writeCalls: [],
+        queryErrors: { "field_reviews:select": { message: "timeout" } },
+      }),
+    );
+
+    await expect(renderRoute()).rejects.toThrow(
+      "Não foi possível carregar a fila de auto-revisão",
+    );
+  });
+});
+
+// #889: depois de um round reiniciado (que arquiva toda geração LLM), a fila
+// fica vazia sem dizer por quê. O coordenador vê quantos documentos ficaram
+// fora por falta de geração LLM corrente — o mesmo critério do toast do reparo.
+describe("AutoReviewRoute — fila vazia por falta de geração LLM", () => {
+  const coordinator = {
+    status: "resolved",
+    accountUserId: "linked-account",
+    memberUserId: "canonical-member",
+    project: { id: "project-1", name: "Projeto", created_by: "coordinator" },
+    membershipRole: "coordenador",
+    isMaster: false,
+    isCoordinator: true,
+  };
+  const humanResponse = (id: string, documentId: string) => ({
+    id,
+    project_id: "project-1",
+    document_id: documentId,
+    respondent_type: "humano",
+    is_latest: true,
+    is_partial: false,
+    "documents.excluded_at": null,
+    "documents.exclusion_pending_at": null,
+  });
+
+  function seedRestartedRound() {
+    tableData = {
+      projects: [{ id: "project-1", pydantic_fields: [], automation_mode: "auto_review_llm" }],
+      project_members: [],
+      documents: [],
+      field_reviews: [],
+      responses: [humanResponse("h1", "doc-1"), humanResponse("h2", "doc-2")],
+    };
+  }
+
+  it("conta, para o coordenador, os documentos sem geração LLM corrente", async () => {
+    seedRestartedRound();
+    authMocks.getProjectAccessContext.mockResolvedValue(coordinator);
+    const props = await renderRoute();
+    expect(props.docs).toEqual([]);
+    // Promessa, não número: a contagem pagina as respostas correntes do
+    // projeto e vai por streaming, sem segurar a renderização da página.
+    expect(props.docsWithoutLlm).toBeInstanceOf(Promise);
+    expect(await props.docsWithoutLlm).toBe(2);
+  });
+
+  it("contagem que lança vira aviso de falha, sem derrubar a página", async () => {
+    seedRestartedRound();
+    authMocks.getProjectAccessContext.mockResolvedValue(coordinator);
+    createSupabaseServer.mockImplementation(async () => {
+      const client = makeFilterAwareSupabaseMock({ tableData, writeCalls: [] });
+      const from = client.from;
+      client.from = (table: string) => {
+        if (table === "responses") throw new Error("fetch failed");
+        return from(table);
+      };
+      return client;
+    });
+    const props = await renderRoute();
+    expect(props.docs).toEqual([]);
+    expect(await props.docsWithoutLlm).toBeNull();
+  });
+
+  it("não conta para o pesquisador nem com fila não vazia", async () => {
+    seedRestartedRound();
+    expect((await renderRoute()).docsWithoutLlm).toBeUndefined();
+
+    seedQueue("canonical-member");
+    authMocks.getProjectAccessContext.mockResolvedValue(coordinator);
+    expect((await renderRoute()).docsWithoutLlm).toBeUndefined();
   });
 });

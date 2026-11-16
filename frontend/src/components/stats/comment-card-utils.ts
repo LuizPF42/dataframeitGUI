@@ -31,6 +31,13 @@ export interface ReviewComment {
    * (`review-validity.ts`), que a tela usa para rotulá-lo (#758).
    */
   verdictInvalidReason?: ReviewInvalidReason;
+  /**
+   * Só em comentário de review com veredito "Ambíguo" cujo texto o comentário
+   * kind='ambiguity' da célula repete, no mesmo estado (aberto ou resolvido):
+   * o card da ambiguidade sai da lista, e este responde também pelo filtro
+   * "Campos ambíguos" (`buildOrderedComments`).
+   */
+  coversAmbiguityComment?: true;
   source:
     | "review"
     | "nota"
@@ -63,9 +70,53 @@ export interface ReviewComment {
   exclusionRejectedReason?: string | null;
 }
 
+/**
+ * Tipo do comentário para o seletor "tipo" da aba Comentários. Dois tipos com
+ * nome parecido e conteúdo distinto (#680): `ambiguo` casa o comentário que o
+ * revisor escreveu num veredito "Ambíguo" (`reviews.verdict`), e
+ * `ambiguidade` casa o comentário de discussão que esse veredito cria para o
+ * campo (`project_comments.kind = 'ambiguity'`).
+ */
+export type CommentFilterType =
+  | "answer"
+  | "ambiguo"
+  | "ambiguidade"
+  | "pular"
+  | "nota"
+  | "sugestao"
+  | "dificuldade"
+  | "anotacao"
+  | "duvida"
+  | "exclusao";
+
+// Se o comentário entra no filtro de tipo escolhido. O card da revisão que
+// ficou no lugar do comentário de ambiguidade repetido responde pelos dois
+// tipos (#680).
+export function matchesCommentFilter(
+  comment: Pick<ReviewComment, "verdict" | "coversAmbiguityComment">,
+  filter: string,
+): boolean {
+  if (filter === "all" || commentFilterType(comment.verdict) === filter) return true;
+  return filter === "ambiguidade" && comment.coversAmbiguityComment === true;
+}
+
+export function commentFilterType(verdict: string): CommentFilterType {
+  if (verdict === "nota") return "nota";
+  if (verdict === "anotacao") return "anotacao";
+  if (verdict === "ambiguidade") return "ambiguidade";
+  if (verdict === "dificuldade") return "dificuldade";
+  if (verdict === "sugestao") return "sugestao";
+  if (verdict === "exclusao") return "exclusao";
+  if (verdict === "duvida") return "duvida";
+  if (verdict === "ambiguo") return "ambiguo";
+  if (verdict === "pular") return "pular";
+  return "answer";
+}
+
 export function formatVerdictLabel(verdict: string): string {
   if (verdict === "nota") return "Nota do pesquisador";
   if (verdict === "anotacao") return "Anotação";
+  if (verdict === "ambiguidade") return "Campo ambíguo";
   if (verdict === "dificuldade") return "Dificuldade do LLM";
   if (verdict === "sugestao") return "Sugestão";
   if (verdict === "exclusao") return "Sugestão de exclusão";
@@ -81,6 +132,7 @@ export function verdictVariant(
 ): "default" | "secondary" | "destructive" | "outline" {
   if (verdict === "nota") return "secondary";
   if (verdict === "anotacao") return "secondary";
+  if (verdict === "ambiguidade") return "secondary";
   if (verdict === "dificuldade") return "secondary";
   if (verdict === "sugestao") return "outline";
   if (verdict === "exclusao") return "destructive";

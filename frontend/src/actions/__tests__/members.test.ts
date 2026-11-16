@@ -1,17 +1,23 @@
-import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
 
 import {
-  makeSupabaseMock,
-  type FilterCall,
+  makeFilterAwareSupabaseMock,
+  type QueryError,
+  type ReadCall,
   type RpcCall,
-  type TableResult,
-  type TableResults,
+  type RpcResult,
   type WriteCall,
-} from "./supabase-mock";
+} from "@/test-utils/supabase-mock";
 
 let writeCalls: WriteCall[];
-let filterCalls: FilterCall[];
 let rpcCalls: RpcCall[];
+let serverRows: Record<string, unknown[]>;
+let adminRows: Record<string, unknown[]>;
+let serverQueryErrors: Record<string, QueryError>;
+let adminQueryErrors: Record<string, QueryError>;
+let adminQueryErrorForCall: Parameters<typeof makeFilterAwareSupabaseMock>[0]["queryErrorForCall"];
+let readCalls: ReadCall[];
 const updateAuthUserById = vi.fn<
   (
     userId: string,
@@ -22,51 +28,26 @@ const updateAuthUserById = vi.fn<
   }>
 >(async (userId) => ({ data: { user: { id: userId } }, error: null }));
 
-function makeClient(
-  updateError?: { message: string },
-  tableResults?: TableResults,
-  rpcResults?: Record<string, TableResult | TableResult[]>,
-) {
-  const identityRpcResults: Record<string, TableResult | TableResult[]> = {
-    ...(rpcResults ?? {}),
-  };
-  if (tableResults?.project_members) {
-    identityRpcResults.add_project_member_with_identity_proof =
-      tableResults.project_members;
-  }
-  if (tableResults?.member_email_links) {
-    identityRpcResults.write_member_email_link_with_identity_proof =
-      tableResults.member_email_links;
-  }
-  const client = makeSupabaseMock({
-    tableResults: {
-      clerk_user_mapping: { data: null },
-      ...(tableResults ?? {}),
-    },
-    defaultResult: updateError
-      ? { data: null, error: updateError }
-      : { data: { project_id: "p-derived", user_id: "userMemberX" } },
+function makeClient(kind: "server" | "admin") {
+  const client = makeFilterAwareSupabaseMock({
+    tableData: kind === "server" ? serverRows : adminRows,
+    queryErrors: kind === "server" ? serverQueryErrors : adminQueryErrors,
+    queryErrorForCall: kind === "admin" ? adminQueryErrorForCall : undefined,
     writeCalls,
-    filterCalls,
+    readCalls,
     rpcCalls,
-    rpcResults: identityRpcResults,
+    rpcResults: kind === "server" ? serverRpcResults : adminRpcResults,
+    projectColumns: true,
   });
-  return {
-    ...client,
-    auth: { admin: { updateUserById: updateAuthUserById } },
-  };
+  return { ...client, auth: { admin: { updateUserById: updateAuthUserById } } };
 }
 
-let clientError: { message: string } | undefined;
-let serverTableResults: TableResults | undefined;
-let adminTableResults: TableResults | undefined;
-let serverRpcResults: Record<string, TableResult | TableResult[]>;
-let adminRpcResults: Record<string, TableResult | TableResult[]>;
+let serverRpcResults: Record<string, RpcResult | RpcResult[]>;
+let adminRpcResults: Record<string, RpcResult | RpcResult[]>;
 let adminCreateCalls: number;
 
 const hoisted = vi.hoisted(() => ({
   revalidatePath: vi.fn<(path: string) => void>(),
-  revalidateTag: vi.fn<(tag: string, profile: unknown) => void>(),
   retry: vi.fn<
     (projectId: string) => Promise<{
       success: boolean;
@@ -120,7 +101,6 @@ const hoisted = vi.hoisted(() => ({
 
 vi.mock("next/cache", () => ({
   revalidatePath: hoisted.revalidatePath,
-  revalidateTag: hoisted.revalidateTag,
 }));
 vi.mock("@/lib/auth", () => ({
   requireCoordinator: hoisted.requireCoordinator,
@@ -135,13 +115,12 @@ vi.mock("@/lib/clerk-sync", async (importOriginal) => ({
   reconcileVerifiedClerkEmailOwner: hoisted.reconcileClerkEmailOwner,
 }));
 vi.mock("@/lib/supabase/server", () => ({
-  createSupabaseServer: async () =>
-    makeClient(clientError, serverTableResults, serverRpcResults),
+  createSupabaseServer: async () => makeClient("server"),
 }));
 vi.mock("@/lib/supabase/admin", () => ({
   createSupabaseAdmin: () => {
     adminCreateCalls++;
-    return makeClient(clientError, adminTableResults, adminRpcResults);
+    return makeClient("admin");
   },
 }));
 vi.mock("@/actions/field-reviews", () => ({
@@ -150,13 +129,30 @@ vi.mock("@/actions/field-reviews", () => ({
 vi.mock("@/actions/comparisons", () => ({
   retryPendingComparisons: hoisted.retryComparisons,
 }));
+// Erro do Postgres, PostgREST ou Auth não vai cru ao toast: o texto vai ao log
+// do servidor, e a action devolve a copy pt-BR do fluxo (#502).
+let consoleError: ReturnType<typeof vi.spyOn>;
+function expectLogged(message: string) {
+  expect(consoleError).toHaveBeenCalledWith(
+    loggedLine(/\[members\] .* falhou/, { message }),
+  );
+}
+
+afterEach(() => consoleError.mockRestore());
+
 beforeEach(() => {
+  consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
   writeCalls = [];
-  filterCalls = [];
+  readCalls = [];
+  serverRows = { project_members: [
+    { id: "member1", project_id: "p-derived" },
+    { id: "other", project_id: "other-project" },
+  ] };
+  adminRows = {};
+  serverQueryErrors = {};
+  adminQueryErrors = {};
+  adminQueryErrorForCall = undefined;
   rpcCalls = [];
-  clientError = undefined;
-  serverTableResults = undefined;
-  adminTableResults = undefined;
   serverRpcResults = {
     remove_project_member: {
       data: { project_id: "p-derived" },
@@ -176,7 +172,6 @@ beforeEach(() => {
     error: null,
   });
   hoisted.revalidatePath.mockReset();
-  hoisted.revalidateTag.mockReset();
   hoisted.retry.mockReset();
   hoisted.retry.mockResolvedValue({
     success: true,
@@ -216,6 +211,9 @@ beforeAll(async () => {
 function rpcArgs(fn: string): Record<string, unknown> {
   const call = rpcCalls.find((entry) => entry.fn === fn);
   return (call?.args as Record<string, unknown>) ?? {};
+}
+function expectNoWriteRpc(fn: string) {
+  expect(rpcCalls.some((call) => call.fn === fn)).toBe(false);
 }
 
 async function loadRemove() {
@@ -273,10 +271,6 @@ describe("removeMember", () => {
     expect(writeCalls).toEqual([]);
     expect(hoisted.revalidatePath).toHaveBeenCalledWith(
       "/projects/p-canonical",
-    );
-    expect(hoisted.revalidateTag).toHaveBeenCalledWith(
-      "project-p-canonical-members",
-      expect.anything(),
     );
   });
 
@@ -367,7 +361,8 @@ describe("setCanArbitrate", () => {
     };
     const set = await loadSet();
     const r = await set("member1", true);
-    expect(r.error).toBe("RLS bloqueou");
+    expect(r.error).toEqual(copyWithRef("Não foi possível alterar a permissão do membro. Tente novamente."));
+    expectLogged("RLS bloqueou");
     expect(hoisted.retry).not.toHaveBeenCalled();
   });
 
@@ -424,7 +419,8 @@ describe("setCanCompare", () => {
     };
     const set = await loadSetCompare();
 
-    expect(await set("member-1", false)).toEqual({ error: "falha atômica" });
+    expect(await set("member-1", false)).toEqual({ error: copyWithRef("Não foi possível alterar a permissão do membro. Tente novamente.") });
+    expectLogged("falha atômica");
     expect(hoisted.retryComparisons).not.toHaveBeenCalled();
   });
 
@@ -458,9 +454,10 @@ async function loadChangeRole() {
 
 describe("changeRole", () => {
   it("deriva o projeto da linha alterada", async () => {
-    serverTableResults = {
-      project_members: { data: { project_id: "p-canonical" } },
-    };
+    serverRows = { project_members: [
+      { id: "member-1", project_id: "p-canonical" },
+      { id: "other", project_id: "other-project" },
+    ] };
     const change = await loadChangeRole();
     const r = await change("member-1", "coordenador");
 
@@ -471,7 +468,7 @@ describe("changeRole", () => {
   });
 
   it("linha ausente → erro fail-closed", async () => {
-    serverTableResults = { project_members: { data: null } };
+    serverRows = { project_members: [] };
     const change = await loadChangeRole();
 
     expect(await change("missing", "pesquisador")).toEqual({
@@ -494,6 +491,7 @@ describe("setCanResolve", () => {
       table: "project_members",
       op: "update",
       payload: { can_resolve: true },
+      filters: [["eq", "id", "member1"]],
     });
     expect(hoisted.revalidatePath).toHaveBeenCalledWith("/projects/p-derived");
   });
@@ -506,18 +504,20 @@ describe("setCanResolve", () => {
       table: "project_members",
       op: "update",
       payload: { can_resolve: false },
+      filters: [["eq", "id", "member1"]],
     });
   });
 
   it("UPDATE falha → retorna error", async () => {
-    clientError = { message: "RLS bloqueou" };
+    serverQueryErrors["project_members:update"] = { message: "RLS bloqueou" };
     const set = await loadSetResolve();
     const r = await set("member1", true);
-    expect(r.error).toBe("RLS bloqueou");
+    expect(r.error).toEqual(copyWithRef("Não foi possível alterar a permissão do membro. Tente novamente."));
+    expectLogged("RLS bloqueou");
   });
 
   it("linha ausente → erro fail-closed", async () => {
-    serverTableResults = { project_members: { data: null } };
+    serverRows = { project_members: [] };
     const set = await loadSetResolve();
 
     expect(await set("missing", true)).toEqual({
@@ -531,23 +531,35 @@ async function loadAdd() {
 }
 
 describe("addMember (pré-registro de membro sem conta)", () => {
+  beforeEach(() => {
+    adminRows = {
+      profiles: [], member_email_links: [], clerk_user_mapping: [],
+      project_members: [
+        { id: "outside-project", project_id: "p2", user_id: "ownerUid" },
+        { id: "other-member", project_id: "p1", user_id: "otherUid" },
+      ],
+    };
+    adminRpcResults.add_project_member_with_identity_proof = { data: null };
+  });
   function setAddCurrentOwnerContext({
     linkedOwner,
     projectMembers,
   }: {
-    linkedOwner: TableResult;
-    projectMembers: TableResult | TableResult[];
+    linkedOwner: string | null;
+    projectMembers: boolean;
   }) {
     hoisted.reconcileClerkEmailOwner.mockResolvedValue({
       status: "resolved",
       userId: "ownerUid",
       snapshotVersion: 101,
     });
-    adminTableResults = {
-      profiles: [{ data: null }, { data: { id: "ownerUid" } }],
-      member_email_links: [{ data: null }, linkedOwner],
-      project_members: projectMembers,
-    };
+    adminRows.profiles = [{ id: "ownerUid" }];
+    adminRows.member_email_links = linkedOwner
+      ? [{ id: "link1", project_id: "p1", email: "alias@conta.com", linked_user_id: "ownerUid", member_user_id: linkedOwner }]
+      : [];
+    adminRows.project_members = projectMembers
+      ? [{ id: "membership1", project_id: "p1", user_id: "ownerUid" }]
+      : [];
   }
 
   it("e-mail inválido → erro sem tocar no banco nem pré-registrar", async () => {
@@ -556,14 +568,10 @@ describe("addMember (pré-registro de membro sem conta)", () => {
     expect(r.error).toBe("E-mail inválido.");
     expect(hoisted.preregister).not.toHaveBeenCalled();
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("normaliza e-mail (trim + lowercase) antes de pré-registrar", async () => {
-    adminTableResults = {
-      profiles: { data: null },
-      member_email_links: { data: null },
-      project_members: { data: null },
-    };
     const add = await loadAdd();
     const r = await add("p1", "  Pessoa@Exemplo.COM ", "pesquisador");
     expect(r.error).toBeUndefined();
@@ -588,14 +596,10 @@ describe("addMember (pré-registro de membro sem conta)", () => {
       userId: "ownerUid",
       snapshotVersion: 102,
     });
-    adminTableResults = {
-      profiles: [
-        { data: { id: "legacyUid", activated_at: "2026-01-01" } },
-        { data: { id: "ownerUid" } },
-      ],
-      member_email_links: [{ data: null }, { data: null }],
-      project_members: [{ data: null }, { data: null }],
-    };
+    adminRows.profiles = [
+      { id: "legacyUid", email: "ja-tem@conta.com", activated_at: "2026-01-01" },
+      { id: "ownerUid" },
+    ];
     const add = await loadAdd();
     const r = await add("p1", "ja-tem@conta.com", "pesquisador");
     expect(r.error).toBeUndefined();
@@ -604,12 +608,10 @@ describe("addMember (pré-registro de membro sem conta)", () => {
     expect(hoisted.reconcileClerkEmailOwner).toHaveBeenCalledWith(
       "ja-tem@conta.com",
     );
-    expect(filterCalls).not.toContainEqual({
-      table: "project_members",
-      method: "eq",
-      column: "user_id",
-      value: "legacyUid",
-    });
+    expect(readCalls.some((call) =>
+      call.table === "project_members" &&
+      call.filters.some((filter) => filter[0] === "eq" && filter[1] === "user_id" && filter[2] === "legacyUid"),
+    )).toBe(false);
     expect(rpcArgs("add_project_member_with_identity_proof")).toMatchObject({
       p_project_id: "p1",
       p_user_id: "ownerUid",
@@ -624,29 +626,19 @@ describe("addMember (pré-registro de membro sem conta)", () => {
       userId: "legacyUid",
       snapshotVersion: 103,
     });
-    adminTableResults = {
-      profiles: [
-        { data: { id: "legacyUid", activated_at: "2026-01-01" } },
-        { data: { id: "legacyUid" } },
-      ],
-      member_email_links: [{ data: null }, { data: null }],
-      project_members: { data: { id: "membership1" } },
-    };
+    adminRows.profiles = [{ id: "legacyUid", email: "still-owned@conta.com", activated_at: "2026-01-01" }];
+    adminRows.project_members = [{ id: "membership1", project_id: "p1", user_id: "legacyUid" }];
     const add = await loadAdd();
 
     expect(await add("p1", "still-owned@conta.com", "pesquisador")).toEqual({
       error: "Usuário já é membro deste projeto.",
     });
     expect(writeCalls.filter((call) => call.op === "insert")).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("profile existente mas ainda pendente (pré-registrado em outro projeto) → pending true", async () => {
-    adminTableResults = {
-      profiles: { data: { id: "placeholderUid2", activated_at: null } },
-      member_email_links: { data: null },
-      project_members: [{ data: null }, { data: null }],
-      clerk_user_mapping: { data: null },
-    };
+    adminRows.profiles = [{ id: "placeholderUid2", email: "pendente@conta.com", activated_at: null }];
     const add = await loadAdd();
     const r = await add("p1", "pendente@conta.com", "pesquisador");
     expect(r.error).toBeUndefined();
@@ -655,12 +647,8 @@ describe("addMember (pré-registro de membro sem conta)", () => {
   });
 
   it("profile pendente já mapeado e sem dono exato não vira membership", async () => {
-    adminTableResults = {
-      profiles: { data: { id: "claimedUid", activated_at: null } },
-      member_email_links: { data: null },
-      project_members: { data: null },
-      clerk_user_mapping: { data: { supabase_user_id: "claimedUid" } },
-    };
+    adminRows.profiles = [{ id: "claimedUid", email: "antigo@exemplo.com", activated_at: null }];
+    adminRows.clerk_user_mapping = [{ supabase_user_id: "claimedUid" }];
     const add = await loadAdd();
 
     expect(await add("p1", "antigo@exemplo.com", "pesquisador")).toEqual({
@@ -668,11 +656,7 @@ describe("addMember (pré-registro de membro sem conta)", () => {
         "Este pré-registro já pertence a outra conta Clerk e não pode ser reutilizado.",
     });
     expect(hoisted.preregister).not.toHaveBeenCalled();
-    expect(
-      writeCalls.some(
-        (call) => call.table === "project_members" && call.op === "insert",
-      ),
-    ).toBe(false);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("profile pendente mapeado só segue quando o dono exato resolve para o mesmo UID", async () => {
@@ -681,15 +665,8 @@ describe("addMember (pré-registro de membro sem conta)", () => {
       userId: "claimedUid",
       snapshotVersion: 104,
     });
-    adminTableResults = {
-      profiles: [
-        { data: { id: "claimedUid", activated_at: null } },
-        { data: { id: "claimedUid" } },
-      ],
-      member_email_links: [{ data: null }, { data: null }],
-      project_members: [{ data: null }, { data: null }],
-      clerk_user_mapping: { data: { supabase_user_id: "claimedUid" } },
-    };
+    adminRows.profiles = [{ id: "claimedUid", email: "atual@exemplo.com", activated_at: null }];
+    adminRows.clerk_user_mapping = [{ supabase_user_id: "claimedUid" }];
     const add = await loadAdd();
 
     expect(await add("p1", "atual@exemplo.com", "pesquisador")).toEqual({
@@ -704,11 +681,7 @@ describe("addMember (pré-registro de membro sem conta)", () => {
   });
 
   it("profile ativo sem dono Clerk confirmado → falha fechada", async () => {
-    adminTableResults = {
-      profiles: { data: { id: "existingUid", activated_at: "2026-01-01" } },
-      member_email_links: { data: null },
-      project_members: { data: null },
-    };
+    adminRows.profiles = [{ id: "existingUid", email: "ja-tem@conta.com", activated_at: "2026-01-01" }];
     const add = await loadAdd();
 
     expect(await add("p1", "ja-tem@conta.com", "pesquisador")).toEqual({
@@ -716,27 +689,23 @@ describe("addMember (pré-registro de membro sem conta)", () => {
         "Não foi possível confirmar que a conta ativa ainda possui este e-mail.",
     });
     expect(writeCalls.filter((call) => call.op === "insert")).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("e-mail vinculado a outro membro do projeto → erro orientando a desvincular", async () => {
-    adminTableResults = {
-      profiles: { data: { id: "srcUid", activated_at: "2026-01-01" } },
-      member_email_links: { data: { member_user_id: "target1" } },
-    };
+    adminRows.profiles = [{ id: "srcUid", email: "vinculado@conta.com", activated_at: "2026-01-01" }];
+    adminRows.member_email_links = [{ project_id: "p1", email: "vinculado@conta.com", member_user_id: "target1" }];
     const add = await loadAdd();
     const r = await add("p1", "vinculado@conta.com", "pesquisador");
     expect(r.error).toContain("vinculado a outro membro");
     expect(writeCalls.filter((c) => c.op === "insert")).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("falha no lookup de posse Clerk → fail-closed após validações locais", async () => {
     hoisted.reconcileClerkEmailOwner.mockRejectedValue(
       new Error("Clerk indisponível"),
     );
-    adminTableResults = {
-      profiles: { data: null },
-      member_email_links: { data: null },
-    };
     const add = await loadAdd();
 
     expect(await add("p1", "novo@exemplo.com", "pesquisador")).toEqual({
@@ -745,6 +714,7 @@ describe("addMember (pré-registro de membro sem conta)", () => {
     });
     expect(adminCreateCalls).toBe(1);
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("conflito estrutural de identidade não é oferecido como retry", async () => {
@@ -756,38 +726,30 @@ describe("addMember (pré-registro de membro sem conta)", () => {
         "Mais de uma conta Clerk possui o e-mail verificado",
       ),
     );
-    adminTableResults = {
-      profiles: { data: null },
-      member_email_links: { data: null },
-    };
     const add = await loadAdd();
 
     expect(await add("p1", "novo@exemplo.com", "pesquisador")).toEqual({
       error: "Mais de uma conta Clerk possui o e-mail verificado",
     });
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("falha na validação local → não consulta o Clerk", async () => {
-    adminTableResults = {
-      profiles: { error: { message: "profiles indisponível" } },
-      member_email_links: { data: null },
-    };
+    adminQueryErrors["profiles:select:id, activated_at"] = { message: "profiles indisponível" };
     const add = await loadAdd();
 
     expect(await add("p1", "novo@exemplo.com", "pesquisador")).toEqual({
-      error: "profiles indisponível",
+      error: copyWithRef("Não foi possível adicionar o membro. Tente novamente."),
     });
+    expectLogged("profiles indisponível");
     expect(hoisted.reconcileClerkEmailOwner).not.toHaveBeenCalled();
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("posse alterada durante a operação não cria membership pendente", async () => {
     hoisted.reconcileClerkEmailOwner.mockResolvedValue({ status: "changed" });
-    adminTableResults = {
-      profiles: { data: null },
-      member_email_links: { data: null },
-    };
     const add = await loadAdd();
 
     expect(await add("p1", "novo@exemplo.com", "pesquisador")).toEqual({
@@ -795,6 +757,7 @@ describe("addMember (pré-registro de membro sem conta)", () => {
     });
     expect(hoisted.preregister).not.toHaveBeenCalled();
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("dono Clerk reconciliado sem profile Supabase → falha fechada", async () => {
@@ -803,40 +766,29 @@ describe("addMember (pré-registro de membro sem conta)", () => {
       userId: "ownerUid",
       snapshotVersion: 105,
     });
-    adminTableResults = {
-      profiles: [{ data: null }, { data: null }],
-      member_email_links: [{ data: null }, { data: null }],
-      project_members: { data: null },
-    };
     const add = await loadAdd();
 
     expect(await add("p1", "novo@exemplo.com", "pesquisador")).toEqual({
       error: "A conta verificada não possui profile Supabase.",
     });
     expect(writeCalls.filter((call) => call.op === "insert")).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("erro genérico no insert é propagado sem revalidar cache", async () => {
-    adminTableResults = {
-      profiles: { data: null },
-      member_email_links: { data: null },
-      project_members: { error: { message: "insert indisponível" } },
-    };
+    adminRpcResults.add_project_member_with_identity_proof = { error: { message: "insert indisponível" } };
     const add = await loadAdd();
 
     expect(await add("p1", "novo@exemplo.com", "pesquisador")).toEqual({
-      error: "insert indisponível",
+      error: copyWithRef("Não foi possível adicionar o membro. Tente novamente."),
     });
+    expectLogged("insert indisponível");
     expect(hoisted.revalidatePath).not.toHaveBeenCalled();
-    expect(hoisted.revalidateTag).not.toHaveBeenCalled();
   });
 
   it("membership do profile administrativo bloqueia duplicação antes da reconciliação", async () => {
-    adminTableResults = {
-      profiles: { data: { id: "existingUid", activated_at: null } },
-      member_email_links: { data: null },
-      project_members: { data: { id: "membership1" } },
-    };
+    adminRows.profiles = [{ id: "existingUid", email: "ja-tem@conta.com", activated_at: null }];
+    adminRows.project_members = [{ id: "membership1", project_id: "p1", user_id: "existingUid" }];
     const add = await loadAdd();
 
     expect(await add("p1", "ja-tem@conta.com", "pesquisador")).toEqual({
@@ -847,8 +799,8 @@ describe("addMember (pré-registro de membro sem conta)", () => {
 
   it("alias da conta por outro e-mail bloqueia uma membership terminal inválida", async () => {
     setAddCurrentOwnerContext({
-      linkedOwner: { data: { member_user_id: "canonicalMember" } },
-      projectMembers: { data: null },
+      linkedOwner: "canonicalMember",
+      projectMembers: false,
     });
     const add = await loadAdd();
 
@@ -856,23 +808,20 @@ describe("addMember (pré-registro de membro sem conta)", () => {
       error:
         "Esta conta já está vinculada a um membro do projeto. Desvincule-a antes de adicioná-la como membro próprio.",
     });
-    expect(filterCalls).toContainEqual({
+    expect(readCalls).toContainEqual(expect.objectContaining({
       table: "member_email_links",
-      method: "eq",
-      column: "linked_user_id",
-      value: "ownerUid",
-    });
+      filters: [["eq", "project_id", "p1"], ["eq", "linked_user_id", "ownerUid"]],
+    }));
     expect(writeCalls.filter((call) => call.op === "insert")).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 
   it("insert concorrente duplicado (23505) → mensagem de já membro", async () => {
     setAddCurrentOwnerContext({
-      linkedOwner: { data: null },
-      projectMembers: [
-        { data: null },
-        { error: { message: "duplicate key", code: "23505" } },
-      ],
+      linkedOwner: null,
+      projectMembers: false,
     });
+    adminRpcResults.add_project_member_with_identity_proof = { error: { message: "duplicate key", code: "23505" } };
     const add = await loadAdd();
 
     expect(await add("p1", "ja-tem@conta.com", "pesquisador")).toEqual({
@@ -881,15 +830,26 @@ describe("addMember (pré-registro de membro sem conta)", () => {
   });
 
   it("falha no pré-registro → erro amigável, sem insert em project_members", async () => {
-    adminTableResults = {
-      profiles: { data: null },
-      member_email_links: { data: null },
-    };
     hoisted.preregister.mockRejectedValueOnce(new Error("kaboom"));
     const add = await loadAdd();
     const r = await add("p1", "novo@exemplo.com", "pesquisador");
-    expect(r.error).toBe("Erro ao pré-registrar: kaboom");
+    expect(r.error).toBe("Não foi possível pré-registrar o membro. Tente novamente.");
     expect(writeCalls.filter((c) => c.op === "insert")).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
+  });
+
+  it("conflito estrutural no pré-registro mantém a mensagem própria, sem retry", async () => {
+    // O e-mail foi ativado (ou reclamado por uma conta Clerk) entre a leitura
+    // local e o pré-registro: "tente novamente" falharia do mesmo jeito.
+    const { ClerkIdentityConflictError } = await import("@/lib/clerk-sync");
+    hoisted.preregister.mockRejectedValueOnce(
+      new ClerkIdentityConflictError("Este e-mail já pertence a uma conta ativa"),
+    );
+    const add = await loadAdd();
+    const r = await add("p1", "novo@exemplo.com", "pesquisador");
+    expect(r.error).toBe("Este e-mail já pertence a uma conta ativa");
+    expect(writeCalls.filter((c) => c.op === "insert")).toEqual([]);
+    expectNoWriteRpc("add_project_member_with_identity_proof");
   });
 });
 
@@ -898,16 +858,19 @@ async function loadUpdatePendingEmail() {
 }
 
 describe("updatePendingMemberEmail — lookups fail-closed", () => {
-  it("delega a troca canônica ao Auth Admin sem duplicar a escrita do profile", async () => {
-    adminTableResults = {
-      project_members: [{ data: { id: "pm1" } }, { count: 2 }],
-      profiles: [
-        { data: { id: "member1", activated_at: null } },
-        { data: null },
+  beforeEach(() => {
+    adminRows = {
+      project_members: [
+        { id: "pm1", project_id: "p1", user_id: "member1" },
+        { id: "pm2", project_id: "p2", user_id: "member1" },
+        { id: "pm3", project_id: "p3", user_id: "member1" },
       ],
-      member_email_links: { data: null },
-      clerk_user_mapping: { data: null },
+      profiles: [{ id: "member1", activated_at: null }],
+      member_email_links: [],
+      clerk_user_mapping: [],
     };
+  });
+  it("delega a troca canônica ao Auth Admin sem duplicar a escrita do profile", async () => {
     const update = await loadUpdatePendingEmail();
 
     await expect(
@@ -922,15 +885,6 @@ describe("updatePendingMemberEmail — lookups fail-closed", () => {
   });
 
   it("propaga a rejeição transacional do Auth Admin sem publicar sucesso", async () => {
-    adminTableResults = {
-      project_members: { data: { id: "pm1" } },
-      profiles: [
-        { data: { id: "member1", activated_at: null } },
-        { data: null },
-      ],
-      member_email_links: { data: null },
-      clerk_user_mapping: { data: null },
-    };
     updateAuthUserById.mockResolvedValueOnce({
       data: { user: null },
       error: { message: "placeholder reclamado" },
@@ -938,83 +892,59 @@ describe("updatePendingMemberEmail — lookups fail-closed", () => {
     const update = await loadUpdatePendingEmail();
 
     await expect(update("p1", "member1", "novo@exemplo.com")).resolves.toEqual({
-      error: "Erro ao atualizar e-mail: placeholder reclamado",
+      error: copyWithRef("Não foi possível atualizar o e-mail. Tente novamente."),
     });
+    expectLogged("placeholder reclamado");
     expect(hoisted.revalidatePath).not.toHaveBeenCalled();
   });
 
   it.each([
     {
       label: "membership",
-      results: {
-        project_members: { error: { message: "membership indisponível" } },
-        profiles: [
-          { data: { id: "member1", activated_at: null } },
-          { data: null },
-        ],
-        member_email_links: { data: null },
-      },
+      key: "project_members:select:id",
       message: "membership indisponível",
     },
     {
       label: "perfil-alvo",
-      results: {
-        project_members: { data: { id: "pm1" } },
-        profiles: [
-          { error: { message: "perfil-alvo indisponível" } },
-          { data: null },
-        ],
-        member_email_links: { data: null },
-      },
+      key: "profiles:select:id, activated_at",
       message: "perfil-alvo indisponível",
     },
     {
       label: "dono do e-mail",
-      results: {
-        project_members: { data: { id: "pm1" } },
-        profiles: [
-          { data: { id: "member1", activated_at: null } },
-          { error: { message: "dono indisponível" } },
-        ],
-        member_email_links: { data: null },
-      },
+      key: "profiles:select:id",
       message: "dono indisponível",
     },
     {
       label: "vínculo do e-mail",
-      results: {
-        project_members: { data: { id: "pm1" } },
-        profiles: [
-          { data: { id: "member1", activated_at: null } },
-          { data: null },
-        ],
-        member_email_links: { error: { message: "vínculo indisponível" } },
-      },
+      filterColumn: "email",
       message: "vínculo indisponível",
+    },
+    {
+      label: "alias resolvido",
+      filterColumn: "member_user_id",
+      message: "alias indisponível",
     },
   ])(
     "falha em $label interrompe antes de mutações",
-    async ({ results, message }) => {
-      adminTableResults = results;
+    async ({ key, filterColumn, message }) => {
+      if (key) adminQueryErrors[key] = { message };
+      else adminQueryErrorForCall = ({ table, columns, filters }) =>
+        table === "member_email_links" && columns === "id" &&
+        filters.some(([kind, column]) => kind === "eq" && column === filterColumn)
+          ? { message } : undefined;
       const update = await loadUpdatePendingEmail();
 
       expect(await update("p1", "member1", "novo@exemplo.com")).toEqual({
-        error: message,
+        error: copyWithRef("Não foi possível atualizar o e-mail. Tente novamente."),
       });
+      expectLogged(message);
       expect(writeCalls).toEqual([]);
+      expect(updateAuthUserById).not.toHaveBeenCalled();
     },
   );
 
   it("profile pendente já mapeado não pode ter o e-mail alterado", async () => {
-    adminTableResults = {
-      project_members: { data: { id: "pm1" } },
-      profiles: [
-        { data: { id: "member1", activated_at: null } },
-        { data: null },
-      ],
-      member_email_links: { data: null },
-      clerk_user_mapping: { data: { clerk_user_id: "clerk_1" } },
-    };
+    adminRows.clerk_user_mapping = [{ supabase_user_id: "member1", clerk_user_id: "clerk_1" }];
     const update = await loadUpdatePendingEmail();
 
     expect(await update("p1", "member1", "novo@exemplo.com")).toEqual({
@@ -1022,24 +952,19 @@ describe("updatePendingMemberEmail — lookups fail-closed", () => {
         "Este membro já está vinculado a uma conta Clerk e não pode ter o e-mail de pré-registro alterado.",
     });
     expect(writeCalls).toEqual([]);
+    expect(updateAuthUserById).not.toHaveBeenCalled();
   });
 
   it("falha ao verificar mapping interrompe antes de alterar auth/profile", async () => {
-    adminTableResults = {
-      project_members: { data: { id: "pm1" } },
-      profiles: [
-        { data: { id: "member1", activated_at: null } },
-        { data: null },
-      ],
-      member_email_links: { data: null },
-      clerk_user_mapping: { error: { message: "mapping indisponível" } },
-    };
+    adminQueryErrors["clerk_user_mapping:select:supabase_user_id"] = { message: "mapping indisponível" };
     const update = await loadUpdatePendingEmail();
 
     expect(await update("p1", "member1", "novo@exemplo.com")).toEqual({
-      error: "mapping indisponível",
+      error: copyWithRef("Não foi possível verificar a identidade do membro. Tente novamente."),
     });
+    expectLogged("mapping indisponível");
     expect(writeCalls).toEqual([]);
+    expect(updateAuthUserById).not.toHaveBeenCalled();
   });
 });
 
@@ -1048,6 +973,20 @@ async function loadLink() {
 }
 
 describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
+  beforeEach(() => {
+    adminRows = {
+      project_members: [
+        { id: "membership1", project_id: "p1", user_id: "target1", role: "pesquisador" },
+        { id: "outside-project", project_id: "p2", user_id: "target1", role: "pesquisador" },
+        { id: "other-member", project_id: "p1", user_id: "otherUid", role: "pesquisador" },
+      ],
+      member_email_links: [],
+      profiles: [],
+      clerk_user_mapping: [],
+    };
+    adminRpcResults.preview_project_member_unification = { data: null };
+    adminRpcResults.write_member_email_link_with_identity_proof = { data: LINK_ROW };
+  });
   const LINK_ROW = {
     id: "link1",
     project_id: "p1",
@@ -1057,6 +996,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
     created_by: "userCoord",
     created_at: "2026-06-11T00:00:00Z",
   };
+  type LinkRow = Omit<typeof LINK_ROW, "linked_user_id"> & { linked_user_id: string | null };
 
   const OWNER_PROFILE = {
     id: "acc1",
@@ -1070,56 +1010,31 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
     email: "extra@exemplo.com",
     activated_at: "2026-05-01T00:00:00Z",
   };
-  const EMPTY_PREVIEW = { data: null };
-
-  function setEmptyTargetLinkContext() {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: { data: null },
-      profiles: { data: null },
-    };
-  }
 
   function setCurrentOwnerLinkContext({
     ownerUserId = "acc1",
-    projectMembers = [
-      { data: { role: "pesquisador" } },
-      { data: { role: "pesquisador" } },
-    ],
-    links = [{ data: null }, { data: null }],
-    profiles = [
-      { data: EMAIL_PROFILE },
-      { data: OWNER_PROFILE },
-      { data: EMAIL_PROFILE },
-    ],
+    initialLink = null,
+    savedLink = LINK_ROW,
+    profiles = [EMAIL_PROFILE, OWNER_PROFILE],
   }: {
     ownerUserId?: string;
-    projectMembers?: TableResult[];
-    links?: TableResult[];
-    profiles?: TableResult[];
+    initialLink?: LinkRow | null;
+    savedLink?: LinkRow;
+    profiles?: Array<{ id: string; first_name: string | null; email: string; activated_at: string | null }>;
   } = {}) {
     hoisted.reconcileClerkEmailOwner.mockResolvedValue({
       status: "resolved",
       userId: ownerUserId,
       snapshotVersion: 106,
     });
-    adminTableResults = {
-      project_members: projectMembers,
-      member_email_links: links,
-      profiles,
-    };
-    adminRpcResults.preview_project_member_unification = EMPTY_PREVIEW;
+    adminRows.member_email_links = initialLink ? [initialLink] : [];
+    adminRows.profiles = profiles;
+    adminRpcResults.write_member_email_link_with_identity_proof = { data: savedLink };
   }
 
   it("e-mail já vinculado a outro membro → valida antes de reconciliar", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: { data: { id: "l0", member_user_id: "outro1" } },
-      profiles: [
-        { data: null },
-        { data: { id: "outro1", first_name: "Ana", email: "ana@x.com" } },
-      ],
-    };
+    adminRows.member_email_links = [{ id: "l0", project_id: "p1", email: "extra@exemplo.com", member_user_id: "outro1" }];
+    adminRows.profiles = [{ id: "outro1", first_name: "Ana", email: "ana@x.com" }];
     const link = await loadLink();
     const r = await link("p1", "target1", "extra@exemplo.com");
     expect(r).toEqual({
@@ -1128,14 +1043,11 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
     });
     expect(hoisted.reconcileClerkEmailOwner).not.toHaveBeenCalled();
     expect(writeCalls.filter((c) => c.op === "insert")).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("target inexistente → valida antes de reconciliar", async () => {
-    adminTableResults = {
-      project_members: { data: null },
-      member_email_links: { data: null },
-      profiles: { data: null },
-    };
+    adminRows.project_members = [];
     const link = await loadLink();
 
     expect(await link("p1", "missing", "extra@exemplo.com")).toEqual({
@@ -1149,7 +1061,6 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
     hoisted.reconcileClerkEmailOwner.mockRejectedValue(
       new Error("Clerk indisponível"),
     );
-    setEmptyTargetLinkContext();
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1158,19 +1069,19 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
         "Não foi possível verificar a posse atual do e-mail. Tente novamente.",
     });
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("releitura após reconciliação perde o target → falha sem persistir", async () => {
-    hoisted.reconcileClerkEmailOwner.mockResolvedValue({
+    hoisted.reconcileClerkEmailOwner.mockImplementation(async () => {
+      adminRows.project_members = [];
+      return {
       status: "resolved",
       userId: "acc1",
       snapshotVersion: 107,
+      };
     });
-    adminTableResults = {
-      project_members: [{ data: { role: "pesquisador" } }, { data: null }],
-      member_email_links: [{ data: null }, { data: null }],
-      profiles: [{ data: null }, { data: OWNER_PROFILE }, { data: null }],
-    };
+    adminRows.profiles = [OWNER_PROFILE];
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1178,6 +1089,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       error: "Membro não encontrado neste projeto.",
     });
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("dono Clerk reconciliado sem profile Supabase → falha fechada", async () => {
@@ -1186,11 +1098,6 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       userId: "acc1",
       snapshotVersion: 108,
     });
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: { data: null },
-      profiles: [{ data: null }, { data: null }],
-    };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1198,6 +1105,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       error: "A conta verificada não possui profile Supabase.",
     });
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("e-mail verificado da própria conta alvo → não cria auto-vínculo", async () => {
@@ -1207,18 +1115,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       snapshotVersion: 109,
     });
     const targetProfile = { ...OWNER_PROFILE, id: "target1" };
-    adminTableResults = {
-      project_members: [
-        { data: { role: "pesquisador" } },
-        { data: { role: "pesquisador" } },
-      ],
-      member_email_links: [{ data: null }, { data: null }],
-      profiles: [
-        { data: targetProfile },
-        { data: targetProfile },
-        { data: targetProfile },
-      ],
-    };
+    adminRows.profiles = [{ ...targetProfile, email: "extra@exemplo.com" }];
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1226,21 +1123,20 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       error: "Este e-mail já pertence à conta deste membro.",
     });
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("profile administrativo que é membro → preview preserva linkEmail", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "coordenador" } },
-      member_email_links: { data: null },
-      profiles: {
-        data: {
+    adminRows.project_members = [
+      { id: "membership1", project_id: "p1", user_id: "target1", role: "coordenador" },
+      { id: "membership2", project_id: "p1", user_id: "src1", role: "pesquisador" },
+    ];
+    adminRows.profiles = [{
           id: "src1",
           first_name: "Beto",
           email: "beto@x.com",
           activated_at: null,
-        },
-      },
-    };
+    }];
     adminRpcResults.preview_project_member_unification = {
       data: {
         assignments_to_migrate: 7,
@@ -1272,14 +1168,12 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       p_target_user_id: "target1",
     });
     expect(writeCalls.filter((c) => c.op === "insert")).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("falha na RPC de preview → não persiste vínculo", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: { data: null },
-      profiles: { data: EMAIL_PROFILE },
-    };
+    adminRows.profiles = [EMAIL_PROFILE];
+    adminRows.project_members.push({ id: "membership2", project_id: "p1", user_id: "legacy1", role: "pesquisador" });
     adminRpcResults.preview_project_member_unification = {
       error: { message: "preview indisponível" },
     };
@@ -1287,19 +1181,17 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
       status: "error",
-      error: "preview indisponível",
+      error: copyWithRef("Não foi possível preparar a unificação dos membros. Tente novamente."),
     });
+    expectLogged("preview indisponível");
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("dono atual e placeholder com o mesmo id geram um único preview", async () => {
     const pendingOwner = { ...OWNER_PROFILE, activated_at: null };
     setCurrentOwnerLinkContext({
-      profiles: [
-        { data: pendingOwner },
-        { data: pendingOwner },
-        { data: pendingOwner },
-      ],
+      profiles: [{ ...pendingOwner, email: "extra@exemplo.com" }],
     });
     adminRpcResults.preview_project_member_unification = {
       data: {
@@ -1324,11 +1216,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
 
   it("conta Clerk atual não-membro → usa ownerProfile e marca acesso pronto", async () => {
     setCurrentOwnerLinkContext({
-      links: [
-        { data: null },
-        { data: null },
-        { data: { ...LINK_ROW, linked_user_id: "acc1" } },
-      ],
+      savedLink: { ...LINK_ROW, linked_user_id: "acc1" },
     });
     const link = await loadLink();
     const r = await link("p1", "target1", "Extra@Exemplo.com");
@@ -1355,7 +1243,8 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
     const staleLink = { ...LINK_ROW, linked_user_id: "legacy1" };
     const resolvedLink = { ...LINK_ROW, linked_user_id: "acc1" };
     setCurrentOwnerLinkContext({
-      links: [{ data: staleLink }, { data: staleLink }, { data: resolvedLink }],
+      initialLink: staleLink,
+      savedLink: resolvedLink,
     });
     const link = await loadLink();
 
@@ -1376,11 +1265,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
 
   it("ignora profile ativo histórico quando o Clerk confirma outro dono atual", async () => {
     setCurrentOwnerLinkContext({
-      links: [
-        { data: null },
-        { data: null },
-        { data: { ...LINK_ROW, linked_user_id: "acc1" } },
-      ],
+      savedLink: { ...LINK_ROW, linked_user_id: "acc1" },
     });
     const link = await loadLink();
     const result = await link("p1", "target1", "extra@exemplo.com");
@@ -1405,12 +1290,12 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
 
   it("placeholder pendente e dono atual membros → não adivinha a origem", async () => {
     setCurrentOwnerLinkContext({
-      profiles: [
-        { data: { ...EMAIL_PROFILE, activated_at: null } },
-        { data: OWNER_PROFILE },
-        { data: { ...EMAIL_PROFILE, activated_at: null } },
-      ],
+      profiles: [{ ...EMAIL_PROFILE, activated_at: null }, OWNER_PROFILE],
     });
+    adminRows.project_members.push(
+      { id: "membership2", project_id: "p1", user_id: "legacy1", role: "pesquisador" },
+      { id: "membership3", project_id: "p1", user_id: "acc1", role: "pesquisador" },
+    );
     const conflictPreview = {
       data: {
         assignments_to_migrate: 1,
@@ -1431,14 +1316,15 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       error:
         "O e-mail envolve mais de uma identidade existente no projeto; resolva-as separadamente.",
     });
+    expect(rpcCalls.filter((call) => call.fn === "preview_project_member_unification")
+      .map((call) => (call.args as { p_source_user_id: string }).p_source_user_id)
+      .sort()).toEqual(["acc1", "legacy1"]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("profile ativo sem dono Clerk confirmado → falha fechada", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: { data: null },
-      profiles: { data: EMAIL_PROFILE },
-    };
+    adminRows.profiles = [EMAIL_PROFILE];
+    adminRows.project_members.push({ id: "membership2", project_id: "p1", user_id: "legacy1", role: "pesquisador" });
     adminRpcResults.preview_project_member_unification = {
       data: {
         assignments_to_migrate: 1,
@@ -1458,19 +1344,13 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
   });
 
   it("profile pendente já mapeado e sem dono exato não vira vínculo", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: { data: null },
-      profiles: {
-        data: {
+    adminRows.profiles = [{
           id: "claimedUid",
           first_name: null,
           email: "extra@exemplo.com",
           activated_at: null,
-        },
-      },
-      clerk_user_mapping: { data: { supabase_user_id: "claimedUid" } },
-    };
+    }];
+    adminRows.clerk_user_mapping = [{ supabase_user_id: "claimedUid" }];
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1479,11 +1359,11 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
         "Este e-mail pertence a uma identidade Clerk diferente e não pode ser reutilizado como pré-registro.",
     });
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("posse alterada durante a operação não degrada para vínculo pendente", async () => {
     hoisted.reconcileClerkEmailOwner.mockResolvedValue({ status: "changed" });
-    setEmptyTargetLinkContext();
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1491,6 +1371,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       error: "A posse verificada do e-mail mudou. Tente novamente.",
     });
     expect(writeCalls).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 
   it("profile pré-registrado preserva a identidade conhecida como pendente", async () => {
@@ -1498,18 +1379,13 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       ...LINK_ROW,
       linked_user_id: "placeholder1",
     };
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [{ data: null }, { data: knownPendingLink }],
-      profiles: {
-        data: {
+    adminRows.profiles = [{
           id: "placeholder1",
           first_name: null,
           email: "extra@exemplo.com",
           activated_at: null,
-        },
-      },
-    };
+    }];
+    adminRpcResults.write_member_email_link_with_identity_proof = { data: knownPendingLink };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1531,18 +1407,14 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
 
   it("retry de vínculo pendente resolve profile que passou a ser conhecido", async () => {
     const resolvedLink = { ...LINK_ROW, linked_user_id: "placeholder1" };
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [{ data: LINK_ROW }, { data: resolvedLink }],
-      profiles: {
-        data: {
+    adminRows.member_email_links = [LINK_ROW];
+    adminRows.profiles = [{
           id: "placeholder1",
           first_name: null,
           email: "extra@exemplo.com",
           activated_at: null,
-        },
-      },
-    };
+    }];
+    adminRpcResults.write_member_email_link_with_identity_proof = { data: resolvedLink };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1566,18 +1438,14 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
   it("vínculo antigo perde dono Clerk → limpa linked_user_id por CAS", async () => {
     const staleLink = { ...LINK_ROW, linked_user_id: "stale-owner" };
     const pendingLink = { ...LINK_ROW, linked_user_id: null };
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [{ data: staleLink }, { data: pendingLink }],
-      profiles: {
-        data: {
+    adminRows.member_email_links = [staleLink];
+    adminRows.profiles = [{
           id: "target1",
           first_name: "Target",
           email: "extra@exemplo.com",
           activated_at: "2026-01-01",
-        },
-      },
-    };
+    }];
+    adminRpcResults.write_member_email_link_with_identity_proof = { data: pendingLink };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1596,18 +1464,14 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
   });
 
   it("CAS sem linha → informa alteração concorrente", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [{ data: LINK_ROW }, { data: null }],
-      profiles: {
-        data: {
+    adminRows.member_email_links = [LINK_ROW];
+    adminRows.profiles = [{
           id: "placeholder1",
           first_name: null,
           email: "extra@exemplo.com",
           activated_at: null,
-        },
-      },
-    };
+    }];
+    adminRpcResults.write_member_email_link_with_identity_proof = { data: [] };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1617,21 +1481,14 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
   });
 
   it("CAS que viola identidade terminal → pede nova revisão da unificação", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [
-        { data: LINK_ROW },
-        { error: { message: "check", code: "23514" } },
-      ],
-      profiles: {
-        data: {
+    adminRows.member_email_links = [LINK_ROW];
+    adminRows.profiles = [{
           id: "placeholder1",
           first_name: null,
           email: "extra@exemplo.com",
           activated_at: null,
-        },
-      },
-    };
+    }];
+    adminRpcResults.write_member_email_link_with_identity_proof = { error: { message: "check", code: "23514" } };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1642,11 +1499,6 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
   });
 
   it("e-mail sem conta → insert com linked_user_id NULL e acesso pendente", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [{ data: null }, { data: LINK_ROW }],
-      profiles: { data: null },
-    };
     const link = await loadLink();
     const r = await link("p1", "target1", "extra@exemplo.com");
     expect(r.status).toBe("linked");
@@ -1669,20 +1521,10 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
     const resolvedLink = { ...LINK_ROW, linked_user_id: "late-owner" };
     hoisted.reconcileClerkEmailOwner
       .mockResolvedValueOnce({ status: "unowned" })
-      .mockResolvedValueOnce({
-        status: "resolved",
-        userId: "late-owner",
-        snapshotVersion: 120,
+      .mockImplementationOnce(async () => {
+        adminRows.member_email_links = [resolvedLink];
+        return { status: "resolved", userId: "late-owner", snapshotVersion: 120 };
       });
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [
-        { data: null },
-        { data: LINK_ROW },
-        { data: resolvedLink },
-      ],
-      profiles: { data: null },
-    };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1694,14 +1536,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
   });
 
   it("insert concorrente duplicado → retorna erro de vínculo existente", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: [
-        { data: null },
-        { error: { message: "duplicate", code: "23505" } },
-      ],
-      profiles: { data: null },
-    };
+    adminRpcResults.write_member_email_link_with_identity_proof = { error: { message: "duplicate", code: "23505" } };
     const link = await loadLink();
 
     expect(await link("p1", "target1", "extra@exemplo.com")).toEqual({
@@ -1711,13 +1546,7 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
   });
 
   it("e-mail de pré-registro do próprio membro → erro sem insert", async () => {
-    adminTableResults = {
-      project_members: { data: { role: "pesquisador" } },
-      member_email_links: { data: null },
-      profiles: {
-        data: { id: "target1", first_name: null, email: "eu@x.com" },
-      },
-    };
+    adminRows.profiles = [{ id: "target1", first_name: null, email: "eu@x.com", activated_at: null }];
     const link = await loadLink();
     const r = await link("p1", "target1", "eu@x.com");
     expect(r).toEqual({
@@ -1725,14 +1554,13 @@ describe("linkMemberEmail (vínculo de e-mails adicionais a um membro)", () => {
       error: "Este já é o e-mail de pré-registro deste membro.",
     });
     expect(writeCalls.filter((c) => c.op === "insert")).toEqual([]);
+    expectNoWriteRpc("write_member_email_link_with_identity_proof");
   });
 });
 
 describe("unlinkMemberEmail", () => {
   it("usa o client da sessão para aplicar o RLS do coordenador", async () => {
-    serverTableResults = {
-      member_email_links: { data: null },
-    };
+    serverRows = { member_email_links: [{ id: "link1", project_id: "p1" }] };
     const { unlinkMemberEmail } = await import("@/actions/members");
 
     expect(await unlinkMemberEmail("p1", "link1")).toEqual({});
@@ -1741,23 +1569,8 @@ describe("unlinkMemberEmail", () => {
       table: "member_email_links",
       op: "delete",
       payload: null,
+      filters: [["eq", "id", "link1"], ["eq", "project_id", "p1"]],
     });
-    expect(filterCalls).toEqual(
-      expect.arrayContaining([
-        {
-          table: "member_email_links",
-          method: "eq",
-          column: "id",
-          value: "link1",
-        },
-        {
-          table: "member_email_links",
-          method: "eq",
-          column: "project_id",
-          value: "p1",
-        },
-      ]),
-    );
   });
 });
 
@@ -1774,8 +1587,8 @@ describe("unifyMembers", () => {
     email: string,
     activatedAt: string | null,
   ) {
-    adminTableResults = {
-      profiles: { data: { email, activated_at: activatedAt } },
+    adminRows = {
+      profiles: [{ id: "source", email, activated_at: activatedAt }],
     };
     adminRpcResults.preview_project_member_unification = {
       data: NO_CONFLICTS,
@@ -1797,10 +1610,8 @@ describe("unifyMembers", () => {
       userId: "source",
       snapshotVersion: 110,
     });
-    adminTableResults = {
-      profiles: {
-        data: { email: "Source@Example.com", activated_at: "2026-01-01" },
-      },
+    adminRows = {
+      profiles: [{ id: "source", email: "Source@Example.com", activated_at: "2026-01-01" }],
     };
     adminRpcResults = {
       preview_project_member_unification: { data: NO_CONFLICTS },
@@ -1826,17 +1637,11 @@ describe("unifyMembers", () => {
     expect(hoisted.revalidatePath).toHaveBeenCalledWith(
       "/projects/p1/analyze/assignments",
     );
-    expect(hoisted.revalidateTag).toHaveBeenCalledWith(
-      "project-p1-members",
-      expect.anything(),
-    );
   });
 
   it("pré-registro pendente sem conta Clerk pode ser unificado pelo próprio e-mail", async () => {
-    adminTableResults = {
-      profiles: {
-        data: { email: "pending@example.com", activated_at: null },
-      },
+    adminRows = {
+      profiles: [{ id: "source", email: "pending@example.com", activated_at: null }],
     };
     adminRpcResults = {
       preview_project_member_unification: { data: NO_CONFLICTS },
@@ -1854,11 +1659,9 @@ describe("unifyMembers", () => {
   });
 
   it("source pendente já mapeado e sem dono exato não pode ser unificado", async () => {
-    adminTableResults = {
-      profiles: {
-        data: { email: "pending@example.com", activated_at: null },
-      },
-      clerk_user_mapping: { data: { supabase_user_id: "source" } },
+    adminRows = {
+      profiles: [{ id: "source", email: "pending@example.com", activated_at: null }],
+      clerk_user_mapping: [{ supabase_user_id: "source" }],
     };
     adminRpcResults.preview_project_member_unification = {
       data: NO_CONFLICTS,
@@ -1874,7 +1677,7 @@ describe("unifyMembers", () => {
   });
 
   it("profile de origem ausente → falha antes de provar identidade", async () => {
-    adminTableResults = { profiles: { data: null } };
+    adminRows = { profiles: [] };
     adminRpcResults.preview_project_member_unification = {
       data: NO_CONFLICTS,
     };
@@ -1887,8 +1690,8 @@ describe("unifyMembers", () => {
   });
 
   it("preview ausente → trata membros como indisponíveis", async () => {
-    adminTableResults = {
-      profiles: { data: { email: "source@example.com", activated_at: null } },
+    adminRows = {
+      profiles: [{ id: "source", email: "source@example.com", activated_at: null }],
     };
     adminRpcResults.preview_project_member_unification = { data: null };
     const { unifyMembers } = await import("@/actions/members");
@@ -1904,10 +1707,8 @@ describe("unifyMembers", () => {
   it.each(["arbitration_conflicts", "comparison_conflicts"] as const)(
     "conflito em %s bloqueia a unificação",
     async (conflictField) => {
-      adminTableResults = {
-        profiles: {
-          data: { email: "source@example.com", activated_at: null },
-        },
+      adminRows = {
+        profiles: [{ id: "source", email: "source@example.com", activated_at: null }],
       };
       adminRpcResults.preview_project_member_unification = {
         data: { ...NO_CONFLICTS, [conflictField]: 1 },
@@ -1962,10 +1763,8 @@ describe("unifyMembers", () => {
       userId: "owner-account",
       snapshotVersion: 111,
     });
-    adminTableResults = {
-      profiles: {
-        data: { email: "pending@example.com", activated_at: null },
-      },
+    adminRows = {
+      profiles: [{ id: "placeholder", email: "pending@example.com", activated_at: null }],
     };
     adminRpcResults = {
       preview_project_member_unification: { data: NO_CONFLICTS },
@@ -2018,13 +1817,9 @@ describe("unifyMembers", () => {
       userId: "third-party",
       snapshotVersion: 113,
     });
-    adminTableResults = {
-      profiles: {
-        data: {
-          email: "administrative@example.com",
-          activated_at: "2026-01-01",
-        },
-      },
+    adminRows = {
+      profiles: [{ id: "source", email: "administrative@example.com",
+          activated_at: "2026-01-01", }],
     };
     adminRpcResults.preview_project_member_unification = {
       data: NO_CONFLICTS,
@@ -2050,10 +1845,8 @@ describe("unifyMembers", () => {
       userId: "new-owner",
       snapshotVersion: 114,
     });
-    adminTableResults = {
-      profiles: {
-        data: { email: "reassigned@example.com", activated_at: "2026-01-01" },
-      },
+    adminRows = {
+      profiles: [{ id: "source", email: "reassigned@example.com", activated_at: "2026-01-01" }],
     };
     adminRpcResults.preview_project_member_unification = {
       data: NO_CONFLICTS,
@@ -2071,8 +1864,8 @@ describe("unifyMembers", () => {
   });
 
   it("não executa quando a releitura do preview encontra conflito", async () => {
-    adminTableResults = {
-      profiles: { data: { email: "source@example.com", activated_at: null } },
+    adminRows = {
+      profiles: [{ id: "source", email: "source@example.com", activated_at: null }],
     };
     adminRpcResults.preview_project_member_unification = {
       data: { ...NO_CONFLICTS, review_conflicts: 1 },
@@ -2090,8 +1883,8 @@ describe("unifyMembers", () => {
   });
 
   it("propaga falha da RPC sem revalidar caches", async () => {
-    adminTableResults = {
-      profiles: { data: { email: "source@example.com", activated_at: null } },
+    adminRows = {
+      profiles: [{ id: "source", email: "source@example.com", activated_at: null }],
     };
     adminRpcResults = {
       preview_project_member_unification: { data: NO_CONFLICTS },
@@ -2103,6 +1896,5 @@ describe("unifyMembers", () => {
       await unifyMembers("p1", "source", "target", "source@example.com"),
     ).toEqual({ error: "conflito concorrente" });
     expect(hoisted.revalidatePath).not.toHaveBeenCalled();
-    expect(hoisted.revalidateTag).not.toHaveBeenCalled();
   });
 });

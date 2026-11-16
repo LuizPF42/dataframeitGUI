@@ -2,6 +2,10 @@
 
 - o ruff do pre-commit é o de ``uv.lock`` (``uv run``), sem ``rev`` próprio
   (porquê: comentário do hook em ``.pre-commit-config.yaml``; #554).
+- todo hook de repositório remoto pina o ``rev`` pelo SHA do commit, com a tag
+  em ``# frozen: <tag>``, e não pela tag, que é ponteiro móvel (#555).
+- o pre-commit dos workflows é o de ``.github/ci-tools/uv.lock``, que o
+  Dependabot atualiza, e não uma versão escrita no workflow.
 - ``.python-version`` == Python do ``Dockerfile`` == ``python_version`` do
   mypy. Sem o pino, o ``uv`` local pegava o Python mais novo instalado (3.15),
   para o qual o lock não tem wheel do tiktoken.
@@ -122,6 +126,71 @@ def test_ruff_hook_problems_flags_second_pin() -> None:
     assert any("backend/uv.lock" in p for p in problems), problems
 
 
+def _remote_revs(config: str) -> list[tuple[str, str]]:
+    """``(repo, rev)`` de cada repositório remoto, com o comentário do ``rev``.
+
+    O bloco vai de um ``- repo:`` ao próximo, então a URL pode ter qualquer
+    forma e o ``rev`` pode vir em qualquer posição do bloco. O YAML não serve:
+    o comentário ``# frozen:`` é justamente o que ele descarta.
+    """
+    revs = []
+    for block in re.split(r"^\s*- repo:", config, flags=re.MULTILINE)[1:]:
+        repo = block.split(maxsplit=1)[0]
+        if repo in ("local", "meta"):
+            continue
+        rev = re.search(r"^\s*rev:\s*(.*)$", block, re.MULTILINE)
+        revs.append((repo, rev.group(1).strip() if rev else "(ausente)"))
+    return revs
+
+
+def _remote_rev_problems(revs: list[tuple[str, str]]) -> list[str]:
+    """Repositórios remotos cujo ``rev`` não é SHA com ``# frozen: <tag>``."""
+    return [
+        f"{repo} em .pre-commit-config.yaml com `rev: {rev}`: pine pelo SHA "
+        "do commit com `# frozen: <tag>` (#555)."
+        for repo, rev in revs
+        if not re.fullmatch(r"[0-9a-f]{40}\s+# frozen: \S.*", rev)
+    ]
+
+
+def test_remote_hooks_pinned_by_frozen_sha() -> None:
+    revs = _remote_revs((REPO / ".pre-commit-config.yaml").read_text())
+    assert revs, "nenhum repositório remoto achado: o teste não confere nada"
+    problems = _remote_rev_problems(revs)
+    assert not problems, "\n".join(problems)
+
+
+def test_remote_rev_problems_flags_tag_pin() -> None:
+    # Prova do vermelho: o pin por tag de antes reprova, em qualquer forma de
+    # URL e de ordem das chaves; SHA sem o comentário (o Dependabot não saberia
+    # a tag) e SHA abreviado também. `local` e `meta` não têm `rev`.
+    sha = "83d9cd684c87d95d656c1458ef04895a7f1cbd8e"
+    config = (
+        "  - repo: https://github.com/gitleaks/gitleaks\n"
+        "    rev: v8.30.1\n"
+        "  - repo: git@github.com:org/hook.git\n"
+        "    hooks:\n"
+        "      - id: hook\n"
+        "    rev: v1.0.0\n"
+        "  - repo: https://github.com/rhysd/actionlint\n"
+        f"    rev: {sha}\n"
+        "  - repo: https://github.com/pre-commit/pre-commit-hooks\n"
+        f"    rev: {sha[:12]}  # frozen: v6.0.0\n"
+        "  - repo: local\n"
+        "    hooks:\n"
+        "      - id: ruff-check\n"
+        "  - repo: https://github.com/example/ok\n"
+        f"    rev: {sha}  # frozen: release-1.2 (ver #555)\n"
+    )
+    problems = _remote_rev_problems(_remote_revs(config))
+    assert [p.split(" ")[0] for p in problems] == [
+        "https://github.com/gitleaks/gitleaks",
+        "git@github.com:org/hook.git",
+        "https://github.com/rhysd/actionlint",
+        "https://github.com/pre-commit/pre-commit-hooks",
+    ], problems
+
+
 def test_python_version_matches_dockerfile_and_mypy() -> None:
     pinned = (BACKEND / ".python-version").read_text().strip()
     match = re.search(
@@ -141,16 +210,78 @@ def test_python_version_matches_dockerfile_and_mypy() -> None:
 
 
 def test_uv_version_matches_dockerfile() -> None:
-    """O uv do contrato de banco no CI (#674) é o mesmo da imagem do backend."""
+    """O uv de todo workflow (#674, #649) é o mesmo da imagem do backend."""
     docker = re.search(
         r"ghcr\.io/astral-sh/uv:(\S+)", (BACKEND / "Dockerfile").read_text()
     )
-    workflow = re.search(
-        r"astral-sh/setup-uv@.*\n\s*with:\n(?:\s*#.*\n)*\s*version:\s*\"([^\"]+)\"",
-        (REPO / ".github/workflows/database-tests.yml").read_text(),
-    )
     assert docker, "uv não encontrado em backend/Dockerfile"
-    assert workflow, "setup-uv sem `version` em .github/workflows/database-tests.yml"
-    assert docker.group(1) == workflow.group(1), (
-        f"uv diverge: Dockerfile {docker.group(1)}, database-tests.yml {workflow.group(1)}"
+    workflows = sorted((REPO / ".github/workflows").glob("*.yml"))
+    uses = 0
+    for workflow in workflows:
+        text = workflow.read_text()
+        versions = re.findall(
+            r"astral-sh/setup-uv@.*\n\s*with:\n(?:\s*#.*\n)*\s*version:\s*\"([^\"]+)\"",
+            text,
+        )
+        count = text.count("astral-sh/setup-uv@")
+        uses += count
+        assert len(versions) == count, f"setup-uv sem `version` em {workflow.name}"
+        assert set(versions) <= {docker.group(1)}, (
+            f"uv diverge: Dockerfile {docker.group(1)}, {workflow.name} {versions}"
+        )
+    assert uses, "nenhum workflow usa astral-sh/setup-uv"
+
+
+_LOCKED_PRE_COMMIT = "uv run --locked --project .github/ci-tools pre-commit "
+
+
+def _workflow_pre_commit_problems(name: str, workflow: str) -> list[str]:
+    """Chamadas do pre-commit em ``workflow`` que não usam o de ci-tools."""
+    problems = []
+    for line in workflow.splitlines():
+        stripped = line.strip()
+        # Comentário e nome de passo citam o comando sem rodá-lo.
+        if stripped.startswith(("#", "- name:", "name:")) or not re.search(
+            r"\bpre-commit\S* run\b", line
+        ):
+            continue
+        if _LOCKED_PRE_COMMIT not in line:
+            problems.append(
+                f"{name}: `{stripped}` não roda o pre-commit de "
+                f".github/ci-tools/uv.lock (`{_LOCKED_PRE_COMMIT.strip()}`): pino "
+                "escrito no workflow fica fora do alcance do Dependabot."
+            )
+    return problems
+
+
+def test_workflows_run_locked_pre_commit() -> None:
+    calls = 0
+    for workflow in sorted((REPO / ".github/workflows").glob("*.yml")):
+        text = workflow.read_text()
+        calls += text.count(_LOCKED_PRE_COMMIT)
+        problems = _workflow_pre_commit_problems(workflow.name, text)
+        assert not problems, "\n".join(problems)
+    assert calls, "nenhum workflow roda o pre-commit: o teste não confere nada"
+
+    # O Dependabot só alcança o pino com a entrada de `uv` no diretório. O
+    # projeto e o lock quem confere é o próprio `uv run --locked`.
+    assert re.search(
+        r'package-ecosystem: "uv"\n\s*directory: "/\.github/ci-tools"',
+        (REPO / ".github/dependabot.yml").read_text(),
+    ), "dependabot.yml sem entrada de `uv` para /.github/ci-tools"
+
+
+def test_workflow_pre_commit_problems_flags_hand_pin() -> None:
+    # Prova do vermelho: o pino à mão de antes reprova, com ou sem versão; a
+    # chamada pelo lock e a menção em comentário passam.
+    workflow = (
+        "      # uvx pre-commit@4.7.0 run era o pino de antes\n"
+        "        run: uvx pre-commit@4.7.0 run --all-files ruff-check\n"
+        "      - name: pre-commit run de tudo\n"
+        "        run: pre-commit run --all-files\n"
+        f"        run: {_LOCKED_PRE_COMMIT}run --all-files\n"
     )
+    problems = _workflow_pre_commit_problems("ci.yml", workflow)
+    assert len(problems) == 2, problems
+    assert "uvx pre-commit@4.7.0 run" in problems[0]
+    assert "`run: pre-commit run --all-files`" in problems[1]

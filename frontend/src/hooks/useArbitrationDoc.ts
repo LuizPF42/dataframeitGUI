@@ -3,6 +3,8 @@
 import { useCallback, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
+import { withErrorCode } from "@/lib/server-error";
+import { withActionTimeout } from "@/lib/action-timeout";
 import {
   submitBlindVerdicts,
   submitFinalVerdicts,
@@ -144,7 +146,9 @@ export function useArbitrationDoc({
       }));
     try {
       if (choices.length > 0) {
-        const r = await submitBlindVerdicts(projectId, doc.docId, choices);
+        const r = await withActionTimeout(
+          submitBlindVerdicts(projectId, doc.docId, choices),
+        );
         if (!r.success) {
           toast.error(r.error ?? "Falha ao registrar veredito cego");
           return;
@@ -152,7 +156,7 @@ export function useArbitrationDoc({
       }
     } catch (error) {
       console.error("[useArbitrationDoc] erro ao registrar veredito cego", error);
-      toast.error("Não foi possível registrar o veredito cego. Tente novamente.");
+      toast.error(withErrorCode(error, "Não foi possível registrar o veredito cego. Tente novamente."));
       return;
     } finally {
       setSubmitting(false);
@@ -189,10 +193,12 @@ export function useArbitrationDoc({
     }));
     let r: Awaited<ReturnType<typeof submitFinalVerdicts>>;
     try {
-      r = await submitFinalVerdicts(projectId, doc.docId, payload);
+      r = await withActionTimeout(
+        submitFinalVerdicts(projectId, doc.docId, payload),
+      );
     } catch (error) {
       console.error("[useArbitrationDoc] erro ao enviar veredito final", error);
-      toast.error("Não foi possível enviar o veredito final. Tente novamente.");
+      toast.error(withErrorCode(error, "Não foi possível enviar o veredito final. Tente novamente."));
       return;
     } finally {
       setSubmitting(false);

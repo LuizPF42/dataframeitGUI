@@ -1,3 +1,5 @@
+import { serverErrorCopy } from "@/lib/server-error";
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 /** Session token indisponível (deslogado ou sessão expirada). Distinto de um 401
@@ -21,6 +23,41 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+// Reason phrase que o roteador do Starlette devolve como `detail` para rota ou
+// método inexistente (frontend publicado antes do backend, que tem deploy
+// próprio): inglês de protocolo, não copy.
+const ROUTER_DEFAULT_DETAIL: Record<number, string> = {
+  404: "Not Found",
+  405: "Method Not Allowed",
+};
+
+/** Texto do toast para uma resposta não-ok. O `detail` string do backend é copy
+ * pt-BR escrita para o usuário (4xx e os 503 da autenticação) e passa como está.
+ * O resto é diagnóstico e vai para o log: o 422 de validação do FastAPI, cujo
+ * `detail` é uma lista de objetos; o corpo que não é JSON (HTML de proxy), de
+ * que só sobra o `statusText` em inglês; o 500, que o backend colapsa em
+ * "Internal Server Error"; e o 404/405 padrão do roteador. */
+function apiErrorCopy(path: string, status: number, statusText: string, body: unknown): string {
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  const isCopy =
+    typeof detail === "string" &&
+    detail !== "" &&
+    status !== 500 &&
+    detail !== ROUTER_DEFAULT_DETAIL[status];
+  if (isCopy) return detail;
+  const raw = typeof detail === "string" || detail === undefined ? detail : JSON.stringify(detail);
+  return serverErrorCopy(
+    `[api] ${path} falhou`,
+    { code: String(status), message: raw || statusText },
+    {
+      generic:
+        status >= 500
+          ? `Erro no servidor (HTTP ${status}). Tente novamente.`
+          : `O servidor recusou a requisição (HTTP ${status}).`,
+    },
+  );
 }
 
 type GetToken = () => Promise<string | null>;
@@ -66,8 +103,8 @@ export async function fetchFastAPI<T>(
   });
 
   if (!res.ok) {
-    const error = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new ApiError(error.detail || `API error: ${res.status}`, res.status);
+    const body: unknown = await res.json().catch(() => null);
+    throw new ApiError(apiErrorCopy(path, res.status, res.statusText, body), res.status);
   }
 
   return res.json();

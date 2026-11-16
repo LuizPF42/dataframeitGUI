@@ -1,9 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { maskedServerError } from "@/test-utils/masked-server-error";
+import { caughtErrorCopy, errorCode, errorDetail, withErrorCode } from "@/lib/server-error";
 import {
   classifyNotFound,
+  describeErrorScreen,
+  describeFinalUrl,
   describeNavigation,
+  describeToastCode,
+  isToastCode,
   readRscPayload,
   redactUrl,
+  TOAST_CODE_PATTERN,
   type NavigationRecord,
 } from "../../../e2e/navigation-diagnostics";
 
@@ -143,5 +150,97 @@ describe("describeNavigation", () => {
 
   it("mostra só status quando não há veredito", () => {
     expect(describeNavigation(record({ status: 500 }))).toBe("GET /projects/p1/analyze/code → 500");
+  });
+});
+
+describe("describeFinalUrl", () => {
+  it("aponta o redirecionamento ao login e redige os parâmetros do Clerk", () => {
+    const line = describeFinalUrl(
+      "http://localhost:3100/auth/login?redirect_url=%2Fprojects%2Fp1&__clerk_db_jwt=segredo",
+    );
+    expect(line).toContain("tela de login");
+    expect(line).toContain("__clerk_db_jwt=%3Comitido%3E");
+    expect(line).not.toContain("segredo");
+  });
+
+  it("reconhece o login hospedado do Clerk e redige o token dentro do redirect_url", () => {
+    const line = describeFinalUrl(
+      "https://inst.accounts.dev/sign-in?redirect_url=" +
+        encodeURIComponent("http://localhost:3100/projects/p1?__clerk_db_jwt=segredo"),
+    );
+    expect(line).toContain("tela de login");
+    expect(line).not.toContain("segredo");
+  });
+
+  it("acrescenta a tela de erro de servidor lida do texto da página (#527)", () => {
+    const text = `Algo deu errado\n${errorDetail({ digest: "1903308217" })}\nTentar de novo`;
+    const line = describeFinalUrl("http://localhost:3100/projects/p1/analyze/code", text);
+    expect(line).toMatch(/^http:\/\/localhost:3100\/projects\/p1\/analyze\/code — tela de erro de servidor/);
+    expect(line).toContain(`"[erro ${errorCode({ digest: "1903308217" })}]"`);
+  });
+
+  it("página do app sai como veio, sem o aviso de login", () => {
+    expect(describeFinalUrl("http://localhost:3100/projects/p1/analyze/code")).toBe(
+      "http://localhost:3100/projects/p1/analyze/code",
+    );
+    expect(describeFinalUrl("about:blank")).toBe("about:blank");
+  });
+});
+
+// O código da tela vem de `errorDetail`, que o ErrorPanel dos boundaries
+// renderiza; o do log vem de `errorCode`, que o `onRequestError` usa. Ler o
+// texto do produtor real, e não uma cópia da string, faz este teste quebrar se
+// o painel mudar o formato e o diagnóstico deixar de achar o código.
+describe("describeErrorScreen", () => {
+  it("lê do painel o mesmo código que o servidor loga", () => {
+    const digest = "1903308217";
+    const code = errorCode({ digest });
+    expect(code).not.toBeNull();
+    expect(describeErrorScreen(`Algo deu errado ${errorDetail({ digest })}`)).toContain(
+      `"[erro ${code}]"`,
+    );
+  });
+
+  it("erro do navegador, sem código, e página normal ficam sem veredito", () => {
+    expect(describeErrorScreen(`Algo deu errado ${errorDetail(new Error("falhou"))}`)).toBeNull();
+    expect(describeErrorScreen("Resumo do documento\nObservação livre")).toBeNull();
+    expect(describeErrorScreen("")).toBeNull();
+  });
+});
+
+// O toast recebe a copy dos produtores reais: `caughtErrorCopy` no servidor
+// (este arquivo roda em node, sem `window`, como a Server Action) e
+// `withErrorCode` no cliente. O código lido do fim da copy tem de ser o da
+// linha `[erro X]` do log.
+describe("código do toast", () => {
+  const pattern = new RegExp(TOAST_CODE_PATTERN);
+
+  it("lê da copy do servidor o mesmo código que a linha do log", () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const copy = caughtErrorCopy("[coding] salvar falhou", new Error("rls"), "Erro ao salvar");
+      const code = pattern.exec(copy)?.[1];
+      expect(code).toBeDefined();
+      expect(String(log.mock.calls[0]?.[0])).toMatch(new RegExp(`^\\[erro ${code}\\] `));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("lê da copy do cliente o código do digest", () => {
+    const error = maskedServerError();
+    expect(pattern.exec(withErrorCode(error, "Erro ao enviar"))?.[1]).toBe(errorCode(error));
+  });
+
+  it("copy sem código não casa", () => {
+    expect(pattern.exec(withErrorCode(new Error("rede"), "Erro ao enviar"))).toBeNull();
+    expect(pattern.exec("Respostas salvas")).toBeNull();
+  });
+
+  it("o binding só aceita o formato do código, e a linha aponta o log", () => {
+    expect(isToastCode("0vhqbt")).toBe(true);
+    expect(isToastCode("Erro ao salvar — código 0vhqbt")).toBe(false);
+    expect(isToastCode({ code: "0vhqbt" })).toBe(false);
+    expect(describeToastCode("0vhqbt")).toContain('"[erro 0vhqbt]"');
   });
 });

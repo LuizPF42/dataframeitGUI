@@ -36,7 +36,12 @@ import {
   type SubmitOutcome,
 } from "./edit-field-save";
 import type { PydanticField, SchemaBaselineIdentity } from "@/lib/types";
-import { resolveSubfieldRule, resolveTarget } from "@/lib/pydantic-field";
+import {
+  resolveSubfieldRule,
+  resolveTarget,
+  stripLikePython,
+} from "@/lib/pydantic-field";
+import { actionErrorMessage } from "@/lib/server-error";
 
 export type { PendingSuggestion };
 
@@ -235,9 +240,7 @@ export function EditFieldDialog({
         onOpenChange(false);
         refresh();
       } catch (e) {
-        toast.error(
-          e instanceof Error ? e.message : "Erro ao salvar",
-        );
+        toast.error(actionErrorMessage(e, "Erro ao salvar"));
       }
     });
   };
@@ -324,7 +327,7 @@ export function EditFieldDialog({
           >
             Cancelar
           </Button>
-          <Button size="sm" disabled={isSaving || !description.trim()} onClick={handleSave}>
+          <Button size="sm" disabled={isSaving || !stripLikePython(description)} onClick={handleSave}>
             {isSaving && <Loader2 className="mr-1.5 size-3.5 animate-spin" />}
             Salvar
           </Button>

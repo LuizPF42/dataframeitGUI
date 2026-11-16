@@ -23,11 +23,15 @@ import { OptionsAllowOtherEditor } from "./OptionsAllowOtherEditor";
 import { DateSentinelEditor } from "./DateSentinelEditor";
 import { useOptionRemovalGuard } from "./useOptionRemovalGuard";
 import { stripOptionFromConditions } from "@/lib/schema-utils";
+import { fieldTypeChangePatch } from "@/lib/field-type-change";
 import type { PydanticField } from "@/lib/types";
 import {
   pydanticFieldNameIssue,
+  RESERVED_NAME_REASON,
+  resolveAllowOther,
   resolveRequired,
   resolveTarget,
+  stripLikePython,
 } from "@/lib/pydantic-field";
 
 interface FieldCardProps {
@@ -78,9 +82,9 @@ function FieldNameInput({
           Use apenas letras minúsculas, números e _ (ex: tipo_documento)
         </p>
       )}
-      {nameIssue === "reserved" && (
+      {nameIssue && nameIssue !== "invalid" && (
         <p className="text-xs text-destructive">
-          Nomes que começam e terminam com __ são reservados pelo Python.
+          Nome {RESERVED_NAME_REASON[nameIssue]}.
         </p>
       )}
       {duplicateName && (
@@ -93,16 +97,6 @@ function FieldNameInput({
 }
 
 type UpdateField = (patch: Partial<PydanticField>) => void;
-
-function fieldTypePatch(
-  field: PydanticField,
-  type: PydanticField["type"],
-): Partial<PydanticField> {
-  if (type === "text") return { type, options: null };
-  if (type === "date") return { type };
-  if (!field.options?.length) return { type, options: ["Opção 1"] };
-  return { type };
-}
 
 function FieldTypeControls({
   field,
@@ -124,7 +118,7 @@ function FieldTypeControls({
               "text-xs",
               field.type === type && "bg-brand/10 text-brand border-brand/40",
             )}
-            onClick={() => updateField(fieldTypePatch(field, type))}
+            onClick={() => updateField(fieldTypeChangePatch(field, type))}
           >
             {TYPE_LABELS[type]}
           </Button>
@@ -218,7 +212,7 @@ function FieldAnswerEditors({
           options={options}
           onChange={(options) => updateField({ options })}
           onBeforeRemoveOption={onBeforeRemoveOption}
-          allowOther={field.allow_other === true}
+          allowOther={resolveAllowOther(field.allow_other)}
           onAllowOtherChange={(checked) =>
             updateField({ allow_other: checked ? true : undefined })
           }
@@ -257,7 +251,7 @@ function FieldAnswerEditors({
             updateField({ justification_prompt: value || undefined })
           }
           onBlur={(value) =>
-            updateField({ justification_prompt: value.trim() || undefined })
+            updateField({ justification_prompt: stripLikePython(value) || undefined })
           }
         />
       )}
@@ -356,7 +350,7 @@ export function FieldCard({
               <Textarea
                 value={field.help_text || ""}
                 onChange={(e) => updateField({ help_text: e.target.value || undefined })}
-                onBlur={(e) => updateField({ help_text: e.target.value.trim() || undefined })}
+                onBlur={(e) => updateField({ help_text: stripLikePython(e.target.value) || undefined })}
                 placeholder="Explicações adicionais sobre como responder esta pergunta"
                 className="text-sm min-h-[60px] resize-y"
               />

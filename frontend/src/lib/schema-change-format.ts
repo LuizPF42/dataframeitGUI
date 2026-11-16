@@ -2,6 +2,7 @@ import type { FieldCondition } from "./types";
 import { formatDate } from "./date-format";
 import { TYPE_LABELS } from "./field-labels";
 import type { FieldPropertyDiff } from "./schema-change-diff";
+import { formatVersion } from "@/lib/compare-version";
 
 export function formatRelativeDate(iso: string): string {
   const then = new Date(iso).getTime();
@@ -18,11 +19,12 @@ export function formatRelativeDate(iso: string): string {
   return formatDate(iso);
 }
 
-export function formatVersion(
+// "vX.Y.Z" do histórico do schema, sobre o formato de `compare-version`.
+export function formatHistoryVersion(
   v: { major: number; minor: number; patch: number } | null,
 ): string {
   if (!v) return "—";
-  return `v${v.major}.${v.minor}.${v.patch}`;
+  return `v${formatVersion(v)}`;
 }
 
 export function formatCondition(c: FieldCondition | null | undefined): string {
@@ -65,6 +67,9 @@ const PROPERTY_LABELS: Record<FieldPropertyDiff["property"], string> = {
   options: "opções",
   type: "tipo",
   target: "alvo",
+  // Substantivo, e não o adjetivo do controle no editor: o rótulo também
+  // aparece sem o valor (selo da linha recolhida, mensagem de conflito), e ali
+  // "obrigatório" afirmaria o valor em vez de nomear a propriedade.
   required: "obrigatoriedade",
   allow_other: "permite outro",
   subfield_rule: "regra de subcampos",

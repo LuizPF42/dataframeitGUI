@@ -1,17 +1,15 @@
 import { describe, it, expect } from "vitest";
 import {
   classifyDocStatus,
-  versionLabel,
   versionEquals,
-  responseRoundLabel,
   isCurrentFilter,
   getCurrentRoundDescriptor,
-  compareVersionLabels,
   resolveRoundFilter,
+  roundLabel,
   type RoundContext,
   type ResponseRoundFields,
-  type SchemaVersion,
 } from "@/lib/rounds";
+import type { SchemaVersion } from "@/lib/compare-version";
 import type { Round } from "@/lib/types";
 
 const v = (major: number, minor: number, patch: number): SchemaVersion => ({
@@ -29,12 +27,7 @@ const round = (id: string, label: string, projectId = "p1"): Round => ({
 
 const mapRounds = (rs: Round[]) => new Map(rs.map((r) => [r.id, r]));
 
-describe("versionLabel / versionEquals", () => {
-  it("formata X.Y.Z", () => {
-    expect(versionLabel(v(1, 2, 3))).toBe("1.2.3");
-    expect(versionLabel(v(0, 1, 0))).toBe("0.1.0");
-  });
-
+describe("versionEquals", () => {
   it("compara versoes por igualdade estrutural", () => {
     expect(versionEquals(v(1, 0, 0), v(1, 0, 0))).toBe(true);
     expect(versionEquals(v(1, 0, 0), v(1, 0, 1))).toBe(false);
@@ -58,7 +51,7 @@ describe("isCurrentFilter", () => {
 });
 
 describe("getCurrentRoundDescriptor", () => {
-  it("schema_version usa versionLabel", () => {
+  it("schema_version usa o rótulo X.Y.Z de formatVersion", () => {
     const ctx: RoundContext = {
       strategy: "schema_version",
       currentRoundId: null,
@@ -232,77 +225,19 @@ describe("classifyDocStatus — manual", () => {
   });
 });
 
-describe("responseRoundLabel", () => {
-  const piloto = round("rp", "Piloto");
+describe("roundLabel", () => {
+  const rounds = mapRounds([round("r1", "Piloto")]);
 
-  it("manual usa label da tabela rounds", () => {
-    const ctx: RoundContext = {
-      strategy: "manual",
-      currentRoundId: "rp",
-      currentVersion: v(1, 0, 0),
-      rounds: [piloto],
-    };
-    expect(responseRoundLabel(ctx, { round_id: "rp" }, mapRounds([piloto]))).toBe(
-      "Piloto",
-    );
+  it("devolve o rotulo da rodada conhecida", () => {
+    expect(roundLabel("r1", rounds)).toBe("Piloto");
   });
 
-  it("manual com round_id null retorna null", () => {
-    const ctx: RoundContext = {
-      strategy: "manual",
-      currentRoundId: "rp",
-      currentVersion: v(1, 0, 0),
-      rounds: [piloto],
-    };
-    expect(responseRoundLabel(ctx, { round_id: null }, mapRounds([piloto]))).toBeNull();
+  it("round_id sem rodada correspondente -> 'Rodada removida'", () => {
+    expect(roundLabel("fantasma", rounds)).toBe("Rodada removida");
   });
 
-  it("schema_version usa X.Y.Z da resposta", () => {
-    const ctx: RoundContext = {
-      strategy: "schema_version",
-      currentRoundId: null,
-      currentVersion: v(1, 0, 0),
-      rounds: [],
-    };
-    const r: ResponseRoundFields = {
-      schema_version_major: 0,
-      schema_version_minor: 9,
-      schema_version_patch: 1,
-    };
-    expect(responseRoundLabel(ctx, r, mapRounds([]))).toBe("0.9.1");
-  });
-
-  it("response null/undefined retorna null", () => {
-    const ctx: RoundContext = {
-      strategy: "schema_version",
-      currentRoundId: null,
-      currentVersion: v(1, 0, 0),
-      rounds: [],
-    };
-    expect(responseRoundLabel(ctx, null, mapRounds([]))).toBeNull();
-    expect(responseRoundLabel(ctx, undefined, mapRounds([]))).toBeNull();
-  });
-});
-
-describe("compareVersionLabels", () => {
-  it("ordena numericamente, nao lexicograficamente", () => {
-    const versions = ["0.10.0", "0.9.0", "1.0.0", "0.2.5"];
-    expect(versions.toSorted(compareVersionLabels)).toEqual([
-      "0.2.5",
-      "0.9.0",
-      "0.10.0",
-      "1.0.0",
-    ]);
-  });
-
-  it("trata versoes iguais como 0", () => {
-    expect(compareVersionLabels("1.2.3", "1.2.3")).toBe(0);
-  });
-
-  it("compara major antes de minor antes de patch", () => {
-    expect(compareVersionLabels("2.0.0", "1.99.99")).toBeGreaterThan(0);
-    expect(compareVersionLabels("1.2.0", "1.1.99")).toBeGreaterThan(0);
-    expect(compareVersionLabels("1.1.2", "1.1.1")).toBeGreaterThan(0);
+  it("round_id nulo -> 'Sem rodada'", () => {
+    expect(roundLabel(null, rounds)).toBe("Sem rodada");
   });
 });
 

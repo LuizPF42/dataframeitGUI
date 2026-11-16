@@ -12,45 +12,21 @@
 // no gate sem caminho para destravar.
 //
 // Rodar de frontend/:  npm run e2e:fixture:coding
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { createClient } from "@supabase/supabase-js";
-import {
-  applyEnvironment,
-  readOptionalEnvironmentFile,
-} from "../worktree-env/env-contract.mjs";
+// Contra o Supabase local:  E2E_ENV_PATH=<arquivo> npm run e2e:fixture:coding
+import { fixtureClient } from "./fixture-client";
 
-// Mesmo par de arquivos, na mesma ordem de precedência, que o
-// playwright.config.ts carrega: as credenciais Supabase vêm de .env.local e os
-// usuários de teste de .env.e2e, que sobrescreve. Ancorado no diretório do
-// próprio script (não no cwd) pelo mesmo motivo documentado lá — rodar da raiz
-// do repo acharia o contrato e nenhum valor.
-const frontendDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-applyEnvironment(process.env, readOptionalEnvironmentFile(join(frontendDir, ".env.local")));
-applyEnvironment(process.env, readOptionalEnvironmentFile(join(frontendDir, ".env.e2e")), {
-  override: true,
-});
-
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (!url || !key) {
-  throw new Error("NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY ausentes");
-}
-const supabase = createClient(url, key);
+// O mesmo ambiente que o playwright.config.ts carrega, inclusive o
+// E2E_ENV_PATH: a fixture nasce no banco que o spec lê. Os e-mails vêm do
+// ambiente, nunca hardcoded: a fixture vale para qualquer instância Clerk
+// (dev de outro contribuidor, instância nova), não só para os usuários de
+// teste desta máquina.
+const {
+  supabase,
+  coordinatorEmail: COORDINATOR_EMAIL,
+  memberEmail: MEMBER_EMAIL,
+} = fixtureClient();
 
 const PROJECT_NAME = "Codificação (save path) — teste E2E";
-
-// Lidos do ambiente, nunca hardcoded: a fixture precisa valer para qualquer
-// instância Clerk (dev de outro contribuidor, instância nova), não só para os
-// usuários de teste desta máquina. São as mesmas variáveis que o Playwright já
-// exige — ver .env.e2e.example.
-const COORDINATOR_EMAIL = process.env.E2E_COORDINATOR_EMAIL;
-const MEMBER_EMAIL = process.env.E2E_MEMBER_EMAIL;
-if (!COORDINATOR_EMAIL || !MEMBER_EMAIL) {
-  throw new Error(
-    "E2E_COORDINATOR_EMAIL / E2E_MEMBER_EMAIL ausentes — configure frontend/.env.e2e (ver .env.e2e.example)",
-  );
-}
 
 async function profileIdByEmail(email: string): Promise<string> {
   const { data, error } = await supabase
@@ -122,7 +98,11 @@ if (existingProject) {
   console.log(`Projeto criado: ${projectId}`);
 }
 
-// 2. Documentos
+// 2. Documentos. O "Doc E2E save 2" é deliberado e não duplica a pergunta na
+// tela (a "via 1" da #540, nunca reproduzida): só o doc 1 tem assignment, a
+// fila do modo Atribuídos vem dos assignments do membro, e a view renderiza
+// um documento por vez. A pergunta em dobro observada era a cópia órfã do
+// segmento de Suspense, que `visivel()` filtra (#798, #806).
 const LOREM =
   "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.\n\n" +
   "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.\n\n" +

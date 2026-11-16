@@ -1,27 +1,28 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
 import {
-  makeSupabaseMock,
+  callsOf,
+  makeFilterAwareSupabaseMock,
+  type QueryError,
   type RpcCall,
-  type TableResult,
-  type TableResults,
+  type RpcResult,
   type WriteCall,
-} from "./supabase-mock";
-import { EMPTY_BASELINE, FIELD, PROJECT_SELECT } from "./schema-test-fixtures";
+} from "@/test-utils/supabase-mock";
+import { EMPTY_BASELINE, FIELD, projectRow } from "./schema-test-fixtures";
 
 // A RPC atômica torna irrepresentável a divergência sugestão × schema (#178).
 
 const supabaseState = vi.hoisted(() => ({
   writeCalls: [] as WriteCall[],
-  tableResults: undefined as TableResults | undefined,
+  tableData: {} as Record<string, unknown[]>,
+  queryErrors: {} as Record<string, QueryError>,
   revalidatePath: vi.fn(),
-  revalidateTag: vi.fn(),
   rpcCalls: [] as RpcCall[],
-  rpcResults: undefined as Record<string, TableResult> | undefined,
+  rpcResults: {} as Record<string, RpcResult>,
 }));
 
 vi.mock("next/cache", () => ({
   revalidatePath: supabaseState.revalidatePath,
-  revalidateTag: supabaseState.revalidateTag,
 }));
 // isProjectCoordinator saiu de @/lib/auth neste branch (identidade canônica);
 // o shape do mock segue o da main (#454), sem o símbolo removido.
@@ -37,8 +38,9 @@ vi.mock("@/lib/api-server", () => ({
 }));
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServer: async () =>
-    makeSupabaseMock({
-      tableResults: supabaseState.tableResults,
+    makeFilterAwareSupabaseMock({
+      tableData: supabaseState.tableData,
+      queryErrors: supabaseState.queryErrors,
       writeCalls: supabaseState.writeCalls,
       rpcCalls: supabaseState.rpcCalls,
       rpcResults: supabaseState.rpcResults,
@@ -51,11 +53,21 @@ import {
   rejectSchemaSuggestion,
 } from "../suggestions";
 
+const otherProject = projectRow({ id: "p2", schema_revision: 9 });
+
 beforeEach(() => {
   supabaseState.writeCalls = [];
-  supabaseState.tableResults = undefined;
+  // p1, e p2 como a linha que a leitura por id precisa descartar.
+  supabaseState.tableData = { projects: [projectRow(), otherProject] };
+  supabaseState.queryErrors = {};
   supabaseState.rpcCalls = [];
-  supabaseState.rpcResults = undefined;
+  supabaseState.rpcResults = {};
+  supabaseState.revalidatePath.mockClear();
+});
+
+// Sugestão s1, pendente em p1, com as colunas que o UPDATE da rejeição filtra.
+const suggestion = (extra: Record<string, unknown> = {}) => ({
+  id: "s1", project_id: "p1", status: "pending", ...extra,
 });
 
 const savedSchema = {
@@ -92,26 +104,23 @@ describe("erros do Postgres não chegam crus ao toast", () => {
 
   it("createSchemaSuggestion devolve copy pt-BR e loga o erro", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    supabaseState.tableResults = { schema_suggestions: { error: postgresError } };
+    supabaseState.queryErrors = { "schema_suggestions:insert": postgresError };
 
     const r = await createSchemaSuggestion("p1", "q1", { description: "Nova" }, "Ajuste");
 
-    expect(r.error).toBe("Não foi possível enviar a sugestão. Tente novamente.");
+    expect(r.error).toEqual(copyWithRef("Não foi possível enviar a sugestão. Tente novamente."));
     expect(consoleError).toHaveBeenCalledWith(
-      "[suggestions] criação da sugestão falhou",
-      expect.objectContaining({ code: "57014" }),
+      loggedLine("[suggestions] criação da sugestão falhou", { code: "57014" }),
     );
     consoleError.mockRestore();
   });
 
   it("createSchemaSuggestion barrada pela RLS diz que falta permissão", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    supabaseState.tableResults = {
-      schema_suggestions: {
-        error: {
-          code: "42501",
-          message: 'new row violates row-level security policy for table "schema_suggestions"',
-        },
+    supabaseState.queryErrors = {
+      "schema_suggestions:insert": {
+        code: "42501",
+        message: 'new row violates row-level security policy for table "schema_suggestions"',
       },
     };
 
@@ -123,14 +132,14 @@ describe("erros do Postgres não chegam crus ao toast", () => {
 
   it("rejectSchemaSuggestion devolve copy pt-BR e loga o erro", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    supabaseState.tableResults = { schema_suggestions: { error: postgresError } };
+    supabaseState.tableData.schema_suggestions = [suggestion()];
+    supabaseState.queryErrors = { "schema_suggestions:update": postgresError };
 
     const r = await rejectSchemaSuggestion("s1", "p1");
 
-    expect(r.error).toBe("Não foi possível rejeitar a sugestão. Tente novamente.");
+    expect(r.error).toEqual(copyWithRef("Não foi possível rejeitar a sugestão. Tente novamente."));
     expect(consoleError).toHaveBeenCalledWith(
-      "[suggestions] rejeição da sugestão falhou",
-      expect.objectContaining({ code: "57014" }),
+      loggedLine("[suggestions] rejeição da sugestão falhou", { code: "57014" }),
     );
     consoleError.mockRestore();
   });
@@ -139,9 +148,6 @@ describe("erros do Postgres não chegam crus ao toast", () => {
 describe("approveSchemaSuggestionWithEdits", () => {
   it("falha da RPC atômica não produz update paralelo", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    supabaseState.tableResults = {
-      projects: PROJECT_SELECT,
-    };
     supabaseState.rpcResults = {
       approve_schema_suggestion: { error: { code: "42501", message: "sem permissão" } },
     };
@@ -152,7 +158,7 @@ describe("approveSchemaSuggestionWithEdits", () => {
       [FIELD],
       EMPTY_BASELINE,
     );
-    expect(r.error).toBe("Não foi possível aplicar a sugestão. Tente novamente.");
+    expect(r.error).toEqual(copyWithRef("Não foi possível aplicar a sugestão. Tente novamente."));
     expect(
       supabaseState.writeCalls.some(
         (call) => call.table === "schema_suggestions" && call.op === "update",
@@ -166,9 +172,6 @@ describe("approveSchemaSuggestionWithEdits", () => {
   // usuário precisa saber que a sugestão saiu de pendente — e por isso ganha
   // copy pt-BR própria em vez da genérica.
   it("sugestão não pendente volta com copy pt-BR específica", async () => {
-    supabaseState.tableResults = {
-      projects: PROJECT_SELECT,
-    };
     supabaseState.rpcResults = {
       approve_schema_suggestion: {
         error: {
@@ -189,9 +192,6 @@ describe("approveSchemaSuggestionWithEdits", () => {
   });
 
   it("caminho feliz: schema aplicado e sugestão marcada como aprovada", async () => {
-    supabaseState.tableResults = {
-      projects: PROJECT_SELECT,
-    };
     supabaseState.rpcResults = { approve_schema_suggestion: savedSchema };
 
     const r = await approveSchemaSuggestionWithEdits(
@@ -213,12 +213,11 @@ describe("approveSchemaSuggestionWithEdits", () => {
   // RPC de commit devolvia erro e deixava a sugestão pendente PARA SEMPRE, com
   // rejeitá-la como única saída para uma sugestão que foi atendida.
   describe("sugestão cujo conteúdo o schema já tem", () => {
-    const projectWithField: TableResult = {
-      data: { ...(PROJECT_SELECT.data as object), pydantic_fields: [FIELD] },
-    };
+    beforeEach(() => {
+      supabaseState.tableData.projects = [projectRow({ pydantic_fields: [FIELD] }), otherProject];
+    });
 
     it("é aprovada sem commitar schema", async () => {
-      supabaseState.tableResults = { projects: projectWithField };
       supabaseState.rpcResults = {
         resolve_schema_suggestion: {
           data: {
@@ -260,7 +259,6 @@ describe("approveSchemaSuggestionWithEdits", () => {
     });
 
     it("revisão mudada entre a leitura e a aprovação volta como conflito", async () => {
-      supabaseState.tableResults = { projects: projectWithField };
       supabaseState.rpcResults = {
         resolve_schema_suggestion: {
           data: {
@@ -287,7 +285,6 @@ describe("approveSchemaSuggestionWithEdits", () => {
     });
 
     it("sugestão já resolvida volta com a copy pt-BR da RPC", async () => {
-      supabaseState.tableResults = { projects: projectWithField };
       supabaseState.rpcResults = {
         resolve_schema_suggestion: {
           error: {
@@ -314,27 +311,34 @@ describe("rejectSchemaSuggestion", () => {
   // coordenador aprovou segundos antes) — a copy é a mesma da RPC irmã, não um
   // falso erro de autorização para quem tem permissão.
   it("UPDATE de schema_suggestions filtrado (0 linhas) → copy de já resolvida", async () => {
-    supabaseState.tableResults = {
-      schema_suggestions: { data: [] },
-    };
+    // s1 já foi aprovada; s2, pendente, é de outro projeto.
+    supabaseState.tableData.schema_suggestions = [
+      suggestion({ status: "approved" }),
+      suggestion({ id: "s2", project_id: "p2" }),
+    ];
 
-    const r = await rejectSchemaSuggestion("s1", "p1", "fora de escopo");
-    expect(r.error).toBe("Sugestão não encontrada ou já resolvida.");
+    for (const id of ["s1", "s2", "s3"]) {
+      const r = await rejectSchemaSuggestion(id, "p1", "fora de escopo");
+      expect(r.error).toBe("Sugestão não encontrada ou já resolvida.");
+    }
+    expect(supabaseState.revalidatePath).not.toHaveBeenCalled();
   });
 
   it("caminho feliz: rejeição persiste com rejection_reason", async () => {
-    supabaseState.tableResults = {
-      schema_suggestions: { data: [{ id: "s1" }] },
-    };
+    supabaseState.tableData.schema_suggestions = [suggestion(), suggestion({ id: "s2" })];
 
     const r = await rejectSchemaSuggestion("s1", "p1", "fora de escopo");
     expect(r.error).toBeUndefined();
-    const upd = supabaseState.writeCalls.find(
-      (c) => c.table === "schema_suggestions" && c.op === "update",
-    );
+    const [upd, ...others] = callsOf(supabaseState.writeCalls, "update", "schema_suggestions");
+    expect(others).toEqual([]);
     expect(upd?.payload).toMatchObject({
       status: "rejected",
       rejection_reason: "fora de escopo",
     });
+    expect(upd?.filters).toEqual([
+      ["eq", "id", "s1"],
+      ["eq", "project_id", "p1"],
+      ["eq", "status", "pending"],
+    ]);
   });
 });

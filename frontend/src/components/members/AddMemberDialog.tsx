@@ -6,6 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { addMember } from "@/actions/members";
 import { toast } from "sonner";
+import { withErrorCode } from "@/lib/server-error";
+import { withActionTimeout } from "@/lib/action-timeout";
 
 interface AddMemberDialogProps {
   projectId: string;
@@ -20,7 +22,7 @@ export function AddMemberDialog({ projectId }: AddMemberDialogProps) {
   const handleAdd = async () => {
     setLoading(true);
     try {
-      const result = await addMember(projectId, email, role);
+      const result = await withActionTimeout(addMember(projectId, email, role));
       if (result?.error) {
         toast.error(result.error);
         return;
@@ -34,7 +36,7 @@ export function AddMemberDialog({ projectId }: AddMemberDialogProps) {
       setOpen(false);
     } catch (error) {
       console.error("[AddMemberDialog] erro ao adicionar membro", error);
-      toast.error("Não foi possível adicionar o membro. Tente novamente.");
+      toast.error(withErrorCode(error, "Não foi possível adicionar o membro. Tente novamente."));
     } finally {
       setLoading(false);
     }

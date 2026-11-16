@@ -21,6 +21,8 @@ import type {
   SchemaSnapshot,
 } from "@/lib/types";
 import type { SchemaDraftConflict } from "@/hooks/useSchemaDraft";
+import { actionErrorMessage } from "@/lib/server-error";
+import { formatHistoryVersion } from "@/lib/schema-change-format";
 
 /**
  * As quatro ações de servidor do SchemaEditor — salvar, publicar MAJOR,
@@ -97,8 +99,7 @@ export function useSchemaEditorActions({
         setMajorDialogOpen(false);
         refresh();
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : "Erro ao publicar MAJOR";
-        toast.error(msg);
+        toast.error(actionErrorMessage(e, "Erro ao publicar MAJOR"));
       }
     });
   };
@@ -120,18 +121,16 @@ export function useSchemaEditorActions({
           toast.error("O schema mudou em outra sessão. Revise o conflito antes de reconstruir.");
           return;
         }
-        const v = r.stats.finalVersion;
         const m = r.stats.byMethod;
         toast.success(
-          `v${v.major}.${v.minor}.${v.patch} · ${r.stats.logEntriesUpdated} entradas, ${r.stats.responsesProcessed} respostas — hashes: ${m.hashes}, created_at: ${m.created_at}, fallback: ${m.fallback_created_at}, live_save: ${m.live_save}`,
+          `${formatHistoryVersion(r.stats.finalVersion)} · ${r.stats.logEntriesUpdated} entradas, ${r.stats.responsesProcessed} respostas — hashes: ${m.hashes}, created_at: ${m.created_at}, fallback: ${m.fallback_created_at}, live_save: ${m.live_save}`,
           { duration: 10000 },
         );
         markSaved(r.snapshot);
         setBackfillDialogOpen(false);
         refresh();
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : "Erro ao reconstruir";
-        toast.error(msg);
+        toast.error(actionErrorMessage(e, "Erro ao reconstruir"));
       }
     });
   };
@@ -168,7 +167,7 @@ export function useSchemaEditorActions({
         submission.fields,
       );
     } catch (e: unknown) {
-      toast.error(e instanceof Error ? e.message : "Erro ao salvar schema");
+      toast.error(actionErrorMessage(e, "Erro ao salvar schema"));
       return null;
     }
   };
@@ -210,7 +209,7 @@ export function useSchemaEditorActions({
         markSaved(r.snapshot);
         toast.success("Schema salvo!");
       } catch (e: unknown) {
-        toast.error(e instanceof Error ? e.message : "Erro ao salvar schema");
+        toast.error(actionErrorMessage(e, "Erro ao salvar schema"));
       }
     });
   };

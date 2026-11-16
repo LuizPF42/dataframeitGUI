@@ -2,9 +2,14 @@ import { writeFileSync } from "node:fs";
 import { test as base, type Response } from "@playwright/test";
 import {
   classifyNotFound,
+  describeFinalUrl,
   describeNavigation,
+  describeToastCode,
+  isToastCode,
   readRscPayload,
   redactUrl,
+  TOAST_CODE_PATTERN,
+  watchToastCodes,
   type NavigationRecord,
 } from "./navigation-diagnostics";
 
@@ -12,10 +17,17 @@ import {
 // fixture-lock-test.ts, que estende este). O fixture automático registra as
 // navegações do frame principal e as requests RSC do cliente de toda página do
 // contexto (o spec pode abrir outra com `context.newPage()`); quando o teste
-// falha, anexa a lista e imprime as que deram erro, já classificadas por
-// navigation-diagnostics.ts. Sem isso o spec só mostra a própria mensagem
-// ("confira o fixture e o reset"), que acusa o fixture mesmo quando o servidor
-// nem casou a rota. `e2e-base-test-coverage.test.ts` exige este import.
+// falha, imprime a URL final de cada página (o login, se a sessão caiu, ou o
+// código da tela de erro de servidor, que acha o stack no log), anexa
+// a lista e imprime as que deram erro, já classificadas por
+// navigation-diagnostics.ts, e o código de cada toast de erro que apareceu
+// (falha de Server Action, que não passa pelo boundary). Sem isso o spec só
+// mostra a própria mensagem, que não tem como saber se o servidor casou a rota.
+// `e2e-base-test-coverage.test.ts` exige este import.
+
+const TOAST_CODE_BINDING = "__e2eToastCode";
+// Teto de códigos guardados: um spec que repete a mesma falha não enche a saída.
+const TOAST_CODE_LIMIT = 10;
 
 function isTracked(response: Response): boolean {
   const request = response.request();
@@ -59,9 +71,45 @@ export const test = base.extend<{ navigationDiagnostics: void }>({
         );
       };
       context.on("response", onResponse);
+      // Colhidos enquanto o teste roda, porque o toast some antes do teardown;
+      // como chegam aqui na hora, página fechada ou travada não os leva junto.
+      const toastCodes = new Set<string>();
+      await Promise.all([
+        context.exposeBinding(TOAST_CODE_BINDING, (_source, code: unknown) => {
+          if (isToastCode(code) && toastCodes.size < TOAST_CODE_LIMIT) toastCodes.add(code);
+        }),
+        context.addInitScript(watchToastCodes, {
+          binding: TOAST_CODE_BINDING,
+          pattern: TOAST_CODE_PATTERN,
+        }),
+      ]);
       await provide();
       context.off("response", onResponse);
       if (testInfo.status === testInfo.expectedStatus) return;
+
+      // Antes das navegações, e mesmo quando nenhuma deu erro: o
+      // redirecionamento ao login responde 200 e não aparece na lista abaixo.
+      // O texto do `<main>`, onde todo boundary de erro do app põe o painel,
+      // só serve para achar o código da tela de erro e não vai para a saída.
+      // Com prazo curto: página travada, fechada ou sem `<main>` sai sem ele,
+      // em vez de prender o teardown e levar junto o resto do diagnóstico.
+      const finalUrls = await Promise.all(
+        context.pages().map(async (page) => {
+          const text = await page
+            .getByRole("main")
+            .first()
+            .innerText({ timeout: 2_000 })
+            .catch(() => "");
+          return `  ${describeFinalUrl(page.url(), text)}`;
+        }),
+      );
+      console.log(`[URL final] ${testInfo.title}\n${finalUrls.join("\n")}`);
+      if (toastCodes.size > 0) {
+        console.log(
+          `[toast com código] ${testInfo.title}\n` +
+            [...toastCodes].map((code) => `  ${describeToastCode(code)}`).join("\n"),
+        );
+      }
 
       const records = await Promise.all(pending);
       // Anexo por caminho, e não por `body`: o reporter `list` do pre-push só

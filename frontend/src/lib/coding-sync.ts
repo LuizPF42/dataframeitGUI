@@ -5,6 +5,15 @@ import { isCodingComplete } from "@/lib/coding-completeness";
 import { drainAutoReviewReconciliationRequests } from "@/lib/auto-review-reconciler";
 import { createAutoComparisonIfDiverges } from "@/lib/auto-comparison";
 import type { PydanticField } from "@/lib/types";
+import { serverErrorScope, type ServerError } from "@/lib/server-error";
+
+// A resposta já está gravada quando o sync roda: o toast diz isso, e o texto
+// do PostgREST vai só ao log, com o código que liga os dois (#502).
+const SYNC_FAILED =
+  "Resposta salva, mas o status da codificação não pôde ser atualizado. Tente salvar novamente.";
+const codingSyncError = serverErrorScope("coding-sync");
+const syncError = (step: string, error: ServerError) =>
+  codingSyncError(step, error, SYNC_FAILED);
 
 async function drainAutoReviewForProject(projectId: string): Promise<void> {
   const result = await drainAutoReviewReconciliationRequests({ projectId });
@@ -90,6 +99,23 @@ async function completeCodingAssignment(
   supabase: SupabaseServerClient,
   params: SyncCodingAssignmentParams,
 ): Promise<{ error?: string }> {
+  // O primeiro envio pode ter gravado a response e falhado neste UPDATE. No
+  // retry, is_partial já é false, mas o assignment ainda não foi concluído:
+  // usar só hadCompletedResponse pularia a automação para sempre.
+  let alreadyCompleted = params.hadCompletedResponse;
+  if (params.hadCompletedResponse) {
+    const { data: assignment, error: readError } = await supabase
+      .from("assignments")
+      .select("status")
+      .eq("project_id", params.projectId)
+      .eq("document_id", params.documentId)
+      .eq("user_id", params.userId)
+      .eq("type", "codificacao")
+      .eq("round_id", params.roundId)
+      .maybeSingle();
+    if (readError) return { error: syncError("leitura do assignment", readError) };
+    alreadyCompleted = assignment?.status === "concluido";
+  }
   const { error } = await supabase
     .from("assignments")
     .update({ status: "concluido", completed_at: new Date().toISOString() })
@@ -98,9 +124,9 @@ async function completeCodingAssignment(
     .eq("user_id", params.userId)
     .eq("type", "codificacao")
     .eq("round_id", params.roundId);
-  if (error) return { error: error.message };
+  if (error) return { error: syncError("conclusão do assignment", error) };
 
-  if (!params.hadCompletedResponse) {
+  if (!alreadyCompleted) {
     await runCodingAutomation(
       params.automationMode,
       params.projectId,
@@ -115,7 +141,7 @@ async function keepCodingAssignmentInProgress(
   supabase: SupabaseServerClient,
   params: SyncCodingAssignmentParams,
 ): Promise<{ error?: string }> {
-  const { data: currentAssignment } = await supabase
+  const { data: currentAssignment, error: readError } = await supabase
     .from("assignments")
     .select("status")
     .eq("project_id", params.projectId)
@@ -124,6 +150,7 @@ async function keepCodingAssignmentInProgress(
     .eq("type", "codificacao")
     .eq("round_id", params.roundId)
     .maybeSingle();
+  if (readError) return { error: syncError("leitura do assignment", readError) };
   if (!currentAssignment || currentAssignment.status === "concluido") return {};
 
   const { error } = await supabase
@@ -134,7 +161,7 @@ async function keepCodingAssignmentInProgress(
     .eq("user_id", params.userId)
     .eq("type", "codificacao")
     .eq("round_id", params.roundId);
-  return error ? { error: error.message } : {};
+  return error ? { error: syncError("assignment em andamento", error) } : {};
 }
 
 // Recalcula o status do assignment de "codificacao" logo depois de um save:

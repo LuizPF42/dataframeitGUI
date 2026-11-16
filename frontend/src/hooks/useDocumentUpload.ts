@@ -9,17 +9,15 @@ import {
   type UploadDoc,
   type UploadOptions,
 } from "@/actions/documents";
-import { errorMessage } from "@/lib/utils";
 import {
   MAX_CHUNK_BYTES,
-  PAYLOAD_TOO_LARGE_MESSAGE,
   TEXT_CHANGE_WITH_RESPONSES_MESSAGE,
   buildDocs,
   buildUploadErrorMessage,
   buildUploadSuccessMessage,
   chunkByBytes,
   docBytes,
-  isPayloadTooLarge,
+  uploadFailureMessage,
   remapDuplicateMapToChunk,
   type ColumnMapping,
   type Csv,
@@ -138,7 +136,6 @@ export function useDocumentUpload(projectId: string) {
       setPhase({ kind: "idle" });
     } catch (e) {
       console.error("[useDocumentUpload] doUpload falhou", e);
-      const msg = errorMessage(e);
       const destructiveReplace =
         options?.mode === "replace_and_add" && !!options?.deleteResponses;
       // Revalida sempre que o banco pode ter mudado: algo entrou (totalInserted > 0)
@@ -158,7 +155,7 @@ export function useDocumentUpload(projectId: string) {
           totalDocs: docs.length,
           mode: options?.mode,
           deleteResponses: options?.deleteResponses,
-          msg,
+          error: e,
         })
       );
       setPhase(returnTo);
@@ -216,12 +213,7 @@ export function useDocumentUpload(projectId: string) {
       }
     } catch (e) {
       console.error("[useDocumentUpload] handleCheckAndUpload falhou", e);
-      const msg = errorMessage(e);
-      toast.error(
-        isPayloadTooLarge(msg)
-          ? PAYLOAD_TOO_LARGE_MESSAGE
-          : msg || "Erro ao verificar duplicatas"
-      );
+      toast.error(uploadFailureMessage(e, "Erro ao verificar duplicatas"));
       setPhase({ kind: "mapping" });
     }
   };

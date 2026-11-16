@@ -142,7 +142,7 @@ describe("mapSuggestionComments", () => {
       status: "pending",
       resolved_at: null,
       created_at: "2026-01-01T00:00:00Z",
-      profiles: { email: "coordenador@example.com" },
+      profiles: { email: "coordenador@example.com", first_name: null, last_name: null },
     };
 
     const [result] = mapSuggestionComments([suggestion], fieldMap);
@@ -159,6 +159,34 @@ describe("mapSuggestionComments", () => {
       help_text: field.help_text,
       options: field.options,
     });
+  });
+
+  // As notas já mostravam o nome do perfil; a sugestão mostrava a parte local
+  // do e-mail, na mesma tela.
+  it("autor aparece pelo nome do perfil, e pelo e-mail só enquanto não tem nome", () => {
+    const suggestion: SuggestionRow = {
+      id: "s1",
+      field_name: "campo1",
+      suggested_changes: {},
+      reason: null,
+      status: "pending",
+      resolved_at: null,
+      created_at: "2026-01-01T00:00:00Z",
+      profiles: { email: "ana.lima@example.com", first_name: "Ana", last_name: "Lima" },
+    };
+
+    const [named, unnamed, orphan] = mapSuggestionComments(
+      [
+        suggestion,
+        { ...suggestion, profiles: { email: "ana.lima@example.com", first_name: null, last_name: null } },
+        { ...suggestion, profiles: null },
+      ],
+      fieldMap,
+    );
+
+    expect(named.reviewerName).toBe("Ana Lima");
+    expect(unnamed.reviewerName).toBe("ana.lima");
+    expect(orphan.reviewerName).toBe("Anônimo");
   });
 });
 
@@ -290,7 +318,7 @@ describe("mapProjectComments", () => {
     kind: "note",
     rejected_at: null,
     rejected_reason: null,
-    profiles: { email: "pesquisador@example.com" },
+    profiles: { email: "pesquisador@example.com", first_name: null, last_name: null },
   };
 
   it("separa anotacoes de sugestoes de exclusao", () => {
@@ -313,6 +341,29 @@ describe("mapProjectComments", () => {
     expect(exclusionComments).toHaveLength(1);
     expect(exclusionComments[0].source).toBe("exclusao");
     expect(exclusionComments[0].exclusionStatus).toBe("pending");
+  });
+
+  it("anotação e sugestão de exclusão mostram o nome do perfil do autor", () => {
+    const named: ProjectCommentRow = {
+      ...baseRow,
+      profiles: { email: "pesquisador@example.com", first_name: "Bia", last_name: "Souza" },
+    };
+
+    const { annotationComments, exclusionComments } = mapProjectComments(
+      {
+        exclusionRows: [{ ...named, id: "c2", kind: "exclusion_request" }],
+        noteRows: [named, { ...baseRow, id: "c3" }],
+      },
+      docMap,
+      new Map(),
+      fieldMap,
+    );
+
+    expect(annotationComments.map((c) => c.reviewerName)).toEqual([
+      "Bia Souza",
+      "pesquisador",
+    ]);
+    expect(exclusionComments[0].reviewerName).toBe("Bia Souza");
   });
 
   it("usa excludedDocTitles quando o documento não está mais no docMap", () => {
@@ -354,28 +405,53 @@ describe("mapProjectComments", () => {
     expect(exclusionComments[0].exclusionStatus).toBe("rejected");
     expect(exclusionComments[0].exclusionRejectedReason).toBe("motivo");
   });
+
+  // #680: a ambiguidade saía com o mesmo veredito das anotações e não dava
+  // para isolá-la no filtro de tipo.
+  it("dá a kind='ambiguity' veredito próprio, distinto da anotação", () => {
+    const ambiguityRow: ProjectCommentRow = {
+      ...baseRow,
+      id: "c5",
+      kind: "ambiguity",
+      body: "Campo marcado como ambíguo na revisão (aba Comparar).",
+    };
+
+    const { annotationComments } = mapProjectComments(
+      { exclusionRows: [], noteRows: [baseRow, ambiguityRow] },
+      docMap,
+      new Map(),
+      fieldMap,
+    );
+
+    expect(annotationComments.map((c) => [c.id, c.verdict])).toEqual([
+      ["anotacao-c1", "anotacao"],
+      ["anotacao-c5", "ambiguidade"],
+    ]);
+    // Mesma tabela das anotações: resolve/reabre pelo mesmo caminho.
+    expect(annotationComments[1].source).toBe("anotacao");
+  });
 });
 
-describe("buildOrderedComments", () => {
-  function comment(overrides: Partial<ReviewComment>): ReviewComment {
-    return {
-      id: "id",
-      documentId: "doc1",
-      documentTitle: "Documento 1",
-      fieldName: "campo1",
-      fieldDescription: "desc",
-      verdict: "correto",
-      comment: "texto",
-      reviewerName: "ana",
-      resolvedAt: null,
-      createdAt: "2026-01-01T00:00:00Z",
-      chosenResponseId: null,
-      source: "review",
-      responseSnapshot: null,
-      ...overrides,
-    };
-  }
+function comment(overrides: Partial<ReviewComment>): ReviewComment {
+  return {
+    id: "id",
+    documentId: "doc1",
+    documentTitle: "Documento 1",
+    fieldName: "campo1",
+    fieldDescription: "desc",
+    verdict: "correto",
+    comment: "texto",
+    reviewerName: "ana",
+    resolvedAt: null,
+    createdAt: "2026-01-01T00:00:00Z",
+    chosenResponseId: null,
+    source: "review",
+    responseSnapshot: null,
+    ...overrides,
+  };
+}
 
+describe("buildOrderedComments", () => {
   it("coloca exclusões pendentes primeiro, depois sugestões pendentes, depois o resto por data desc", () => {
     const older = comment({ id: "old", source: "review", createdAt: "2026-01-01T00:00:00Z" });
     const newer = comment({ id: "new", source: "nota", createdAt: "2026-01-02T00:00:00Z" });
@@ -415,5 +491,84 @@ describe("buildOrderedComments", () => {
       "new",
       "old",
     ]);
+  });
+});
+
+describe("buildOrderedComments — veredito ambíguo e comentário de ambiguidade", () => {
+  const base = comment({
+    id: "r1",
+    verdict: "ambiguo",
+    comment: "a pergunta admite duas leituras",
+  });
+  const note = comment({
+    id: "anotacao-a1",
+    verdict: "ambiguidade",
+    source: "anotacao",
+    comment:
+      "Campo marcado como ambíguo na revisão (aba Comparar): a pergunta admite duas leituras",
+  });
+  const build = (reviewComments: ReviewComment[], annotationComments: ReviewComment[]) =>
+    buildOrderedComments({
+      reviewComments,
+      noteComments: [],
+      difficultyComments: [],
+      duvidaComments: [],
+      annotationComments,
+      suggestionComments: [],
+      exclusionComments: [],
+    });
+
+  it("a célula aparece num card só: o da revisão, que responde pelos dois filtros", () => {
+    const result = build([base], [note]);
+    expect(result.map((c) => c.id)).toEqual(["r1"]);
+    expect(result[0]).toMatchObject({ verdict: "ambiguo", coversAmbiguityComment: true });
+  });
+
+  it("revisores com a mesma nota seguem em cards próprios", () => {
+    const second = { ...base, id: "r2", reviewerName: "bia" };
+    expect(build([base, second], [note]).map((c) => c.id).sort()).toEqual(["r1", "r2"]);
+  });
+
+  it("comentário de ambiguidade com outro texto, de outra célula ou sem veredito ambíguo fica", () => {
+    const otherText = { ...base, comment: "outra leitura" };
+    const otherDoc = { ...base, documentId: "doc2" };
+    const notAmbiguous = { ...base, verdict: "correto" };
+    for (const review of [otherText, otherDoc, notAmbiguous]) {
+      const ids = build([review], [note]).map((c) => c.id);
+      expect(ids.sort()).toEqual(["anotacao-a1", "r1"]);
+    }
+  });
+
+  // A resolução dos dois é separada: a do card da revisão em `reviews`, a do
+  // comentário em `project_comments`, com permissões próprias (`can_resolve`).
+  // A Comparação conta o comentário aberto na célula (`buildCountsByKey`), então
+  // ele não pode sumir da aba enquanto o card que o cobria está resolvido.
+  const RESOLVED = "2026-11-16T10:00:00Z";
+
+  it("revisão resolvida não esconde o comentário de ambiguidade aberto", () => {
+    const result = build([{ ...base, resolvedAt: RESOLVED }], [note]);
+    expect(result.map((c) => c.id).sort()).toEqual(["anotacao-a1", "r1"]);
+    expect(result.find((c) => c.id === "r1")?.coversAmbiguityComment).toBeUndefined();
+    expect(result.find((c) => c.id === "anotacao-a1")?.resolvedAt).toBeNull();
+  });
+
+  it("comentário resolvido à parte não faz a revisão aberta responder por ele", () => {
+    const result = build([base], [{ ...note, resolvedAt: RESOLVED }]);
+    expect(result.map((c) => c.id).sort()).toEqual(["anotacao-a1", "r1"]);
+    expect(result.find((c) => c.id === "r1")?.coversAmbiguityComment).toBeUndefined();
+  });
+
+  it("os dois resolvidos seguem num card só", () => {
+    const result = build([{ ...base, resolvedAt: RESOLVED }], [{ ...note, resolvedAt: RESOLVED }]);
+    expect(result.map((c) => c.id)).toEqual(["r1"]);
+    expect(result[0].coversAmbiguityComment).toBe(true);
+  });
+
+  it("com a mesma nota, cobre só o revisor no mesmo estado do comentário", () => {
+    const resolved = { ...base, id: "r2", resolvedAt: RESOLVED };
+    const result = build([base, resolved], [note]);
+    expect(result.map((c) => c.id).sort()).toEqual(["r1", "r2"]);
+    expect(result.find((c) => c.id === "r1")?.coversAmbiguityComment).toBe(true);
+    expect(result.find((c) => c.id === "r2")?.coversAmbiguityComment).toBeUndefined();
   });
 });

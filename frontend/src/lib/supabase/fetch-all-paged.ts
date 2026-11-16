@@ -1,9 +1,11 @@
+import { mapWithConcurrency } from "@/lib/upload-chunking";
+
 // Paginação de leitura do PostgREST. O builder é de uso único (o await o
 // executa), por isso o caller passa uma FÁBRICA de query, não a query pronta.
 //
-// Compartilhado entre o export e a métrica de erro do LLM: os dois varrem
-// tabelas inteiras de um projeto, onde o teto default de 1000 linhas do
-// PostgREST truncaria em silêncio — e truncar aqui não dá erro, dá número errado.
+// Usado nas leituras que ainda exigem OFFSET; o cursor abaixo atende leituras
+// cuja chave de ordenação faz parte do contrato da linha.
+// Ambos evitam o teto default de 1000 linhas do PostgREST.
 //
 // `orderBy` é obrigatório e a assinatura exige pelo menos uma coluna porque
 // `.range()` pagina por LIMIT/OFFSET: sem ORDER BY o Postgres não promete ordem
@@ -45,4 +47,83 @@ export async function fetchAllPaged<T>(
     from += PAGE_SIZE;
   }
   return { data: all, error: null };
+}
+
+// Chaves que pertencem ao contrato das linhas lidas por cursor.
+// O cursor evita que INSERT/DELETE antes da página seguinte desloque o OFFSET;
+// cada página ainda é um statement separado, sem snapshot transacional.
+interface CursorQueryBuilder<T> extends PromiseLike<{ data: T[] | null; error: { message: string } | null }> {
+  order: (column: string) => CursorQueryBuilder<T>;
+  limit: (count: number) => CursorQueryBuilder<T>;
+  gt: (column: string, value: string) => CursorQueryBuilder<T>;
+  or: (filters: string) => CursorQueryBuilder<T>;
+}
+
+async function fetchAllByCursor<T>(
+  build: () => CursorQueryBuilder<T>,
+  ordered: (query: CursorQueryBuilder<T>) => CursorQueryBuilder<T>,
+  after: (query: CursorQueryBuilder<T>, last: T) => CursorQueryBuilder<T>,
+): Promise<{ data: T[]; error: { message: string } | null }> {
+  const all: T[] = [];
+  let last: T | undefined;
+  for (;;) {
+    const query = ordered(last === undefined ? build() : after(build(), last));
+    // react-doctor-disable-next-line react-doctor/async-await-in-loop
+    const { data, error } = await query.limit(PAGE_SIZE);
+    if (error) return { data: all, error };
+    const batch = data ?? [];
+    all.push(...batch);
+    if (batch.length < PAGE_SIZE) return { data: all, error: null };
+    last = batch[batch.length - 1];
+  }
+}
+
+export function fetchAllAfterId<T extends { id: string }>(
+  build: () => CursorQueryBuilder<T>,
+) {
+  return fetchAllByCursor(build, (query) => query.order("id"), (query, last) => query.gt("id", last.id));
+}
+
+export function fetchAllAfterDocumentField<T extends { document_id: string; field_name: string }>(
+  build: () => CursorQueryBuilder<T>,
+) {
+  return fetchAllByCursor(
+    build,
+    (query) => query.order("document_id").order("field_name"),
+    (query, last) => query.or(
+      `document_id.gt.${JSON.stringify(last.document_id)},and(document_id.eq.${JSON.stringify(last.document_id)},field_name.gt.${JSON.stringify(last.field_name)})`,
+    ),
+  );
+}
+
+// Lote do `.in("document_id", ...)`: uma lista longa de UUIDs vai na URL do
+// PostgREST, e cem ficam bem abaixo do limite.
+const DOCUMENT_CHUNK = 100;
+// Lotes em voo ao mesmo tempo. Uma lista de milhares de documentos não pode
+// virar dezenas de requisições simultâneas contra o PostgREST.
+const CHUNK_CONCURRENCY = 4;
+
+export type PagedRead<T> = Promise<{ data: T[]; error: { message: string } | null }>;
+
+// Leitura restrita a `documentIds`, um `.in` por lote, até `concurrency` lotes
+// em paralelo. A primeira falha vence e para de abrir lotes: um lote faltando
+// daria número errado, não erro.
+export async function fetchByDocumentChunks<T>(
+  documentIds: readonly string[],
+  fetchChunk: (ids: string[]) => PagedRead<T>,
+  concurrency = CHUNK_CONCURRENCY,
+): PagedRead<T> {
+  const chunks: string[][] = [];
+  for (let i = 0; i < documentIds.length; i += DOCUMENT_CHUNK) {
+    chunks.push(documentIds.slice(i, i + DOCUMENT_CHUNK));
+  }
+  let failed: { message: string } | null = null;
+  const results = await mapWithConcurrency(chunks, concurrency, async (ids) => {
+    if (failed) return null;
+    const result = await fetchChunk(ids);
+    failed ??= result.error;
+    return result;
+  });
+  if (failed) return { data: [], error: failed };
+  return { data: results.flatMap((result) => result?.data ?? []), error: null };
 }

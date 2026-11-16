@@ -10,7 +10,8 @@
 # integrity` é pgTAP e roda por `supabase test db`; as demais sinalizam falha
 # com `RAISE EXCEPTION 'FALHOU ...'` e rodam por psql com ON_ERROR_STOP=1.
 #
-# Três guardas fecham os modos de drift que originaram ou disfarçariam a #557:
+# Quatro guardas fecham os modos de drift que originaram ou disfarçariam a #557
+# (a quarta veio da #650):
 #   1. Drift disco↔runner: a causa raiz da #557 foi uma suíte .test.sql fora de
 #      toda cadeia. Aqui, qualquer .test.sql no disco não classificado em um dos
 #      três conjuntos — ou qualquer suíte listada sem arquivo no disco — derruba
@@ -19,7 +20,15 @@
 #      falha pedindo a promoção para GATE_SUITES — a exceção não apodrece
 #      silenciosamente até alguém reparar (drift no sentido bom, mas ainda drift).
 #   3. Diagnóstico em falha: a saída de cada suíte vai para um log; em FAIL de
-#      gate a cauda é impressa, sem exigir re-run do npm script individual.
+#      gate a cauda é impressa, sem exigir re-run da suíte.
+#   4. KNOWN_RED fóssil: toda entrada aponta para uma issue (#N) ABERTA. Uma
+#      suíte silenciada por issue fechada ou inexistente derruba o gate antes de
+#      rodar. Fora do CI, sem `gh`, sem rede ou sem login, a consulta é pulada
+#      com aviso (fail-open); no CI ela reprova.
+#
+# Uso: `npm run test:db` roda tudo; `npm run test:db -- <suíte> [<suíte>...]`
+# roda só as nomeadas (o nome do arquivo sem `.test.sql`, ou
+# `backend_integration`). As listas abaixo são a fonte única das suítes.
 
 # Sem `-e`: a varredura precisa continuar após uma suíte falhar.
 set -uo pipefail
@@ -72,7 +81,6 @@ GATE_SUITES=(
   responses_latest_human_concurrency
   response_round_serialization
   unmark_equivalence_atomic
-  value_equivalences
   auto_review_reconciliation_outbox
   arbitration_reopen
   rls_audit
@@ -80,16 +88,19 @@ GATE_SUITES=(
   visible_if_no_codigo_pydantic
   self_comparison_exception
   schema_revision_rpcs
+  error_resolution_cycle
+  schema_revision_serialization
+  value_equivalences
+  native_supabase_auth
+  native_llm_in_browser
 )
 
-# Órfã quebrada pela era da migration 20260717120000 (connstr de dblink), fora
-# do escopo da #557 e rastreada em issue própria. Roda e é reportada, mas NÃO
+# Suíte vermelha rastreada em issue própria. Roda e é reportada, mas NÃO
 # derruba o gate até ser consertada. Isto NÃO é silenciamento: aparece no resumo
 # com sua issue; ao consertar, mover para GATE_SUITES (a guarda 2 força esse
-# passo).
-declare -A KNOWN_RED=(
-  [schema_revision_serialization]="#572"
-)
+# passo). Vazia hoje: value_equivalences (#913) foi a última, e passou a rodar
+# como `supabase_admin` (diretiva no topo da suíte, lida pelo run-sql-test.sh).
+declare -A KNOWN_RED=()
 
 # ── Guarda 1: drift entre o runner e o disco (fecha a causa raiz da #557). ────
 # O conjunto classificado é a união dos três; a fonte da verdade de "quem é
@@ -116,6 +127,18 @@ if [[ ${#drift[@]} -gt 0 ]]; then
   exit 1
 fi
 
+# Suítes pedidas na linha de comando; nenhuma = todas. Nome fora das listas é
+# erro, e não um subconjunto vazio que passaria em silêncio.
+declare -A SELECTED=()
+for name in "$@"; do
+  if [[ -z "$name" ]] || [[ -z "${CLASSIFIED[$name]:-}" && "$name" != backend_integration ]]; then
+    echo "suíte desconhecida: ${name} (veja GATE_SUITES/PGTAP_SUITES/KNOWN_RED)" >&2
+    exit 2
+  fi
+  SELECTED["$name"]=1
+done
+selected() { [[ ${#SELECTED[@]} -eq 0 || -n "${SELECTED[$1]:-}" ]]; }
+
 pass=()
 fail_gate=()
 fail_known=()
@@ -130,18 +153,40 @@ run_pgtap() {
     local port
     port="$(docker inspect -f '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "${CONTAINER}")"
     if [[ ! "$port" =~ ^[0-9]+$ ]]; then
-      echo "container sem porta PostgreSQL publicada" >"${LOG_DIR}/$1.log"
+      echo "container sem porta PostgreSQL publicada"
       return 2
     fi
     PGPASSWORD=postgres npx supabase test db "${TESTS_DIR}/$1.test.sql" \
-      --db-url "postgresql://postgres@127.0.0.1:${port}/${SUPABASE_DB_NAME:-postgres}" >"${LOG_DIR}/$1.log" 2>&1
+      --db-url "postgresql://postgres@127.0.0.1:${port}/${SUPABASE_DB_NAME:-postgres}"
   else
-    npx supabase test db "${TESTS_DIR}/$1.test.sql" --local >"${LOG_DIR}/$1.log" 2>&1
+    npx supabase test db "${TESTS_DIR}/$1.test.sql" --local
   fi
 }
 
 run_psql() {
-  bash scripts/run-sql-test.sh "${TESTS_DIR}/$1.test.sql" >"${LOG_DIR}/$1.log" 2>&1
+  bash scripts/run-sql-test.sh "${TESTS_DIR}/$1.test.sql"
+}
+
+# No GitHub Actions o database-tests.yml roda tudo num passo só, e o passo por
+# suíte de antes mostrava a saída inteira de cada uma e, num travamento, qual
+# estava rodando. Lá cada suíte vira um grupo, aberto antes de ela rodar e com
+# a saída inteira enquanto roda, e a falha de gate vira anotação.
+in_ci() { [[ ${GITHUB_ACTIONS:-} == true ]]; }
+
+# Roda uma suíte com a saída no log dela e a reporta: gate|known, suíte, comando.
+run_suite() {
+  local gated="$1" suite="$2" code
+  shift 2
+  if in_ci; then
+    echo "::group::${suite}"
+    "$@" 2>&1 | tee "${LOG_DIR}/${suite}.log"
+    code=${PIPESTATUS[0]}
+    echo "::endgroup::"
+  else
+    "$@" >"${LOG_DIR}/${suite}.log" 2>&1
+    code=$?
+  fi
+  report "${suite}" "${code}" "${gated}"
 }
 
 tail_log() {
@@ -164,27 +209,65 @@ report() {
   elif [[ ${gated} == gate ]]; then
     printf '  FAIL  %s\n' "${suite}"
     fail_gate+=("${suite}")
-    tail_log "${suite}"
+    if in_ci; then
+      echo "::error title=Suíte do banco ${suite}::falhou; saída inteira no grupo ${suite} do passo"
+    else
+      tail_log "${suite}"
+    fi
   else
     printf '  RED*  %s (conhecida, %s)\n' "${suite}" "${KNOWN_RED[$suite]}"
     fail_known+=("${suite}")
   fi
 }
 
-echo "▸ suítes de contrato do banco (varredura completa)"
+# ── Guarda 4 (ver o cabeçalho): toda KNOWN_RED aponta para issue aberta. ─────
+# Fechada a issue, ou a suíte foi consertada e vai para GATE_SUITES, ou a
+# exceção perdeu o dono. No CI o workflow dá o token ao `gh`.
+KNOWN_RED_REPO=bdcdo/dataframeitGUI
+fossil=()
+for s in "${!KNOWN_RED[@]}"; do
+  ref="${KNOWN_RED[$s]}"
+  if [[ ! "$ref" =~ ^#([0-9]+)$ ]]; then
+    fossil+=("${s}: '${ref}' não é referência de issue (#N)")
+    continue
+  fi
+  if state="$(gh issue view "${BASH_REMATCH[1]}" --repo "${KNOWN_RED_REPO}" \
+    --json state -q .state 2>"${LOG_DIR}/gh.err")"; then
+    [[ "$state" == OPEN ]] || fossil+=("${s}: ${ref} está ${state}")
+  elif grep -q "Could not resolve to an issue" "${LOG_DIR}/gh.err"; then
+    fossil+=("${s}: ${ref} não existe em ${KNOWN_RED_REPO}")
+  elif in_ci; then
+    fossil+=("${s}: não deu para conferir ${ref} no GitHub: $(head -1 "${LOG_DIR}/gh.err")")
+  else
+    echo "aviso: não deu para conferir ${ref} de ${s} no GitHub (gh ausente, sem rede ou sem login); seguindo." >&2
+  fi
+done
+if [[ ${#fossil[@]} -gt 0 ]]; then
+  echo "▸ KNOWN_RED sem issue aberta — corrija antes de rodar:" >&2
+  printf '   - %s\n' "${fossil[@]}" >&2
+  echo "conserte a suíte e mova-a para GATE_SUITES, ou aponte a entrada para a issue aberta que a rastreia." >&2
+  exit 1
+fi
+
+if [[ ${#SELECTED[@]} -eq 0 ]]; then
+  echo "▸ suítes de contrato do banco (varredura completa)"
+else
+  echo "▸ suítes de contrato do banco: ${!SELECTED[*]}"
+fi
 
 for s in "${PGTAP_SUITES[@]}"; do
-  run_pgtap "$s"; report "$s" $? gate
+  selected "$s" && run_suite gate "$s" run_pgtap "$s"
 done
 for s in "${GATE_SUITES[@]}"; do
-  run_psql "$s"; report "$s" $? gate
+  selected "$s" && run_suite gate "$s" run_psql "$s"
 done
 for s in "${!KNOWN_RED[@]}"; do
-  run_psql "$s"; report "$s" $? known
+  selected "$s" && run_suite known "$s" run_psql "$s"
 done
 # Contrato do llm_runner em `llm_runs` (#674), pytest contra este mesmo stack.
-bash scripts/run-backend-integration.sh >"${LOG_DIR}/backend_integration.log" 2>&1
-report backend_integration $? gate
+if selected backend_integration; then
+  run_suite gate backend_integration bash scripts/run-backend-integration.sh
+fi
 
 echo "────────────────────────────────────────"
 printf 'PASS=%d  FAIL(gate)=%d  RED*(conhecida)=%d  VERDE(promover)=%d\n' \
@@ -203,7 +286,9 @@ if [[ ${#fail_gate[@]} -gt 0 ]]; then
   echo "FALHOU: ${fail_gate[*]}"
   status=1
 fi
-if [[ ${status} -eq 0 ]]; then
+if [[ ${status} -eq 0 && ${#SELECTED[@]} -gt 0 ]]; then
+  echo "OK: as suítes pedidas passaram (execução parcial)."
+elif [[ ${status} -eq 0 ]]; then
   echo "OK: todas as suítes de gate passaram."
 fi
 exit ${status}

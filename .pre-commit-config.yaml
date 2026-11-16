@@ -5,12 +5,19 @@
 #
 # Divisao de estagios (ver docs/CODE_QUALITY_TOOLING.md):
 #   pre-commit (todo commit, leve / file-scoped): gitleaks, ruff, actionlint,
-#                                                deploy notifier, react-doctor
-#   pre-push   (todo push,  pesado / grafo):       typecheck, vitest, deployment-versioning, e2e-smoke, lint:types, fallow, semgrep, backend-pytest, toolchain-pins, mypy, db-tests, llm-runs-contract
+#                                                deploy notifier, ci-gate-matrix,
+#                                                react-doctor
+#   pre-push   (todo push,  pesado / grafo):       typecheck, vitest, deployment-versioning, vitest-non-ts-inputs, e2e-smoke, lint:types, fallow, fallow-severity-canary, semgrep, backend-pytest, toolchain-pins, mypy, db-tests, llm-runs-contract
 #   post-checkout (informativo, nunca bloqueia):   worktree-env
 #
 # O CI roda o mesmo gitleaks em todo PR e push para `main` via
-# .github/workflows/secret-scan.yml — este hook e a primeira barreira local.
+# .github/workflows/secret-scan.yml, chamado pelo ci.yml — este hook e a
+# primeira barreira local.
+# Os hooks de pre-push tambem rodam no servidor: o .github/workflows/ci.yml
+# deriva deste arquivo uma celula por hook com `stages: [pre-push]` (#649).
+# Os de pre-commit rodam la numa chamada so, no job `lint`. Hook novo entra no
+# CI sozinho; o que nao pode rodar la (segredo, Docker) ou nao mede nada la
+# (diff local) ganha entrada com motivo em .github/ci-exempt-gates.json.
 default_install_hook_types: [pre-commit, pre-push, post-checkout]
 # Hook sem `stages:` proprio roda so no pre-commit (os leves: gitleaks, ruff,
 # actionlint, deploy notifier, react-doctor). Os pesados sobrescrevem com
@@ -19,6 +26,12 @@ default_install_hook_types: [pre-commit, pre-push, post-checkout]
 # estagios), furando a divisao descrita abaixo.
 default_stages: [pre-commit]
 
+# Hook de repositorio remoto pina o `rev` por SHA do commit, com a tag legivel
+# em `# frozen: vX.Y.Z` (forma do `pre-commit autoupdate --freeze`): a tag e
+# ponteiro movel, e quem controla o upstream poderia reapontar a tag para outro
+# codigo sob o mesmo `rev`, sem diff aqui. O Dependabot de `pre-commit` le o
+# comentario para resolver a tag nova e reescreve SHA e comentario juntos (#555).
+# O teste em backend/tests/test_toolchain_pins.py barra a volta do pin por tag.
 repos:
   # Marcador de conflito nao resolvido em qualquer arquivo versionado. Entrou
   # depois de 2026-08-10: a resolucao de um merge deixou um `=======` orfao em
@@ -28,7 +41,7 @@ repos:
   # Fail-closed na producao funcionou (o preflight abortou antes de mutar nada),
   # mas o custo foi um deploy vermelho por algo que um grep pega no commit.
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       # --assume-in-merge porque o default so inspeciona quando o repo esta em
       # estado de merge (MERGE_HEAD presente), e o marcador sobrevive ao commit
@@ -39,7 +52,7 @@ repos:
         args: [--assume-in-merge]
 
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.30.1
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e  # frozen: v8.30.1
     hooks:
       - id: gitleaks
 
@@ -74,7 +87,7 @@ repos:
         require_serial: true
 
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.12
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # frozen: v1.7.12
     hooks:
       - id: actionlint
         # v1.7.12 é anterior a `concurrency.queue`; o teste local abaixo valida
@@ -93,13 +106,23 @@ repos:
         pass_filenames: false
         require_serial: true
 
+      # O parser compartilhado pelos dois contratos de Machines abaixo, testado
+      # num fly.toml mínimo nas regras que não dependem de cada app.
+      - id: fly-toml-contract
+        name: fly.toml contract parser
+        entry: .github/scripts/test-fly-toml-contract.sh
+        language: system
+        files: ^\.github/scripts/(test-)?fly-toml-contract\.(py|sh)$
+        pass_filenames: false
+        require_serial: true
+
       # Contrato de custo/disponibilidade do backend no Fly: o workflow só
       # converge de 0/1 para uma Machine e valida tamanho, região e health.
       - id: backend-fly-machine-contract
         name: backend Fly machine contract
         entry: .github/scripts/test-backend-fly-machine-contract.sh
         language: system
-        files: ^(\.github/(workflows/fly-deploy\.yml|scripts/(check|test)-backend-fly-machine.*\.sh)|backend/fly\.toml)$
+        files: ^(\.github/(workflows/fly-deploy\.yml|scripts/((check|test)-backend-fly-machine.*\.sh|fly-toml-contract\.py))|backend/fly\.toml)$
         pass_filenames: false
         require_serial: true
 
@@ -113,7 +136,7 @@ repos:
         name: frontend Fly machine contract
         entry: .github/scripts/test-frontend-fly-machine-contract.sh
         language: system
-        files: ^(\.github/(workflows/frontend-fly-deploy\.yml|scripts/(check|test)-frontend-fly-machine.*\.sh)|frontend/fly\.toml)$
+        files: ^(\.github/(workflows/frontend-fly-deploy\.yml|scripts/((check|test)-frontend-fly-machine.*\.sh|fly-toml-contract\.py))|frontend/fly\.toml)$
         pass_filenames: false
         require_serial: true
 
@@ -125,6 +148,19 @@ repos:
         entry: .github/scripts/test-fly-vigia.sh
         language: system
         files: ^\.github/(workflows/fly-vigia\.yml|scripts/(test-)?fly-vigia\.sh)$
+        pass_filenames: false
+        require_serial: true
+
+      # Contrato da matriz de gates do CI (#649): o ci.yml roda uma célula por
+      # hook de pre-push deste arquivo, menos as exceções com motivo de
+      # .github/ci-exempt-gates.json. O teste reprova exceção órfã ou sem
+      # motivo, e o ci.yml que ganhe filtro de `paths` ou deixe um job fora do
+      # `ci-required`.
+      - id: ci-gate-matrix
+        name: CI gate matrix contract
+        entry: .github/scripts/test-ci-gate-matrix.sh
+        language: system
+        files: ^(\.pre-commit-config\.yaml|\.github/(ci-(exempt-gates|gate-shards)\.json|workflows/[^/]+\.yml|scripts/(test-)?ci-gate-matrix\.sh))$
         pass_filenames: false
         require_serial: true
 
@@ -150,7 +186,10 @@ repos:
         name: react-doctor (changed lines, fail on new warnings/errors)
         entry: bash frontend/scripts/react-doctor-gate.sh
         language: system
-        files: ^frontend/.*\.(mts|ts|tsx)$
+        # O package.json (e o lock) tambem: um bump do react-doctor sem linha TS
+        # alterada passa pela guarda de versao do script, que falha fechado com
+        # o node_modules desatualizado.
+        files: ^frontend/(.*\.(mts|ts|tsx)|package(-lock)?\.json)$
         pass_filenames: false
         require_serial: true
 
@@ -182,7 +221,7 @@ repos:
       # Python, e um push que mude só esse arquivo precisa rodar os dois lados.
       - id: vitest
         name: vitest run (full suite, pre-push)
-        entry: bash -c 'cd frontend && test -x ./node_modules/.bin/vitest && exec ./node_modules/.bin/vitest run || { echo "vitest ausente em frontend/node_modules; rode (cd frontend && npm install)" >&2; exit 1; }'
+        entry: bash -c 'cd frontend && test -x ./node_modules/.bin/vitest && exec ./node_modules/.bin/vitest run ${GATE_SHARD:+--shard=$GATE_SHARD} || { echo "vitest ausente em frontend/node_modules; rode (cd frontend && npm install)" >&2; exit 1; }'
         language: system
         files: ^(frontend/(.*\.(mjs|mts|ts|tsx|sh)|\.env\.(local|e2e)\.example)|backend/tests/field_hash_parity_cases\.json)$
         pass_filenames: false
@@ -203,11 +242,27 @@ repos:
         require_serial: true
         stages: [pre-push]
 
+      # Suites do vitest que leem arquivos que nao sao TS e que mudam fora do
+      # frontend/src (migrations e suites SQL, o backend, a config dos hooks), que
+      # o hook do vitest, por extensao TS, nao pega. Roda so essas suites, e nao
+      # a suite inteira, para que um push so de backend nao pague o frontend
+      # todo. As suites saem de uma varredura no script, e o disparo tambem e
+      # dele (always_run): pelo diff do push, que enxerga arquivo removido, o que
+      # o `files:` do pre-commit nao enxerga.
+      - id: vitest-non-ts-inputs
+        name: vitest das suites que leem SQL, Python e JSON do backend (pre-push)
+        entry: bash frontend/scripts/vitest-non-ts-inputs.sh
+        language: system
+        always_run: true
+        pass_filenames: false
+        require_serial: true
+        stages: [pre-push]
+
       # Playwright e2e smoke: fecha o loop aberto pela #107 (agent/CI travava
       # no login do Clerk sem Testing Tokens) fazendo esses specs rodarem sem
       # depender de alguem lembrar de digitar `npm run test:e2e` (issue #306).
-      # Nao ha CI bloqueante (sem branch protection no free tier — ver
-      # docs/CODE_QUALITY_TOOLING.md), entao pre-push e o unico lugar onde
+      # No servidor este hook nao roda (precisa de segredo do Clerk — ver
+      # .github/ci-exempt-gates.json), entao pre-push e o unico lugar onde
       # "testar antes do PR" pode ser automatico de verdade.
       #
       # No modo manual (`npm run test:e2e`), os specs ainda fazem test.skip()
@@ -291,25 +346,43 @@ repos:
       # os arquivos vindos da main como introduzidos aqui, barrando o push por
       # achado alheio. Fixar em origin/main faz o gate responder a pergunta certa:
       # o que ESTE PR introduz em relacao ao alvo do merge.
+      #
+      # O script tambem falha fechado com o fallow instalado != pinado e com
+      # aviso do fallow sobre a config, como regra desconhecida (#652). Por isso o
+      # hook roda ainda quando o push so muda a config ou a versao do fallow.
       - id: fallow-audit
         name: fallow audit (new findings block, pre-push)
-        entry: bash -c 'cd frontend && test -x ./node_modules/.bin/fallow && exec ./node_modules/.bin/fallow audit --base origin/main || { echo "fallow ausente em frontend/node_modules; rode (cd frontend && npm install)" >&2; exit 1; }'
+        entry: bash frontend/scripts/fallow-audit-gate.sh
         language: system
-        files: ^frontend/.*\.(mts|ts|tsx)$
+        files: ^frontend/(.*\.(mts|ts|tsx)|\.fallowrc\.jsonc|package(-lock)?\.json|scripts/(fallow-audit-gate|gates/lib/assert-pinned-version)\.sh)$
         pass_filenames: false
         require_serial: true
         stages: [pre-push]
 
-      # semgrep SAST (JS/TS + Python) via uvx, engine pinado (==1.168.0) para
-      # reprodutibilidade e para fugir da regressao da serie 1.12x que retornava
-      # exit 2 em runs limpos (que, sob o fail-open, tornaria o gate um no-op).
-      # --baseline-commit limita aos achados NOVOS vs origin/main (mesma logica do
-      # fallow: o `main` local costuma estar defasado). Falha fechado em achado
-      # (exit 1); falha ABERTO em erro de infra/rede (exit>1) para nao travar push
-      # offline. Rulesets p/... exigem rede na 1a vez (depois cacheados). Ver doc.
+      # Canario de severidade do fallow (#652): o fallow instalado, com o
+      # .fallowrc.jsonc real, tem de barrar em error cada regra da familia
+      # client/server. Roda so quando o push muda a config ou a versao do
+      # fallow, que nao casam com o glob por extensao do hook do vitest (o push
+      # que muda .ts ja roda o canario na suite inteira).
+      - id: fallow-severity-canary
+        name: canario de severidade do fallow (pre-push)
+        entry: bash -c 'cd frontend && test -x ./node_modules/.bin/vitest && exec ./node_modules/.bin/vitest run src/tooling/__tests__/fallow-severity-canary.test.ts || { echo "vitest ausente em frontend/node_modules; rode (cd frontend && npm install)" >&2; exit 1; }'
+        language: system
+        files: ^frontend/(\.fallowrc\.jsonc|package(-lock)?\.json)$
+        pass_filenames: false
+        require_serial: true
+        stages: [pre-push]
+
+      # semgrep SAST (JS/TS + Python) via uvx, so achados NOVOS vs origin/main
+      # (mesma logica do fallow: o `main` local costuma estar defasado). Falha
+      # fechado em achado (exit 1). Em erro de infra/rede (exit>1) falha ABERTO
+      # no push local, para nao travar push offline, e FECHADO no CI, que roda o
+      # mesmo script com GATE_FAIL_OPEN=0. Engine pinado e o porque de cada
+      # decisao em frontend/scripts/semgrep-gate.sh. Rulesets p/... exigem rede
+      # na 1a vez (depois cacheados). Ver doc.
       - id: semgrep
         name: semgrep SAST (new findings, pre-push)
-        entry: bash -c 'command -v uvx >/dev/null 2>&1 || { echo "uvx ausente — semgrep pulado" >&2; exit 0; }; base=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo main); out=$(uvx --from semgrep==1.168.0 semgrep scan --config p/typescript --config p/react --config p/python --baseline-commit "$base" --error --quiet frontend backend 2>&1); code=$?; if [ "$code" = "1" ]; then echo "$out" >&2; echo "semgrep achou problema novo — corrija ou marque com nosemgrep" >&2; exit 1; fi; if [ "$code" -gt 1 ] 2>/dev/null; then echo "semgrep nao rodou (rede/config?) — push liberado" >&2; fi; exit 0'
+        entry: bash frontend/scripts/semgrep-gate.sh
         language: system
         pass_filenames: false
         require_serial: true
@@ -334,15 +407,16 @@ repos:
 
       # Pinos da toolchain do backend declarados fora do backend: o ruff acima
       # vindo do uv.lock (sem `rev` proprio), e o backend/.python-version contra
-      # o Dockerfile e o mypy (backend/tests/test_toolchain_pins.py). Roda so esse
-      # teste quando o push toca um desses dois arquivos; os demais lados
+      # o Dockerfile e o mypy, e o pre-commit do CI vindo de .github/ci-tools
+      # (backend/tests/test_toolchain_pins.py). Roda so esse teste quando o push
+      # toca um desses arquivos; os demais lados
       # (uv.lock, Dockerfile, pyproject.toml) ja disparam o backend-pytest
       # inteiro, que inclui o teste.
       - id: toolchain-pins
         name: pinos da toolchain do backend (pre-push)
         entry: bash -c 'command -v uv >/dev/null 2>&1 || { echo "uv ausente — instale o astral uv para conferir os pinos da toolchain" >&2; exit 1; }; cd backend && exec uv run pytest -q tests/test_toolchain_pins.py'
         language: system
-        files: ^(\.pre-commit-config\.yaml|backend/\.python-version|\.github/workflows/database-tests\.yml)$
+        files: ^(\.pre-commit-config\.yaml|backend/\.python-version|\.github/(workflows/.*\.yml|ci-tools/.*|dependabot\.yml))$
         pass_filenames: false
         require_serial: true
         stages: [pre-push]
@@ -378,8 +452,8 @@ repos:
       # (sem parar na primeira, ao contrario do antigo `&&`) e sai !=0 se
       # qualquer suite de GATE falhar. Requer o Supabase local no ar; sem o
       # container o push e barrado com mensagem (gate de verdade, como o
-      # backend-pytest). A orfa schema_revision_serialization (#572) esta em
-      # KNOWN_RED no runner e e reportada sem bloquear ate ser consertada.
+      # backend-pytest). As suites em KNOWN_RED no runner sao reportadas sem
+      # bloquear ate serem consertadas.
       # Escopo por `files`: so roda quando o push toca migrations, suites .sql
       # ou os scripts do runner. O runner tambem roda o contrato do llm_runner
       # (hook seguinte), para que migration nova seja conferida contra ele.
@@ -400,7 +474,7 @@ repos:
         name: contrato llm_runs do llm_runner (pre-push)
         entry: bash -c 'cd frontend && exec bash scripts/run-backend-integration.sh'
         language: system
-        files: ^(backend/(services/llm_runner\.py|tests/integration/.*\.py)|frontend/scripts/run-backend-integration\.sh)$
+        files: ^(backend/(services/(llm_runner|llm_rate_limiter|auth|auto_review_reconciliation)\.py|tests/integration/.*\.py)|frontend/scripts/run-backend-integration\.sh)$
         pass_filenames: false
         require_serial: true
         stages: [pre-push]

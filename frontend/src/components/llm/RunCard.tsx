@@ -20,6 +20,7 @@ import {
   type RunFilter,
 } from "./run-filter";
 import type { LlmConfig } from "@/lib/types";
+import { actionErrorMessage } from "@/lib/server-error";
 
 interface RunCardProps {
   projectId: string;
@@ -70,8 +71,6 @@ export function RunCard({
     status,
     phase,
     etaSeconds,
-    currentBatch,
-    totalBatches,
     processedComplete,
     processedPartial,
     processedEmpty,
@@ -103,7 +102,7 @@ export function RunCard({
       if (r?.error) toast.error(r.error);
       else toast.success("Configuração salva!");
     } catch (e: unknown) {
-      toast.error(e instanceof Error ? e.message : "Erro ao salvar configuração");
+      toast.error(actionErrorMessage(e, "Erro ao salvar configuração"));
     }
   };
 
@@ -152,7 +151,7 @@ export function RunCard({
       );
       start(res.job_id);
     } catch (e: unknown) {
-      toast.error(e instanceof Error ? e.message : "Erro ao iniciar execução");
+      toast.error(actionErrorMessage(e, "Erro ao iniciar execução"));
     } finally {
       setIsStartingRun(false);
     }
@@ -210,8 +209,6 @@ export function RunCard({
             progress={progress}
             total={total}
             etaSeconds={etaSeconds}
-            currentBatch={currentBatch}
-            totalBatches={totalBatches}
             processedComplete={processedComplete}
             processedPartial={processedPartial}
             processedEmpty={processedEmpty}

@@ -1,26 +1,27 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
 
 // Regressão da issue #182: getLotteryDocStats (path de exibição do dialog de
 // sorteio) passa a ler a view agregada `lottery_doc_stats` em vez de fazer
 // fetch bruto de responses/assignments do projeto inteiro. O teste trava o
 // ganho garantindo que essas tabelas não são mais tocadas nesse path.
 import {
-  makeSupabaseMock,
+  makeFilterAwareSupabaseMock,
   type RpcCall,
-  type TableResult,
-  type TableResults,
+  type RpcResult,
+  type QueryError,
   type WriteCall,
-} from "./supabase-mock";
+} from "@/test-utils/supabase-mock";
 
-let serverTableResults: TableResults | undefined;
+let tableData: Record<string, unknown[]>;
+let queryErrors: Record<string, QueryError>;
 let fromCalls: string[];
 let writeCalls: WriteCall[];
 let rpcCalls: RpcCall[];
-let rpcResults: Record<string, TableResult> | undefined;
+let rpcResults: Record<string, RpcResult>;
 
 vi.mock("next/cache", () => ({
   revalidatePath: () => {},
-  revalidateTag: () => {},
 }));
 vi.mock("@/lib/auth", () => ({
   getAuthUser: async () => ({ id: "user-1", isMaster: false }),
@@ -28,11 +29,13 @@ vi.mock("@/lib/auth", () => ({
 }));
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServer: async () => {
-    const mock = makeSupabaseMock({
-      tableResults: serverTableResults,
+    const mock = makeFilterAwareSupabaseMock({
+      tableData,
+      queryErrors,
       writeCalls,
       rpcCalls,
       rpcResults,
+      projectColumns: true,
     });
     return {
       ...mock,
@@ -45,6 +48,7 @@ vi.mock("@/lib/supabase/server", () => ({
 }));
 
 import {
+  clearPendingAssignments,
   cycleAssignment,
   getLotteryDocStats,
   previewLottery,
@@ -53,27 +57,27 @@ import {
 } from "../assignments";
 import { LOTTERY_EMPTY_MESSAGES } from "@/lib/lottery-utils";
 
-const ROUND_RESULTS: TableResults = {
-  rounds: { data: { id: "round-1", label: "Rodada inicial" } },
-  lottery_round_work_counts: { data: [] },
+const ROUND_RESULTS: Record<string, unknown[]> = {
+  rounds: [{ id: "round-1", project_id: "p1", label: "Rodada inicial" }],
+  lottery_round_work_counts: [],
 };
 
 beforeEach(() => {
-  serverTableResults = undefined;
+  tableData = {};
+  queryErrors = {};
   fromCalls = [];
   writeCalls = [];
   rpcCalls = [];
-  rpcResults = undefined;
+  rpcResults = {};
 });
 
 describe("getLotteryDocStats", () => {
   it("mapeia as linhas da view lottery_doc_stats para LotteryDocStats[]", async () => {
-    serverTableResults = {
+    tableData = {
       ...ROUND_RESULTS,
-      lottery_doc_stats: {
-        data: [
+      lottery_doc_stats: [
           {
-            id: "d1",
+            id: "d1", project_id: "p1",
             external_id: "EXT-1",
             title: "Doc 1",
             human_coding_count: 2,
@@ -84,7 +88,7 @@ describe("getLotteryDocStats", () => {
             batch_ids: ["b1", "b2"],
           },
           {
-            id: "d2",
+            id: "d2", project_id: "p1",
             external_id: null,
             title: "Doc 2",
             human_coding_count: 0,
@@ -94,14 +98,14 @@ describe("getLotteryDocStats", () => {
             has_assignment_in_current_round: false,
             batch_ids: null,
           },
+          {
+            id: "outside", project_id: "other", external_id: null, title: "Outro projeto",
+            human_coding_count: 0, has_llm_response: false, active_codificacao: 0,
+            active_comparacao: 0, has_assignment_in_current_round: false, batch_ids: [],
+          },
         ],
-      },
-      assignment_batches: {
-        data: [{ id: "b1", label: "Lote 1", created_at: "2026-01-01" }],
-      },
-      projects: {
-        data: { min_responses_for_comparison: 2, automation_mode: "compare_llm", current_round_id: "round-1" },
-      },
+      assignment_batches: [{ id: "b1", project_id: "p1", round_id: "round-1", label: "Lote 1", created_at: "2026-01-01" }],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: "compare_llm", current_round_id: "round-1" }],
     };
 
     const result = await getLotteryDocStats("p1");
@@ -133,25 +137,22 @@ describe("getLotteryDocStats", () => {
     expect(result.automationMode).toBe("compare_llm");
     expect(result.currentRoundId).toBe("round-1");
     expect(result.currentRoundLabel).toBe("Rodada inicial");
+    expect(result.batches).toEqual([{ id: "b1", label: "Lote 1", createdAt: "2026-01-01" }]);
     expect(result.activeOpenAssignmentCount).toBe(0);
     expect(result.pendingScopeAssignmentCount).toBe(0);
   });
 
   it("separa trabalho ativo de documentos ainda em revisão de escopo", async () => {
-    serverTableResults = {
+    tableData = {
       ...ROUND_RESULTS,
-      lottery_doc_stats: { data: [] },
-      assignment_batches: { data: [] },
-      projects: {
-        data: { min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" },
-      },
-      lottery_round_work_counts: {
-        data: [
-          { assignment_type: "codificacao", scope_state: "active", open_count: 3 },
-          { assignment_type: "comparacao", scope_state: "active", open_count: 2 },
-          { assignment_type: "codificacao", scope_state: "pending_scope", open_count: 4 },
+      lottery_doc_stats: [],
+      assignment_batches: [],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" }],
+      lottery_round_work_counts: [
+          { project_id: "p1", round_id: "round-1", assignment_type: "codificacao", scope_state: "active", open_count: 3 },
+          { project_id: "p1", round_id: "round-1", assignment_type: "comparacao", scope_state: "active", open_count: 2 },
+          { project_id: "p1", round_id: "round-1", assignment_type: "codificacao", scope_state: "pending_scope", open_count: 4 },
         ],
-      },
     };
 
     const result = await getLotteryDocStats("p1");
@@ -162,11 +163,11 @@ describe("getLotteryDocStats", () => {
   });
 
   it("não consulta responses nem assignments crus (regressão da issue #182)", async () => {
-    serverTableResults = {
+    tableData = {
       ...ROUND_RESULTS,
-      lottery_doc_stats: { data: [] },
-      assignment_batches: { data: [] },
-      projects: { data: { min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" } },
+      lottery_doc_stats: [],
+      assignment_batches: [],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" }],
     };
 
     await getLotteryDocStats("p1");
@@ -180,13 +181,12 @@ describe("getLotteryDocStats", () => {
 
 describe("previewLottery", () => {
   it("caminho feliz: distribui documentos elegíveis a partir da view + assignments brutos", async () => {
-    serverTableResults = {
+    tableData = {
       ...ROUND_RESULTS,
-      project_members: { data: [{ user_id: "u1" }] },
-      lottery_doc_stats: {
-        data: [
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+      lottery_doc_stats: [
           {
-            id: "d1",
+            id: "d1", project_id: "p1",
             external_id: "EXT-1",
             title: "Doc 1",
             human_coding_count: 0,
@@ -197,11 +197,10 @@ describe("previewLottery", () => {
             batch_ids: [],
           },
         ],
-      },
-      assignment_batches: { data: [] },
-      projects: { data: { min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" } },
-      assignments: { data: [] },
-      responses: { data: [] },
+      assignment_batches: [],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" }],
+      assignments: [],
+      responses: [],
     };
 
     const result = await previewLottery({
@@ -224,13 +223,12 @@ describe("previewLottery", () => {
   });
 
   it("falha fechado quando não consegue ler as atribuições existentes", async () => {
-    serverTableResults = {
+    tableData = {
       ...ROUND_RESULTS,
-      project_members: { data: [{ user_id: "u1" }] },
-      lottery_doc_stats: {
-        data: [
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+      lottery_doc_stats: [
           {
-            id: "d1",
+            id: "d1", project_id: "p1",
             external_id: null,
             title: "Doc 1",
             human_coding_count: 0,
@@ -241,15 +239,14 @@ describe("previewLottery", () => {
             batch_ids: [],
           },
         ],
-      },
-      assignment_batches: { data: [] },
-      projects: {
-        data: { min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" },
-      },
-      assignments: { data: null, error: { message: "timeout" } },
-      responses: { data: [] },
+      assignment_batches: [],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" }],
+      assignments: [],
+      responses: [],
     };
+    queryErrors["assignments:select"] = { message: "timeout" };
 
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const result = await previewLottery({
       projectId: "p1",
       type: "codificacao",
@@ -259,20 +256,26 @@ describe("previewLottery", () => {
       participantIds: ["u1"],
     });
 
-    expect(result.error).toBe(
-      "Erro ao ler as atribuições existentes do sorteio: timeout",
+    // O contexto e o texto do Postgres vão ao log; o toast recebe a copy (#502).
+    expect(result.error).toEqual(
+      copyWithRef("Não foi possível calcular a prévia do sorteio. Tente novamente."),
     );
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[assignments] prévia do sorteio falhou", {
+        message: "Erro ao ler as atribuições existentes do sorteio: timeout",
+      }),
+    );
+    consoleError.mockRestore();
     expect(rpcCalls).toHaveLength(0);
   });
 
   it("explica quando a capacidade total dos participantes já acabou", async () => {
-    serverTableResults = {
+    tableData = {
       ...ROUND_RESULTS,
-      project_members: { data: [{ user_id: "u1" }] },
-      lottery_doc_stats: {
-        data: [
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+      lottery_doc_stats: [
           {
-            id: "d1",
+            id: "d1", project_id: "p1",
             external_id: null,
             title: "Doc 1",
             human_coding_count: 0,
@@ -283,7 +286,7 @@ describe("previewLottery", () => {
             batch_ids: [],
           },
           {
-            id: "d2",
+            id: "d2", project_id: "p1",
             external_id: null,
             title: "Doc 2",
             human_coding_count: 1,
@@ -294,17 +297,12 @@ describe("previewLottery", () => {
             batch_ids: ["b0"],
           },
         ],
-      },
-      assignment_batches: { data: [] },
-      projects: {
-        data: { min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" },
-      },
-      assignments: {
-        data: [
-          { document_id: "d2", user_id: "u1", status: "concluido", type: "codificacao", round_id: "round-1" },
+      assignment_batches: [],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" }],
+      assignments: [
+          { document_id: "d2", project_id: "p1", user_id: "u1", status: "concluido", type: "codificacao", round_id: "round-1" },
         ],
-      },
-      responses: { data: [] },
+      responses: [],
     };
 
     const result = await previewLottery({
@@ -326,13 +324,12 @@ describe("previewLottery", () => {
   });
 
   it("atribuições de documentos fora do escopo não consomem capacidade", async () => {
-    serverTableResults = {
+    tableData = {
       ...ROUND_RESULTS,
-      project_members: { data: [{ user_id: "u1" }] },
-      lottery_doc_stats: {
-        data: [
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+      lottery_doc_stats: [
           {
-            id: "active-doc",
+            id: "active-doc", project_id: "p1",
             external_id: null,
             title: "Documento ativo",
             human_coding_count: 0,
@@ -343,18 +340,13 @@ describe("previewLottery", () => {
             batch_ids: [],
           },
         ],
-      },
-      assignment_batches: { data: [] },
-      projects: {
-        data: { min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" },
-      },
-      assignments: {
-        data: [
-          { document_id: "excluded-doc", user_id: "u1", status: "em_andamento", type: "codificacao", round_id: "round-1" },
-          { document_id: "pending-scope-doc", user_id: "u1", status: "pendente", type: "codificacao", round_id: "round-1" },
+      assignment_batches: [],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" }],
+      assignments: [
+          { project_id: "p1", document_id: "excluded-doc", user_id: "u1", status: "em_andamento", type: "codificacao", round_id: "round-1" },
+          { project_id: "p1", document_id: "pending-scope-doc", user_id: "u1", status: "pendente", type: "codificacao", round_id: "round-1" },
         ],
-      },
-      responses: { data: [] },
+      responses: [],
     };
 
     const result = await previewLottery({
@@ -382,14 +374,13 @@ describe("previewLottery", () => {
 describe("sorteio de comparação: um revisor por documento (#490)", () => {
   // Um doc apto à comparação (2 humanos) e três participantes disponíveis: se o
   // número de revisores fosse honrado, sobrariam candidatos para uma 2ª vaga.
-  function comparisonFixture(assignments: unknown[] = []): TableResults {
+  function comparisonFixture(assignments: unknown[] = []): Record<string, unknown[]> {
     return {
       ...ROUND_RESULTS,
-      project_members: { data: [{ user_id: "u1" }, { user_id: "u2" }, { user_id: "u3" }] },
-      lottery_doc_stats: {
-        data: [
+      project_members: [{ project_id: "p1", user_id: "u1" }, { project_id: "p1", user_id: "u2" }, { project_id: "p1", user_id: "u3" }],
+      lottery_doc_stats: [
           {
-            id: "d1",
+            id: "d1", project_id: "p1",
             external_id: "EXT-1",
             title: "Doc 1",
             human_coding_count: 2,
@@ -400,16 +391,15 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
             batch_ids: [],
           },
         ],
-      },
-      assignment_batches: { data: [] },
-      projects: { data: { min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" } },
-      assignments: { data: assignments },
-      responses: { data: [] },
+      assignment_batches: [],
+      projects: [{ id: "p1", min_responses_for_comparison: 2, automation_mode: null, current_round_id: "round-1" }],
+      assignments,
+      responses: [],
     };
   }
 
   it("recusa researchersPerDoc forjado no payload de comparação antes de consultar o banco", async () => {
-    serverTableResults = comparisonFixture();
+    tableData = comparisonFixture();
 
     const result = await previewLottery({
       projectId: "p1",
@@ -431,14 +421,12 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
     // Espelho do trigger enforce_comparison_assignment_actor (20260716160100):
     // resposta humana is_latest veta o par no sorteio manual — sem o veto, o
     // RPC transacional abortaria o lote inteiro com 23514.
-    serverTableResults = {
+    tableData = {
       ...comparisonFixture(),
-      responses: {
-        data: [
-          { document_id: "d1", respondent_id: "u1" },
-          { document_id: "d1", respondent_id: "u2" },
+      responses: [
+          { document_id: "d1", project_id: "p1", respondent_type: "humano", is_latest: true, respondent_id: "u1" },
+          { document_id: "d1", project_id: "p1", respondent_type: "humano", is_latest: true, respondent_id: "u2" },
         ],
-      },
     };
 
     const result = await previewLottery({
@@ -457,7 +445,7 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
   });
 
   it("codificação continua honrando dois pesquisadores por documento", async () => {
-    serverTableResults = comparisonFixture();
+    tableData = comparisonFixture();
 
     const result = await previewLottery({
       projectId: "p1",
@@ -475,8 +463,8 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
   it("documento com comparação CONCLUÍDA volta a ser sorteável, mas não para quem já comparou", async () => {
     // Concluída não ocupa a vaga (é o que permite a re-rodada por versão de
     // schema); o par continua bloqueado pelo preservedSet.
-    serverTableResults = comparisonFixture([
-      { document_id: "d1", user_id: "u1", status: "concluido", type: "comparacao" },
+    tableData = comparisonFixture([
+      { document_id: "d1", project_id: "p1", user_id: "u1", status: "concluido", type: "comparacao" },
     ]);
 
     const result = await previewLottery({
@@ -494,8 +482,8 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
   });
 
   it("documento com comparação PENDENTE não recebe um segundo revisor", async () => {
-    serverTableResults = comparisonFixture([
-      { document_id: "d1", user_id: "u1", status: "pendente", type: "comparacao" },
+    tableData = comparisonFixture([
+      { document_id: "d1", project_id: "p1", user_id: "u1", status: "pendente", type: "comparacao" },
     ]);
 
     const result = await previewLottery({
@@ -516,8 +504,8 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
   });
 
   it("não chama a RPC quando todas as vagas já estão ocupadas", async () => {
-    serverTableResults = comparisonFixture([
-      { document_id: "d1", user_id: "u1", status: "pendente", type: "comparacao", round_id: "round-1" },
+    tableData = comparisonFixture([
+      { document_id: "d1", project_id: "p1", user_id: "u1", status: "pendente", type: "comparacao", round_id: "round-1" },
     ]);
 
     const result = await smartRandomize({
@@ -534,12 +522,10 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
   });
 
   it("explica quando todos os pares disponíveis são vetados", async () => {
-    serverTableResults = {
+    tableData = {
       ...comparisonFixture(),
-      project_members: { data: [{ user_id: "u1" }] },
-      responses: {
-        data: [{ document_id: "d1", respondent_id: "u1", round_id: "round-1" }],
-      },
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+      responses: [{ document_id: "d1", project_id: "p1", respondent_type: "humano", is_latest: true, respondent_id: "u1", round_id: "round-1" }],
     };
 
     const result = await previewLottery({
@@ -559,12 +545,7 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
   });
 
   it("smartRandomize grava um assignment e registra researchers_per_doc 1 no lote", async () => {
-    serverTableResults = {
-      ...comparisonFixture(),
-      // Fila: a 1ª leitura é a do computeLottery (lista de lotes); a 2ª é o
-      // insert...select("id").single() do lote deste sorteio.
-      assignment_batches: [{ data: [] }, { data: { id: "b1" } }],
-    };
+    tableData = comparisonFixture();
     rpcResults = { apply_lottery_assignments: { data: { inserted: 1 } } };
 
     const result = await smartRandomize({
@@ -585,14 +566,69 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
     expect((rpc?.args as { p_batch: unknown }).p_batch).toMatchObject({ researchers_per_doc: 1 });
   });
 
-  it("nova rodada envia contagens e confirmações separadas no snapshot transacional", async () => {
-    serverTableResults = {
+  // 40001: a RPC recusa o lote porque o sorteio mudou desde a prévia. A
+  // saída é recarregar, e a copy diz isso; outra falha da RPC vai ao log.
+  it.each([
+    [
+      { code: "40001", message: "a rodada atual mudou; recarregue o sorteio" },
+      "O sorteio mudou desde que foi aberto (rodada, escopo ou trabalho em aberto). Recarregue o sorteio e tente novamente.",
+      false,
+    ],
+    [
+      { code: "P0001", message: "a rodada atual possui 3 trabalhos abertos em documentos ativos" },
+      "Não foi possível iniciar a nova rodada: a rodada atual possui 3 trabalhos abertos em documentos ativos. Reabra o sorteio e confirme o trabalho em aberto.",
+      false,
+    ],
+    [
+      { code: "XX000", message: "internal error" },
+      copyWithRef("Não foi possível gravar o sorteio. Tente novamente."),
+      true,
+    ],
+  ])("smartRandomize com a RPC recusando (%o)", async (rpcError, expected, logged) => {
+    tableData = comparisonFixture();
+    rpcResults = { apply_lottery_assignments: { error: rpcError } };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await smartRandomize({
+      projectId: "p1",
+      type: "comparacao",
+      mode: "append",
+      balancing: "round",
+      participantIds: ["u1", "u2", "u3"],
+    });
+
+    expect(result.error).toEqual(expected);
+    expect(consoleError.mock.calls.length > 0).toBe(logged);
+    consoleError.mockRestore();
+  });
+
+  it("recusa deliberada do sorteio chega ao toast como foi escrita", async () => {
+    tableData = {
       ...comparisonFixture(),
-      project_members: { data: [{ user_id: "u1" }] },
-      lottery_doc_stats: {
-        data: [
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+    };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await previewLottery({
+      projectId: "p1",
+      type: "comparacao",
+      mode: "append",
+      balancing: "round",
+      participantIds: ["u1", "u-desconhecido"],
+    });
+
+    expect(result.error).toBe("Necessário ter ao menos um participante válido.");
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it("nova rodada envia contagens e confirmações separadas no snapshot transacional", async () => {
+    tableData = {
+      ...comparisonFixture(),
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+      lottery_doc_stats: [
           {
-            id: "d1",
+            id: "d1", project_id: "p1",
             external_id: "EXT-1",
             title: "Doc 1",
             human_coding_count: 2,
@@ -603,14 +639,11 @@ describe("sorteio de comparação: um revisor por documento (#490)", () => {
             batch_ids: ["old-batch"],
           },
         ],
-      },
-      lottery_round_work_counts: {
-        data: [
-          { assignment_type: "codificacao", scope_state: "active", open_count: 2 },
-          { assignment_type: "comparacao", scope_state: "pending_scope", open_count: 3 },
+      lottery_round_work_counts: [
+          { project_id: "p1", round_id: "round-1", assignment_type: "codificacao", scope_state: "active", open_count: 2 },
+          { project_id: "p1", round_id: "round-1", assignment_type: "comparacao", scope_state: "pending_scope", open_count: 3 },
         ],
-      },
-      responses: { data: [] },
+      responses: [],
     };
     rpcResults = {
       apply_lottery_assignments: { data: { inserted: 1, round_id: "round-2" } },
@@ -678,18 +711,13 @@ describe("status inicial do assignment de codificação (#521)", () => {
 
   // Um documento e um participante: o sorteio cria exatamente o par (d1, u1),
   // o mesmo par que já tem response humana.
-  function codingFixture(responseRows: unknown[], answerRows: unknown[]): TableResults {
+  function codingFixture(responseRows: Array<Record<string, unknown>>): Record<string, unknown[]> {
     return {
       ...ROUND_RESULTS,
-      rounds: [
-        { data: { id: "round-1", label: "Rodada inicial" } },
-        { data: [{ id: "round-1", label: "Rodada inicial" }] },
-      ],
-      project_members: { data: [{ user_id: "u1" }] },
-      lottery_doc_stats: {
-        data: [
+      project_members: [{ project_id: "p1", user_id: "u1" }],
+      lottery_doc_stats: [
           {
-            id: "d1",
+            id: "d1", project_id: "p1",
             external_id: "EXT-1",
             title: "Doc 1",
             human_coding_count: 1,
@@ -700,14 +728,15 @@ describe("status inicial do assignment de codificação (#521)", () => {
             batch_ids: [],
           },
         ],
-      },
-      // Fila: leitura da lista de lotes no computeLottery e, depois, o insert
-      // do lote deste sorteio.
-      assignment_batches: [{ data: [] }, { data: { id: "b1" } }],
-      projects: { data: PROJECT_ROW },
-      assignments: { data: [] },
-      // Fila: fase 1 (linhas leves, sem answers) e fase 2 (answers dos pares).
-      responses: [{ data: responseRows }, { data: answerRows }],
+      assignment_batches: [],
+      projects: [{ id: "p1", ...PROJECT_ROW }],
+      assignments: [],
+      // A projeção do SELECT tira answers na fase 1; a segunda fase lê a
+      // mesma linha, filtrada pelo ID, com as respostas completas.
+      responses: responseRows.map((row) => ({
+        project_id: "p1", respondent_type: "humano", is_latest: true,
+        ...row,
+      })),
     };
   }
 
@@ -730,19 +759,19 @@ describe("status inicial do assignment de codificação (#521)", () => {
   });
 
   it("sorteio manda 'concluido' + completed_at quando o sorteado já codificou o documento", async () => {
-    serverTableResults = codingFixture(
+    tableData = codingFixture(
       [
         {
           id: "r1",
-          document_id: "d1",
+          document_id: "d1", project_id: "p1",
           respondent_id: "u1",
           updated_at: CODED_AT,
           round_id: null,
           is_partial: false,
           ...CURRENT_VERSION,
+          answers: { q1: "a", q2: "b" }, answer_field_hashes: {},
         },
       ],
-      [{ id: "r1", answers: { q1: "a", q2: "b" }, answer_field_hashes: {} }],
     );
 
     const result = await smartRandomize(lotteryParams);
@@ -754,19 +783,19 @@ describe("status inicial do assignment de codificação (#521)", () => {
   });
 
   it("codificação parcial do sorteado vira 'em_andamento'", async () => {
-    serverTableResults = codingFixture(
+    tableData = codingFixture(
       [
         {
           id: "r1",
-          document_id: "d1",
+          document_id: "d1", project_id: "p1",
           respondent_id: "u1",
           updated_at: CODED_AT,
           round_id: null,
           is_partial: true,
           ...CURRENT_VERSION,
+          answers: { q1: "a" }, answer_field_hashes: {},
         },
       ],
-      [{ id: "r1", answers: { q1: "a" }, answer_field_hashes: {} }],
     );
 
     await smartRandomize(lotteryParams);
@@ -778,11 +807,11 @@ describe("status inicial do assignment de codificação (#521)", () => {
 
   it("documento sem response do sorteado vai para a RPC sem status (default 'pendente')", async () => {
     // Response de OUTRO pesquisador não promove o par sorteado.
-    serverTableResults = codingFixture(
+    tableData = codingFixture(
       [
         {
           id: "r9",
-          document_id: "d1",
+          document_id: "d1", project_id: "p1",
           respondent_id: "u9",
           updated_at: CODED_AT,
           round_id: null,
@@ -790,7 +819,6 @@ describe("status inicial do assignment de codificação (#521)", () => {
           ...CURRENT_VERSION,
         },
       ],
-      [],
     );
 
     await smartRandomize(lotteryParams);
@@ -802,52 +830,49 @@ describe("status inicial do assignment de codificação (#521)", () => {
     // Degradar para 'pendente' em silêncio reintroduziria o próprio bug sem
     // sinal nenhum; e o cálculo vem antes do lote justamente para o erro não
     // deixar um assignment_batches órfão.
-    serverTableResults = {
-      ...codingFixture(
+    tableData = codingFixture(
         [
           {
             id: "r1",
-            document_id: "d1",
+            document_id: "d1", project_id: "p1",
             respondent_id: "u1",
             updated_at: CODED_AT,
             round_id: null,
             is_partial: false,
             ...CURRENT_VERSION,
+            answers: { q1: "a", q2: "b" }, answer_field_hashes: {},
           },
         ],
-        [{ id: "r1", answers: { q1: "a", q2: "b" }, answer_field_hashes: {} }],
-      ),
-      // 1ª leitura: a do computeLottery. 2ª: a do status inicial, que falha.
-      projects: [{ data: PROJECT_ROW }, { data: null, error: { message: "boom" } }],
-    };
+      );
+    // A segunda leitura de projects pede o schema; a primeira já foi feita.
+    queryErrors["projects:select:pydantic_fields, current_round_id"] = { message: "boom" };
 
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const result = await smartRandomize(lotteryParams);
 
-    expect(result.error).toContain("status inicial");
+    expect(result.error).toEqual(
+      copyWithRef("Não foi possível gravar o sorteio. Tente novamente."),
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[assignments] sorteio falhou", {
+        message: expect.stringContaining("status inicial"),
+      }),
+    );
+    consoleError.mockRestore();
     expect(writeCalls.some((c) => c.table === "assignment_batches")).toBe(false);
     expect(rpcCalls).toHaveLength(0);
   });
 
   it("atribuição manual sobre documento já codificado nasce concluída", async () => {
-    serverTableResults = {
-      assignments: { data: [] },
-      projects: { data: PROJECT_ROW },
-      responses: [
-        // Autoria do par (`isHumanCoder`), lida em paralelo às atribuições.
-        { count: 1 },
-        {
-          data: {
-            id: "r1",
-            document_id: "d1",
-            respondent_id: "u1",
-            updated_at: CODED_AT,
-            round_id: null,
-            is_partial: false,
-            ...CURRENT_VERSION,
-          },
-        },
-        { data: [{ id: "r1", answers: { q1: "a", q2: "b" }, answer_field_hashes: {} }] },
-      ],
+    tableData = {
+      assignments: [],
+      projects: [{ id: "p1", ...PROJECT_ROW }],
+      responses: [{
+        id: "r1", project_id: "p1", document_id: "d1", respondent_type: "humano", is_latest: true, respondent_id: "u1",
+        updated_at: CODED_AT,
+        round_id: null, is_partial: false, ...CURRENT_VERSION,
+        answers: { q1: "a", q2: "b" }, answer_field_hashes: {},
+      }],
     };
 
     const result = await cycleAssignment("p1", "d1", "u1");
@@ -855,7 +880,7 @@ describe("status inicial do assignment de codificação (#521)", () => {
     expect(result.error).toBeUndefined();
     const insert = writeCalls.find((c) => c.table === "assignments" && c.op === "insert");
     expect(insert?.payload).toMatchObject({
-      document_id: "d1",
+      document_id: "d1", project_id: "p1",
       user_id: "u1",
       type: "codificacao",
       status: "concluido",
@@ -864,10 +889,10 @@ describe("status inicial do assignment de codificação (#521)", () => {
   });
 
   it("atribuição manual sobre documento nunca codificado nasce pendente", async () => {
-    serverTableResults = {
-      assignments: { data: [] },
-      projects: { data: PROJECT_ROW },
-      responses: [{ count: 0 }, { data: null }, { data: [] }],
+    tableData = {
+      assignments: [],
+      projects: [{ id: "p1", ...PROJECT_ROW }],
+      responses: [],
     };
 
     await cycleAssignment("p1", "d1", "u1");
@@ -882,15 +907,15 @@ describe("status inicial do assignment de codificação (#521)", () => {
 // ciclo manual promovia a codificação pendente sem olhar a autoria e o 23514
 // do gatilho chegava cru ao toast — sem caminho para liberar a exceção.
 describe("cycleAssignment — autocomparação", () => {
-  const PROJECT = { data: { current_round_id: "round-1" } };
-  const pendingCoding = { data: [{ id: "a1", status: "pendente", type: "codificacao" }] };
-  const doneCoding = { data: [{ id: "a1", status: "concluido", type: "codificacao" }] };
-  const coder = { count: 1 };
-  const notCoder = { count: 0 };
+  const PROJECT = [{ id: "p1", current_round_id: "round-1" }];
+  const pendingCoding = [{ id: "a1", project_id: "p1", document_id: "d1", user_id: "u1", round_id: "round-1", status: "pendente", type: "codificacao" }];
+  const doneCoding = [{ ...pendingCoding[0], status: "concluido" }];
+  const coder = [{ id: "r1", project_id: "p1", document_id: "d1", respondent_type: "humano", is_latest: true, respondent_id: "u1" }];
+  const notCoder: unknown[] = [];
   const assignmentWrites = () => writeCalls.filter((c) => c.table === "assignments");
 
   it("pede confirmação, sem gravar, antes de dar a comparação a quem codificou", async () => {
-    serverTableResults = { projects: PROJECT, assignments: [pendingCoding], responses: coder };
+    tableData = { projects: PROJECT, assignments: pendingCoding, responses: coder };
 
     const result = await cycleAssignment("p1", "d1", "u1");
 
@@ -899,33 +924,33 @@ describe("cycleAssignment — autocomparação", () => {
   });
 
   it("com a confirmação, promove e registra quem liberou", async () => {
-    serverTableResults = { projects: PROJECT, assignments: [pendingCoding, { data: null }], responses: coder };
+    tableData = { projects: PROJECT, assignments: pendingCoding, responses: coder };
 
     const result = await cycleAssignment("p1", "d1", "u1", { allowSelfComparison: true });
 
     expect(result.error).toBeUndefined();
     expect(assignmentWrites()).toEqual([
-      { table: "assignments", op: "update", payload: { type: "comparacao", self_comparison_approved_by: "user-1" } },
+      { table: "assignments", op: "update", payload: { type: "comparacao", self_comparison_approved_by: "user-1" }, filters: [["eq", "id", "a1"]] },
     ]);
   });
 
   it("sem codificação do par, promove como sempre, sem liberação", async () => {
-    serverTableResults = { projects: PROJECT, assignments: [pendingCoding, { data: null }], responses: notCoder };
+    tableData = { projects: PROJECT, assignments: pendingCoding, responses: notCoder };
 
     const result = await cycleAssignment("p1", "d1", "u1");
 
     expect(result).toEqual({});
     expect(assignmentWrites()).toEqual([
-      { table: "assignments", op: "update", payload: { type: "comparacao" } },
+      { table: "assignments", op: "update", payload: { type: "comparacao" }, filters: [["eq", "id", "a1"]] },
     ]);
   });
 
   it("codificação concluída ganha a comparação da própria codificação, com confirmação", async () => {
-    serverTableResults = { projects: PROJECT, assignments: [doneCoding], responses: coder };
+    tableData = { projects: PROJECT, assignments: doneCoding, responses: coder };
     expect(await cycleAssignment("p1", "d1", "u1")).toEqual({ needsSelfComparisonConfirmation: true });
     expect(assignmentWrites()).toHaveLength(0);
 
-    serverTableResults = { projects: PROJECT, assignments: [doneCoding, { data: null }], responses: coder };
+    tableData = { projects: PROJECT, assignments: doneCoding, responses: coder };
     const result = await cycleAssignment("p1", "d1", "u1", { allowSelfComparison: true });
 
     expect(result.error).toBeUndefined();
@@ -933,6 +958,7 @@ describe("cycleAssignment — autocomparação", () => {
       {
         table: "assignments",
         op: "insert",
+        filters: [],
         payload: {
           project_id: "p1",
           document_id: "d1",
@@ -946,7 +972,7 @@ describe("cycleAssignment — autocomparação", () => {
   });
 
   it("codificação concluída de quem não codificou segue travada, com aviso", async () => {
-    serverTableResults = { projects: PROJECT, assignments: [doneCoding], responses: notCoder };
+    tableData = { projects: PROJECT, assignments: doneCoding, responses: notCoder };
 
     expect((await cycleAssignment("p1", "d1", "u1")).error).toMatch(/não tem codificação corrente/);
     expect(assignmentWrites()).toHaveLength(0);
@@ -954,40 +980,91 @@ describe("cycleAssignment — autocomparação", () => {
 
   it("confirmação que já não corresponde ao par (passo mudou) não grava nada", async () => {
     // A outra aba concluiu a promoção: o próximo passo seria apagar.
-    serverTableResults = {
+    tableData = {
       projects: PROJECT,
-      assignments: [{ data: [{ id: "a1", status: "pendente", type: "comparacao" }] }],
+      assignments: [{ ...pendingCoding[0], type: "comparacao" }],
       responses: coder,
     };
     expect((await cycleAssignment("p1", "d1", "u1", { allowSelfComparison: true })).error).toMatch(/mudou/);
 
     // A codificação sumiu: a promoção deixou de ser autocomparação.
-    serverTableResults = { projects: PROJECT, assignments: [pendingCoding], responses: notCoder };
+    tableData = { projects: PROJECT, assignments: pendingCoding, responses: notCoder };
     expect((await cycleAssignment("p1", "d1", "u1", { allowSelfComparison: true })).error).toMatch(/mudou/);
 
     expect(assignmentWrites()).toHaveLength(0);
   });
 
   it("23514 do gatilho (codificação surgida entre a checagem e a escrita) reabre a confirmação", async () => {
-    serverTableResults = {
+    tableData = {
       projects: PROJECT,
-      assignments: [pendingCoding, { error: { code: "23514", message: "o codificador do documento não pode receber sua comparação" } }],
+      assignments: pendingCoding,
       responses: notCoder,
     };
+    queryErrors["assignments:update"] = { code: "23514", message: "o codificador do documento não pode receber sua comparação" };
 
     expect(await cycleAssignment("p1", "d1", "u1")).toEqual({ needsSelfComparisonConfirmation: true });
   });
 
-  it("outro 23514 em assignments é erro real, não pedido de confirmação", async () => {
-    serverTableResults = {
+  // guard_self_comparison_approval: quem libera perdeu o papel entre o gate e
+  // a escrita. A recusa pt-BR do gatilho chega ao toast como veio.
+  it("recusa 42501 da liberação de autocomparação passa como veio", async () => {
+    tableData = {
       projects: PROJECT,
-      assignments: [pendingCoding, { error: { code: "23514", message: "violates check constraint \"assignments_self_comparison_approval_shape\"" } }],
+      assignments: pendingCoding,
       responses: notCoder,
     };
+    queryErrors["assignments:update"] = { code: "42501", message: "só o coordenador pode liberar a autocomparação" };
 
     const result = await cycleAssignment("p1", "d1", "u1");
 
+    expect(result.error).toBe("só o coordenador pode liberar a autocomparação");
+  });
+
+  it("outro 23514 em assignments é erro real, não pedido de confirmação", async () => {
+    tableData = {
+      projects: PROJECT,
+      assignments: pendingCoding,
+      responses: notCoder,
+    };
+    queryErrors["assignments:update"] = { code: "23514", message: "violates check constraint \"assignments_self_comparison_approval_shape\"" };
+
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await cycleAssignment("p1", "d1", "u1");
+
     expect(result.needsSelfComparisonConfirmation).toBeUndefined();
-    expect(result.error).toMatch(/assignments_self_comparison_approval_shape/);
+    expect(result.error).toEqual(
+      copyWithRef("Não foi possível alterar a atribuição. Tente novamente."),
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[assignments] ciclo da atribuição falhou", {
+        code: "23514",
+        message: expect.stringMatching(/assignments_self_comparison_approval_shape/),
+      }),
+    );
+    consoleError.mockRestore();
+  });
+});
+
+// O texto do Postgres ia cru, em inglês, ao toast pt-BR: vai ao log do
+// servidor, e a action devolve a copy do fluxo (#502).
+describe("clearPendingAssignments — erro do banco", () => {
+  it("devolve copy pt-BR e loga o texto cru", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const pgError = { code: "57014", message: "canceling statement due to statement timeout" };
+    tableData = {
+      projects: [{ id: "p1", current_round_id: "round-1" }],
+      assignments: [],
+    };
+    queryErrors["assignments:delete"] = pgError;
+
+    const result = await clearPendingAssignments("p1");
+
+    expect(result).toEqual({
+      error: copyWithRef("Não foi possível limpar as atribuições pendentes. Tente novamente."),
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[assignments] limpeza das pendentes falhou", pgError),
+    );
+    consoleError.mockRestore();
   });
 });

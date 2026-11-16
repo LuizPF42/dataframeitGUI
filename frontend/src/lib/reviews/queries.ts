@@ -8,11 +8,12 @@ import type {
   RespondentAnswer,
 } from "./types";
 import { buildReviewLookupMaps } from "./lookup-maps";
-import { fetchAllPaged } from "@/lib/supabase/fetch-all-paged";
+import { fetchAllAfterId } from "@/lib/supabase/fetch-all-paged";
 import { effectiveErrorResolution, errorResolutionComment, ERROR_DECISION_LABELS, isBlankAnswer, type ErrorResolutionRow, type EffectiveErrorResolution } from "@/lib/error-resolution";
 import { pickValidCellReviews } from "@/lib/review-validity";
 import { stableStringify } from "@/lib/schema-utils";
 import { isComparedField } from "@/lib/compare-divergence";
+import { fetchProfileNames, respondentDisplayName } from "@/lib/respondent-names";
 
 /* ── Raw row shapes ── */
 
@@ -46,12 +47,6 @@ export interface ReviewRow {
 
 /* ── Context shared across computations ── */
 
-export interface ReviewDataTruncation {
-  responses: boolean;
-  reviews: boolean;
-  documents: boolean;
-}
-
 export interface ReviewComputationContext {
   fields: PydanticField[];
   comparableFields: PydanticField[];
@@ -62,11 +57,6 @@ export interface ReviewComputationContext {
   responsesByDoc: Map<string, ResponseRow[]>;
   uniqueReviews: ReviewRow[];
   errorResolutions?: ErrorResolutionRow[];
-  profileMap: Map<string, string>;
-  // true para cada tabela cuja query atingiu REVIEW_BASE_DATA_LIMIT — os
-  // dados agregados podem estar silenciosamente errados. As paginas de
-  // reviews renderizam um TruncationBanner quando alguma flag e true.
-  truncated: ReviewDataTruncation;
 }
 
 /* ── Pure helpers ── */
@@ -153,42 +143,7 @@ function getRespondentKey(r: {
     : r.respondent_name || "llm";
 }
 
-function getRespondentDisplayName(
-  r: {
-    respondent_id: string | null;
-    respondent_name: string | null;
-    respondent_type: string;
-  },
-  profileMap: Map<string, string>,
-) {
-  if (r.respondent_type === "humano") {
-    return r.respondent_id
-      ? profileMap.get(r.respondent_id) || r.respondent_name || "Pesquisador"
-      : r.respondent_name || "Pesquisador";
-  }
-  return r.respondent_name || "LLM";
-}
-
 /* ── Fetch base data ── */
-
-export const REVIEW_BASE_DATA_LIMIT = 50000;
-
-/**
- * Marca como `true` cada tabela cuja query atingiu o teto de
- * REVIEW_BASE_DATA_LIMIT linhas. Query que falhou (`null`) nao conta como
- * truncada — `null?.length` e `undefined`, nunca igual ao teto.
- */
-export function computeTruncation(
-  responses: unknown[] | null,
-  reviews: unknown[] | null,
-  documents: unknown[] | null,
-): ReviewDataTruncation {
-  return {
-    responses: responses?.length === REVIEW_BASE_DATA_LIMIT,
-    reviews: reviews?.length === REVIEW_BASE_DATA_LIMIT,
-    documents: documents?.length === REVIEW_BASE_DATA_LIMIT,
-  };
-}
 
 /**
  * A review vigente de cada (documento, campo) do Gabarito, pela regra única de
@@ -203,110 +158,99 @@ export function gabaritoReviews(
   return [...pickValidCellReviews(reviews, fieldMap).values()];
 }
 
+// Lança em vez de devolver a leitura parcial: metade das linhas renderizaria um
+// Gabarito com cara de completo.
+async function readAllOrThrow<T>(
+  read: PromiseLike<{ data: T[]; error: { message: string } | null }>,
+  what: string,
+): Promise<T[]> {
+  const { data, error } = await read;
+  if (error) throw new Error(`Não foi possível carregar ${what}: ${error.message}`, { cause: error });
+  return data;
+}
+
+// As três tabelas são lidas inteiras, página a página: o PostgREST corta cada
+// resposta em `max_rows` sem erro, e um `.limit()` acima disso não muda o corte.
 export async function fetchReviewBaseData(
   supabase: SupabaseClient,
   projectId: string,
-  options?: { since?: string },
 ): Promise<ReviewComputationContext> {
-  let responsesQuery = supabase
-    .from("responses")
-    .select(
-      "id, document_id, respondent_id, respondent_type, respondent_name, answers, justifications, is_latest, pydantic_hash, answer_field_hashes, created_at",
-    )
-    .eq("project_id", projectId)
-    .eq("is_latest", true)
-    .limit(REVIEW_BASE_DATA_LIMIT);
-
-  if (options?.since) {
-    responsesQuery = responsesQuery.gte("created_at", options.since);
-  }
-
   const [
-    { data: project },
-    { data: responses },
-    { data: reviews },
-    { data: documents },
-    { data: errorResolutions, error: resolutionsError },
+    { data: project, error: projectError },
+    responses,
+    reviews,
+    documents,
+    errorResolutions,
+    profileNames,
   ] = await Promise.all([
     supabase
       .from("projects")
       .select("pydantic_fields, pydantic_hash, created_by")
       .eq("id", projectId)
       .single(),
-    responsesQuery,
-    supabase
-      .from("reviews")
-      .select(
-        "id, document_id, field_name, verdict, chosen_response_id, comment, reviewer_id, created_at, field_hash",
-      )
-      .eq("project_id", projectId)
-      .limit(REVIEW_BASE_DATA_LIMIT),
-    supabase
-      .from("documents")
-      .select("id, title, external_id")
-      .eq("project_id", projectId)
-      .is("excluded_at", null)
-      .is("exclusion_pending_at", null)
-      .limit(REVIEW_BASE_DATA_LIMIT),
-    fetchAllPaged<ErrorResolutionRow>(() => supabase.rpc("read_error_resolutions", { p_project_id: projectId }), ["id"]),
+    readAllOrThrow(
+      fetchAllAfterId<ResponseRow>(() =>
+        supabase
+          .from("responses")
+          .select(
+            "id, document_id, respondent_id, respondent_type, respondent_name, answers, justifications, pydantic_hash, answer_field_hashes, created_at",
+          )
+          .eq("project_id", projectId)
+          .eq("is_latest", true),
+      ),
+      "as respostas",
+    ),
+    readAllOrThrow(
+      fetchAllAfterId<ReviewRow>(() =>
+        supabase
+          .from("reviews")
+          .select(
+            "id, document_id, field_name, verdict, chosen_response_id, comment, reviewer_id, created_at, field_hash",
+          )
+          .eq("project_id", projectId),
+      ),
+      "as revisões",
+    ),
+    readAllOrThrow(
+      fetchAllAfterId<{ id: string; title: string | null; external_id: string | null }>(() =>
+        supabase
+          .from("documents")
+          .select("id, title, external_id")
+          .eq("project_id", projectId)
+          .is("excluded_at", null)
+          .is("exclusion_pending_at", null),
+      ),
+      "os documentos",
+    ),
+    readAllOrThrow(
+      fetchAllAfterId<ErrorResolutionRow>(() => supabase.rpc("read_error_resolutions", { p_project_id: projectId })),
+      "as decisões",
+    ),
+    fetchProfileNames(supabase, projectId),
   ]);
-  if (resolutionsError) throw new Error(`Não foi possível carregar as decisões: ${resolutionsError.message}`);
-
-  const truncated = computeTruncation(responses, reviews, documents);
-  for (const [name, isTruncated] of Object.entries(truncated)) {
-    if (isTruncated) {
-      console.warn(
-        `fetchReviewBaseData: ${name} atingiu o teto de ${REVIEW_BASE_DATA_LIMIT} linhas para o projeto ${projectId} — dados podem estar truncados, considere paginar.`,
-      );
-    }
-  }
-
   const fields = (project?.pydantic_fields || []) as PydanticField[];
   const projectPydanticHash = project?.pydantic_hash || null;
 
   const { fieldMap, docMap } = buildReviewLookupMaps(fields, documents);
   const currentFieldHashes = buildFieldHashMap(fields);
 
-  // Fetch profile names
-  const respondentIds = new Set<string>();
-  responses?.forEach((r) => {
-    if (r.respondent_id) respondentIds.add(r.respondent_id);
-  });
-  reviews?.forEach((r) => {
-    if (r.reviewer_id) respondentIds.add(r.reviewer_id);
-  });
+  // Sem o projeto não há schema, e todo veredito sairia como de campo removido.
+  if (projectError) throw new Error(`Não foi possível carregar o projeto: ${projectError.message}`, { cause: projectError });
 
-  let profileMap = new Map<string, string>();
-  if (respondentIds.size > 0) {
-    const { data: profiles } = await supabase
-      .from("profiles")
-      .select("id, full_name")
-      .in("id", [...respondentIds]);
-    profileMap = new Map(
-      profiles?.map((p) => [p.id, p.full_name || p.id]) || [],
-    );
+  const responsesByDoc = new Map<string, ResponseRow[]>();
+  for (const r of responses) {
+    const list = responsesByDoc.get(r.document_id) || [];
+    list.push({ ...r, respondent_name: respondentDisplayName(r, profileNames) });
+    responsesByDoc.set(r.document_id, list);
+  }
+  // O cursor devolve as respostas na ordem da PK, que é aleatória. A ordem
+  // dos respondentes de cada documento na tela segue a de gravação, por
+  // instante e não pelo texto do timestamp, como em `pickCellReview`.
+  for (const list of responsesByDoc.values()) {
+    list.sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || (a.id < b.id ? -1 : 1));
   }
 
-  // Group responses by document_id
-  const responsesByDoc = new Map<string, ResponseRow[]>();
-  responses?.forEach((r) => {
-    const list = responsesByDoc.get(r.document_id) || [];
-    list.push({
-      id: r.id,
-      document_id: r.document_id,
-      respondent_id: r.respondent_id,
-      respondent_type: r.respondent_type as "humano" | "llm",
-      respondent_name: r.respondent_name,
-      answers: r.answers as Record<string, unknown>,
-      justifications: r.justifications as Record<string, string> | null,
-      pydantic_hash: r.pydantic_hash,
-      answer_field_hashes: r.answer_field_hashes as AnswerFieldHashes,
-      created_at: r.created_at,
-    });
-    responsesByDoc.set(r.document_id, list);
-  });
-
-  const uniqueReviews = gabaritoReviews(reviews as ReviewRow[] | null, fieldMap);
+  const uniqueReviews = gabaritoReviews(reviews, fieldMap);
 
   const comparableFields = fields.filter(isComparedField);
 
@@ -320,8 +264,6 @@ export async function fetchReviewBaseData(
     responsesByDoc,
     uniqueReviews,
     errorResolutions,
-    profileMap,
-    truncated,
   };
 }
 
@@ -408,6 +350,9 @@ function sameAnswer(answer: unknown, value: unknown): boolean {
 }
 
 export function computeReviewedDocuments(ctx: ReviewComputationContext): ReviewedDocument[] {
+  // As reviews chegam na ordem da PK, que é aleatória: os campos de cada
+  // documento saem na ordem do schema.
+  const fieldOrder = new Map(ctx.fields.map((field, index) => [field.name, index]));
   const reviewsByDoc = new Map<string, ReviewRow[]>();
   reviewsWithResolutions(ctx).forEach((r) => {
     const list = reviewsByDoc.get(r.document_id) || [];
@@ -421,6 +366,7 @@ export function computeReviewedDocuments(ctx: ReviewComputationContext): Reviewe
     const docResponses = ctx.responsesByDoc.get(docId) || [];
     const reviewedFields: ReviewedField[] = [];
 
+    docReviews.sort((a, b) => (fieldOrder.get(a.field_name) ?? 0) - (fieldOrder.get(b.field_name) ?? 0));
     for (const review of docReviews) {
       const { resolution } = review;
       const field = ctx.fieldMap.get(review.field_name);
@@ -438,7 +384,9 @@ export function computeReviewedDocuments(ctx: ReviewComputationContext): Reviewe
         const correct = isReviewedAnswerCorrect(answer, review, field.type);
         return {
           respondentKey: getRespondentKey(r),
-          respondentName: getRespondentDisplayName(r, ctx.profileMap),
+          respondentName:
+            r.respondent_name ||
+            (r.respondent_type === "humano" ? "Pesquisador" : "LLM"),
           respondentType: r.respondent_type,
           answer,
           justification: r.justifications?.[review.field_name] || null,
