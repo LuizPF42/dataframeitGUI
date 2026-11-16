@@ -12,6 +12,7 @@ import { serverErrorCopy } from "@/lib/server-error";
 import type { ErrorResolutionRow } from "@/lib/error-resolution";
 import { fetchProjectValueEquivalences } from "@/lib/value-equivalence-query";
 import { usesAutoReviewSource } from "@/lib/llm-error-metrics";
+import { readProfileNames, withProfileNames } from "@/lib/respondent-names";
 import {
   assembleExport,
   type ExportDataset,
@@ -60,6 +61,7 @@ export async function getExportDataset(
     { data: errorResolutions, error: resolutionsError },
     { data: equivalences, error: equivalencesError },
     { data: comparisons, error: comparisonsError },
+    { data: profileNames, error: profileNamesError },
   ] = await Promise.all([
     supabase
       .from("projects")
@@ -105,6 +107,7 @@ export async function getExportDataset(
         .eq("project_id", projectId)
         .eq("type", "comparacao"),
     ),
+    readProfileNames(supabase, projectId),
   ]);
 
   const error = [
@@ -115,6 +118,7 @@ export async function getExportDataset(
     resolutionsError,
     equivalencesError,
     comparisonsError,
+    profileNamesError,
   ].find(Boolean);
   if (error) return { error: serverErrorCopy("[export] leitura falhou", error, { generic: EXPORT_READ_FAILED }) };
   if (!project) return { error: "Projeto não encontrado." };
@@ -146,7 +150,9 @@ export async function getExportDataset(
     fields: (project.pydantic_fields || []) as PydanticField[],
     minResponses: project.min_responses_for_comparison || 2,
     documents,
-    responses,
+    // A mesma pessoa saía sob dois nomes (e-mail e nome) conforme a data de
+    // cada gravação (#622).
+    responses: withProfileNames(responses, profileNames),
     reviews,
     errorResolutions,
     equivalences,

@@ -104,6 +104,33 @@ const withOthers = (tables: Record<string, unknown[]>): Record<string, unknown[]
 };
 
 describe("getExportDataset — monta o dataset a partir das queries", () => {
+  // #622: `respondent_name` congela o que o perfil tinha no dia da gravação,
+  // e a mesma pessoa saía na exportação sob dois nomes.
+  it("a mesma pessoa gravada sob dois nomes sai com o nome do perfil", async () => {
+    server = {
+      tableData: withOthers({
+        projects: [projectRow({ pydantic_fields: [{ name: "campo", type: "text", options: null, description: "" }] })],
+        documents: [doc("d1"), doc("d2")],
+        responses: [
+          response("r1", "humano", "A", { respondent_id: "ana", respondent_name: "ana@example.com" }),
+          response("r2", "humano", "B", { document_id: "d2", respondent_id: "ana", respondent_name: "Ana Lima" }),
+        ],
+        project_members: [
+          { project_id: "proj-1", user_id: "ana", profiles: { first_name: "Ana", last_name: "Lima" } },
+        ],
+      }),
+    };
+
+    const getExportDataset = await loadAction();
+    const r = await getExportDataset("proj-1");
+
+    if ("error" in r) throw new Error(`esperava dataset, veio erro: ${r.error}`);
+    const respondentOf = (sheet: { headers: string[]; rows: unknown[][] }) =>
+      sheet.rows.map((row) => row[sheet.headers.indexOf("respondent")]);
+    expect(respondentOf(r.responses)).toEqual(["Ana Lima", "Ana Lima"]);
+    expect(respondentOf(r.csv)).toEqual(["Ana Lima", "Ana Lima"]);
+  });
+
   it("retorna o shape do contrato com colunas originais e linhas por origem", async () => {
     server = {
       tableData: withOthers({
@@ -256,6 +283,21 @@ describe("getExportDataset — monta o dataset a partir das queries", () => {
     expect(consoleError).toHaveBeenCalledWith(
       loggedLine("[export] leitura falhou", { message: "boom na query de documentos" }),
     );
+    consoleError.mockRestore();
+  });
+
+  // Sem os nomes do perfil a planilha sairia com a mesma pessoa sob dois
+  // nomes, sem aviso: a exportação falha como nas demais leituras.
+  it("falha na leitura dos nomes do perfil não gera planilha com autoria misturada", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    server = {
+      tableData: withOthers({ projects: [projectRow()] }),
+      queryErrors: { "project_members:select": { message: "boom nos membros" } },
+    };
+    const getExportDataset = await loadAction();
+    expect(await getExportDataset("proj-1")).toEqual({
+      error: copyWithRef("Não foi possível carregar os dados da exportação. Tente novamente."),
+    });
     consoleError.mockRestore();
   });
 });
