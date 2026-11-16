@@ -1,11 +1,20 @@
 // `/auth/login` do modo estático: e-mail e código de 6 dígitos (OTP) do
-// Supabase Auth. Código em vez de link mágico porque filtros de e-mail
-// corporativos abrem os links antes da pessoa e queimam o token.
+// Supabase Auth. O código é o caminho preferido porque filtros de e-mail
+// corporativos abrem os links antes da pessoa e queimam o token — mas o
+// Supabase só deixa trocar o modelo do e-mail por `{{ .Token }}` com SMTP
+// próprio. Sem SMTP o e-mail traz link mágico, e esta tela também aceita o
+// retorno dele (fluxo PKCE, ver `identity/email-link.ts`).
 
 import { useEffect, useId, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  describeEmailLinkError,
+  readEmailLinkResult,
+  stripEmailLinkParams,
+} from "@/static/identity/email-link";
+import { siteRoot } from "@/static/runtime/base-path";
 import { readConnection } from "@/static/runtime/connection";
 import { navigate } from "@/static/runtime/navigation";
 import { getSupabase } from "@/static/runtime/supabase";
@@ -34,24 +43,45 @@ export function describeAuthError(message: string): string {
   return message;
 }
 
+/** Codes já trocados nesta página: o StrictMode roda o efeito duas vezes, e o code é de uso único. */
+const exchangedCodes = new Set<string>();
+
 export function LoginScreen() {
   const emailId = useId();
   const codeId = useId();
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [step, setStep] = useState<"email" | "code">("email");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // Retorno do link mágico, lido uma vez ao montar.
+  const [link] = useState(() => readEmailLinkResult(window.location.search, window.location.hash));
+  const [busy, setBusy] = useState(link?.kind === "code");
+  const [error, setError] = useState<string | null>(() =>
+    link?.kind === "error" ? describeEmailLinkError(link.errorCode, link.description) : null,
+  );
   const connection = readConnection();
   const next = safeNextPath(new URLSearchParams(window.location.search).get("next"));
 
   useEffect(() => {
+    if (link) {
+      // O code é de uso único: sai da URL antes de qualquer outra coisa.
+      window.history.replaceState(null, "", stripEmailLinkParams(new URL(window.location.href)));
+      if (link.kind === "error" || exchangedCodes.has(link.code)) return;
+      exchangedCodes.add(link.code);
+      void getSupabase()
+        .auth.exchangeCodeForSession(link.code)
+        .then(({ error: exchangeError }) => {
+          setBusy(false);
+          if (exchangeError) setError(describeEmailLinkError("exchange", exchangeError.message));
+          else navigate(next, { replace: true });
+        });
+      return;
+    }
     void getSupabase()
       .auth.getSession()
       .then(({ data }) => {
         if (data.session) navigate(next, { replace: true });
       });
-  }, [next]);
+  }, [link, next]);
 
   async function sendCode(event?: FormEvent) {
     event?.preventDefault();
@@ -64,7 +94,10 @@ export function LoginScreen() {
     setError(null);
     const { error: otpError } = await getSupabase().auth.signInWithOtp({
       email: normalized,
-      options: { shouldCreateUser: true },
+      // Sem SMTP próprio o e-mail traz link (não código); ele volta para esta
+      // tela, que troca o `code` pela sessão. Sem query: a lista de retorno do
+      // projeto é `<site>/**`.
+      options: { shouldCreateUser: true, emailRedirectTo: `${siteRoot()}/auth/login` },
     });
     setBusy(false);
     if (otpError) {
@@ -79,7 +112,7 @@ export function LoginScreen() {
     event.preventDefault();
     const token = code.replace(/\D/g, "");
     if (token.length < 6) {
-      setError("O código tem 6 dígitos.");
+      setError("Digite o código numérico do e-mail.");
       return;
     }
     setBusy(true);
@@ -106,7 +139,7 @@ export function LoginScreen() {
             Nuvem do grupo <strong>{connection.name}</strong>
           </>
         ) : (
-          "Enviaremos um código de acesso para o seu e-mail."
+          "Enviaremos um acesso para o seu e-mail."
         )
       }
     >
@@ -129,13 +162,14 @@ export function LoginScreen() {
             </p>
           ) : null}
           <Button type="submit" className="w-full" disabled={busy}>
-            {busy ? "Enviando…" : "Enviar código"}
+            {busy ? "Enviando…" : "Enviar acesso"}
           </Button>
         </form>
       ) : (
         <form onSubmit={(event) => void verify(event)} className="space-y-4" noValidate>
           <p className="text-sm text-muted-foreground">
-            Enviamos um código de 6 dígitos para <strong>{email}</strong>. Ele vale por alguns minutos.
+            Enviamos um e-mail para <strong>{email}</strong>. Se ele trouxer um código, digite-o abaixo;
+            se trouxer um link, abra-o neste mesmo navegador. Vale por alguns minutos.
           </p>
           <div className="space-y-1.5">
             <Label htmlFor={codeId}>Código</Label>
@@ -170,7 +204,7 @@ export function LoginScreen() {
               Trocar e-mail
             </button>
             <button type="button" className="text-brand underline" disabled={busy} onClick={() => void sendCode()}>
-              Reenviar código
+              Reenviar e-mail
             </button>
           </div>
         </form>

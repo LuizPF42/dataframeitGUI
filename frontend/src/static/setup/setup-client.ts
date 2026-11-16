@@ -2,7 +2,7 @@
 // setup dos mantenedores (supabase/functions/static-setup), que é quem chama a
 // Management API do Supabase com o token OAuth que a pessoa concedeu.
 
-import { basePath } from "@/static/runtime/base-path";
+import { siteRoot } from "@/static/runtime/base-path";
 
 export interface SetupConfig {
   functionUrl: string;
@@ -17,10 +17,7 @@ export function readSetupConfig(): SetupConfig | null {
   return functionUrl && functionKey && oauthClientId ? { functionUrl, functionKey, oauthClientId } : null;
 }
 
-/** Raiz do site publicado, ex.: https://grupo.github.io/dataframeitGUI */
-export function siteRoot(): string {
-  return `${window.location.origin}${basePath}`;
-}
+export { siteRoot };
 
 function setupRedirectUri(): string {
   return `${siteRoot()}/nova-nuvem`;

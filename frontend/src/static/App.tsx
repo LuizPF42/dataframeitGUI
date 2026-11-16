@@ -6,6 +6,7 @@ import { lazy, Suspense, useSyncExternalStore } from "react";
 import { Toaster } from "@/components/ui/sonner";
 import { MobileWarning } from "@/components/shell/MobileWarning";
 import { LlmActivityBanner, ProviderKeyDialog } from "@/static/llm/LlmBrowserUi";
+import { readEmailLinkResult } from "@/static/identity/email-link";
 import { readConnection } from "@/static/runtime/connection";
 import { getSnapshot, navigate, subscribe } from "@/static/runtime/navigation";
 import { RouteView } from "@/static/runtime/RouteView";
@@ -37,6 +38,11 @@ function Screen() {
     return null;
   }
   if (pathname === "/auth/login") return <LoginScreen />;
+  // Se o endereço de retorno do link não estiver na lista do projeto, o
+  // Supabase volta para o Site URL (a raiz) com o `code`: a raiz também o aceita.
+  if (pathname === "/" && readEmailLinkResult(window.location.search, window.location.hash)) {
+    return <LoginScreen />;
+  }
   if (pathname === "/auth/post-login") return <AccessProblemScreen />;
   return <RouteView />;
 }

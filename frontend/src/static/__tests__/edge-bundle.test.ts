@@ -62,6 +62,7 @@ describe("bundle da Edge Function actions", () => {
       env: { get: (key: string) => values[key], toObject: () => ({ ...values }) },
     });
     expect(typeof (globalThis as { window?: unknown }).window).toBe("undefined");
+    // eslint-disable-next-line test-cold-imports/warm-dynamic-imports -- o bundle é gerado neste teste; carregá-lo é o que se mede
     await import(/* @vite-ignore */ pathToFileURL(file).href);
     expect(serve).toHaveBeenCalledTimes(1);
     expect(typeof serve.mock.calls[0][0]).toBe("function");

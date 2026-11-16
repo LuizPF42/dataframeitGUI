@@ -69,7 +69,7 @@ Suítes: `native_supabase_auth.test.sql` e `native_llm_in_browser.test.sql`, com
 
 ## Criar a nuvem do grupo
 
-`/nova-nuvem` cria (ou atualiza) um projeto Supabase na conta do coordenador: aplica `schema/schema.sql`, publica a Edge Function `actions`, configura o login por código de 6 dígitos (modelos de e-mail com `{{ .Token }}`), obtém a chave pública, verifica a instalação (RLS em todas as tabelas, modo nativo, funções) e entrega o link para a equipe (`/conectar#url=…&key=…&nome=…`).
+`/nova-nuvem` cria (ou atualiza) um projeto Supabase na conta do coordenador: aplica `schema/schema.sql`, publica a Edge Function `actions`, configura o login (código de 6 dígitos válido por 15 minutos, JWT de 15 minutos, sem login anônimo e, se o projeto tiver SMTP próprio, modelos de e-mail com `{{ .Token }}`), obtém a chave pública, verifica a instalação (RLS em todas as tabelas, modo nativo, funções) e entrega o link para a equipe (`/conectar#url=…&key=…&nome=…`).
 
 O Supabase não responde CORS fora de supabase.com na API de gerenciamento nem no token OAuth, e a troca do código exige o client secret do app OAuth (medido pelo QualiLab). Por isso o assistente usa uma Edge Function de setup, `supabase/functions/static-setup`, publicada **uma vez pelos mantenedores** num projeto deles, com uma lista fixa de operações. Ela não guarda nada, e os dados da pesquisa nunca passam por ela. Sem ela configurada, o assistente mostra o passo a passo manual.
 
@@ -97,6 +97,10 @@ Banco sem Docker: `scripts/db-embedded/README.md` (Postgres 17 por pacote npm; r
 - **Validade do token.** No modo nativo a identidade vale enquanto o JWT vale (o banco não consulta a sessão). O assistente reduz o `jwt_exp` para 15 minutos; o padrão do Supabase é 1 hora.
 - **Dreno da auto-revisão.** Na Edge Function, só coordenador ou master o aciona, e as contagens (que somam todos os projetos) não voltam ao navegador.
 - **A conferir no Supabase real.** Com "só entra quem o coordenador cadastrar" desligado, o cadastro por senha do GoTrue continua aberto. Falta confirmar se um cadastro por senha não confirmado, feito por terceiro com o e-mail de outra pessoa, perde a senha quando o dono confirma por código.
+
+## Login: código ou link
+
+O caminho preferido é o código de 6 dígitos, porque filtros de e-mail corporativos abrem links antes da pessoa e queimam o token. Mas o Supabase só deixa trocar o modelo do e-mail por `{{ .Token }}` com **SMTP próprio** (medido em nov/2026); sem ele, o e-mail padrão traz um link mágico. A tela de login aceita os dois: o link volta para `/auth/login` com `?code=` (fluxo **PKCE**, `identity/email-link.ts`), e o `code` só vira sessão no navegador que pediu o e-mail. O fluxo implícito, que devolve os tokens no `#hash`, ficou de fora de propósito: aceitar qualquer `#access_token` deixaria um terceiro logar a vítima na conta dele. O assistente tenta gravar os modelos com código numa chamada separada e, se o projeto não tem SMTP, conclui o passo avisando que o e-mail traz link.
 
 ## Limites conhecidos
 

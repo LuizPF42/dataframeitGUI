@@ -28,7 +28,11 @@ export function createBrowserClient(connection: Connection): SupabaseClient {
     auth: {
       persistSession: true,
       autoRefreshToken: true,
+      // O retorno do link mágico é tratado pela tela de login
+      // (`identity/email-link.ts`), não na criação do cliente.
       detectSessionInUrl: false,
+      // PKCE: o `code` do link só vira sessão neste navegador (ver email-link.ts).
+      flowType: "pkce",
       storageKey: `dataframeit-auth-${projectRefOf(connection.url)}`,
     },
   });

@@ -74,12 +74,43 @@ describe("função de setup do assistente", () => {
       fetchImpl,
     );
     expect(ok.status).toBe(200);
-    const payload = JSON.parse(String((fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+    expect(await ok.json()).toEqual({ ok: true, code_template: true });
+    const bodyOf = (index: number) =>
+      JSON.parse(String((fetchImpl.mock.calls[index] as unknown as [string, RequestInit])[1].body));
+    const payload = bodyOf(0);
     expect(payload.mailer_otp_length).toBe(6);
     expect(payload.jwt_exp).toBe(900);
     expect(payload.external_anonymous_users_enabled).toBe(false);
-    expect(payload.mailer_templates_magic_link_content).toContain("{{ .Token }}");
-    expect(payload.mailer_templates_confirmation_content).toContain("{{ .Token }}");
+    // Os modelos vão numa chamada separada: sem SMTP próprio o Supabase os recusa.
+    expect(payload).not.toHaveProperty("mailer_templates_magic_link_content");
+    const templates = bodyOf(1);
+    expect(templates.mailer_templates_magic_link_content).toContain("{{ .Token }}");
+    expect(templates.mailer_templates_confirmation_content).toContain("{{ .Token }}");
+  });
+
+  it("sem SMTP próprio, conclui o Auth e avisa que o e-mail traz link", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, {}))
+      .mockResolvedValueOnce(jsonResponse(400, { message: "Custom SMTP required to update email templates" }));
+    const response = await handle(
+      request({ op: "auth", token: "t", ref: REF, site_url: "https://grupo.github.io", redirect: "https://grupo.github.io/**" }),
+      ENV,
+      fetchImpl,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, code_template: false });
+  });
+
+  it("falha o passo quando a configuração essencial do Auth é recusada", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(403, { message: "forbidden" }));
+    const response = await handle(
+      request({ op: "auth", token: "t", ref: REF, site_url: "https://grupo.github.io", redirect: "https://grupo.github.io/**" }),
+      ENV,
+      fetchImpl,
+    );
+    expect(response.status).toBe(502);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("devolve só a chave pública do projeto", async () => {

@@ -85,8 +85,18 @@ function ManualSetup() {
             <code>npx supabase functions deploy actions --project-ref SEU_REF</code>.
           </li>
           <li>
-            Em Authentication → Email Templates, troque o link pelo código <code>{"{{ .Token }}"}</code> nos
-            modelos “Magic Link” e “Confirm signup”. Em URL Configuration, use o endereço deste site.
+            Em Authentication → URL Configuration, ponha <code>{siteRoot()}</code> em Site URL e adicione{" "}
+            <code>{`${siteRoot()}/**`}</code> em Redirect URLs.
+          </li>
+          <li>
+            Em Authentication → Sign In / Providers, desligue os logins anônimos, mantenha “Confirm email”
+            ligado e, no provedor Email, use código de 6 dígitos com validade de 900 segundos. Em Project
+            Settings → JWT Keys, reduza a validade do access token para 900 segundos.
+          </li>
+          <li>
+            Opcional, com SMTP próprio configurado no projeto: em Authentication → Emails, troque o link pelo
+            código <code>{"{{ .Token }}"}</code> nos modelos “Confirm signup” e “Magic link”. Sem SMTP o e-mail
+            traz um link, que também funciona se for aberto no mesmo navegador.
           </li>
           <li>
             Em Settings → API, copie a URL e a chave <em>anon</em> e use-as em{" "}
@@ -207,8 +217,22 @@ function Wizard({ config }: { config: SetupConfig }) {
 
       current = "auth";
       mark("auth", "running");
-      await call({ op: "auth", site_url: siteRoot(), redirect: `${siteRoot()}/**`, invite_only: inviteOnly });
-      mark("auth", "done", inviteOnly ? "Só e-mails cadastrados pelo coordenador entram." : "Qualquer e-mail pode criar conta.");
+      const { code_template: codeTemplate } = await call<{ code_template?: boolean }>({
+        op: "auth",
+        site_url: siteRoot(),
+        redirect: `${siteRoot()}/**`,
+        invite_only: inviteOnly,
+      });
+      mark(
+        "auth",
+        "done",
+        [
+          inviteOnly ? "Só e-mails cadastrados pelo coordenador entram." : "Qualquer e-mail pode criar conta.",
+          codeTemplate
+            ? "O e-mail de acesso traz um código."
+            : "O e-mail de acesso traz um link (para mandar código, configure um SMTP próprio no projeto).",
+        ].join(" "),
+      );
 
       current = "keys";
       mark("keys", "running");

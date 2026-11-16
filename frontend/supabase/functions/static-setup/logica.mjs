@@ -228,10 +228,6 @@ export async function handle(req, env, fetchImpl) {
       mailer_autoconfirm: false,
       mailer_otp_length: 6,
       mailer_otp_exp: 900,
-      mailer_subjects_magic_link: OTP_SUBJECT,
-      mailer_templates_magic_link_content: OTP_TEMPLATE,
-      mailer_subjects_confirmation: OTP_SUBJECT,
-      mailer_templates_confirmation_content: OTP_TEMPLATE,
       disable_signup: body.invite_only === true,
       // Sem sessão anônima: ela não resolve identidade na RLS, mas ocupa cota.
       external_anonymous_users_enabled: false,
@@ -241,7 +237,16 @@ export async function handle(req, env, fetchImpl) {
       jwt_exp: 900,
     });
     if (!r.ok) return reply(502, await upstreamError(r), cors);
-    return reply(200, { ok: true }, cors);
+    // Modelo com código: o Supabase só aceita trocar o modelo do e-mail com
+    // SMTP próprio. Sem ele, o e-mail padrão traz link mágico, que a tela de
+    // login também aceita (fluxo PKCE) — por isso a recusa aqui não é erro.
+    const t = await call("PATCH", "/v1/projects/" + ref + "/config/auth", {
+      mailer_subjects_magic_link: OTP_SUBJECT,
+      mailer_templates_magic_link_content: OTP_TEMPLATE,
+      mailer_subjects_confirmation: OTP_SUBJECT,
+      mailer_templates_confirmation_content: OTP_TEMPLATE,
+    });
+    return reply(200, { ok: true, code_template: t.ok }, cors);
   }
   if (op === "deploy") {
     const code = String(body.code || "");
