@@ -1,8 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { loadCompareQueue, type CompareQueueIdentity } from "@/lib/compare-queue";
 import type { PydanticField } from "@/lib/types";
 import { makeHumanResponse, makeProjectRow } from "@/test-utils/comparison-fixtures";
-import { makeFilterAwareSupabaseMock, type QueryError } from "@/test-utils/supabase-mock";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
+import { makeFilterAwareSupabaseMock, type QueryError, type ReadCall } from "@/test-utils/supabase-mock";
 
 // A fila de comparação entra pelo carregador (#751): as buscas vão a um banco
 // de mentira filtrado como o PostgREST, e o teste confere as props que chegam
@@ -11,6 +12,10 @@ import { makeFilterAwareSupabaseMock, type QueryError } from "@/test-utils/supab
 // (`documents.excluded_at`) é a coluna com esse nome na linha da resposta.
 
 const PROJECT = "p1";
+
+// Os casos de erro silenciam o console.error com spy; ele não vaza para o
+// teste seguinte.
+afterEach(() => vi.restoreAllMocks());
 
 let fieldIdSeq = 0;
 function nextFieldId(): string {
@@ -111,9 +116,62 @@ function tables(seed: Seed): Record<string, unknown[]> {
   };
 }
 
-function client(tableData: Record<string, unknown[]>, queryErrors?: Record<string, QueryError>) {
-  return makeFilterAwareSupabaseMock({ tableData, writeCalls: [], queryErrors });
+type MockClient = ReturnType<typeof makeFilterAwareSupabaseMock>;
+
+function client(
+  tableData: Record<string, unknown[]>,
+  queryErrors?: Record<string, QueryError>,
+  readCalls?: ReadCall[],
+): MockClient {
+  return makeFilterAwareSupabaseMock({ tableData, writeCalls: [], queryErrors, readCalls });
 }
+
+type Builder = Record<string, unknown> & {
+  limit: (n: number) => unknown;
+  in: (c: string, v: unknown[]) => unknown;
+  range: (from: number, to: number) => unknown;
+};
+
+// Embrulha o mock, deixando `patch` trocar métodos do builder de cada leitura.
+function patchReads(base: MockClient, patch: (table: string, builder: Builder) => void): MockClient {
+  return {
+    ...base,
+    from: (table: string) => {
+      const builder = base.from(table) as Builder;
+      patch(table, builder);
+      return builder;
+    },
+  };
+}
+
+// O PostgREST corta toda leitura em `max_rows` (1000), mesmo com `.limit()`
+// maior, e não avisa. O mock não corta: este embrulho corta, para que leitura
+// sem paginação saia truncada aqui como sai em produção.
+const MAX_ROWS = 1000;
+const withMaxRows = (base: MockClient) =>
+  patchReads(base, (_table, builder) => {
+    const limit = builder.limit;
+    builder.limit = (n) => limit(Math.min(n, MAX_ROWS));
+    limit(MAX_ROWS);
+  });
+
+// Falha uma leitura no meio do caminho: a página (`.range`) de `table` cujo
+// início e cujo lote (`.in`) satisfazem `when`. As anteriores dão certo.
+type ReadPosition = { from: number; ids: readonly unknown[] | null };
+const failingRead = (table: string, when: (read: ReadPosition) => boolean) => (base: MockClient) =>
+  patchReads(base, (t, builder) => {
+    if (t !== table) return;
+    let ids: readonly unknown[] | null = null;
+    const { in: inFilter, range } = builder;
+    builder.in = (c, v) => {
+      ids = v;
+      return inFilter(c, v);
+    };
+    builder.range = (from, to) =>
+      when({ from, ids }) ? Promise.resolve({ data: null, error: { message: "falha no meio" } }) : range(from, to);
+  });
+const secondPage = (read: ReadPosition) => read.from >= 1000;
+const batchWith = (docId: string) => (read: ReadPosition) => read.ids?.includes(docId) ?? false;
 
 const COORDINATOR: CompareQueueIdentity = {
   ownMemberUserId: "me",
@@ -132,10 +190,13 @@ async function load(
     searchParams?: Record<string, string | undefined>;
     identity?: CompareQueueIdentity;
     queryErrors?: Record<string, QueryError>;
+    readCalls?: ReadCall[];
+    wrap?: (base: MockClient) => MockClient;
   } = {},
 ) {
+  const base = withMaxRows(client(tables(seed), opts.queryErrors, opts.readCalls));
   return loadCompareQueue(
-    client(tables(seed), opts.queryErrors) as never,
+    (opts.wrap ? opts.wrap(base) : base) as never,
     PROJECT,
     Promise.resolve(opts.identity ?? COORDINATOR),
     opts.searchParams ?? ALL_QUEUE,
@@ -227,17 +288,14 @@ describe("loadCompareQueue: a fila final", () => {
     expect(props.responses.doc2).toBeUndefined();
   });
 
-  it("devolve o erro da busca de respostas em vez de uma fila vazia", async () => {
-    const result = await load(
-      { responses: divergentPair("doc1") },
-      { queryErrors: { "responses:select": { message: "boom" } } },
-    );
-    expect(result).toEqual({ ok: false, error: "boom" });
-  });
-
-  it("identidade que falha derruba o carregador", async () => {
+  it("identidade que falha derruba o carregador, mesmo com uma fonte em erro", async () => {
     await expect(
-      loadCompareQueue(client(tables({})) as never, PROJECT, Promise.reject(new Error("sem identidade")), ALL_QUEUE),
+      loadCompareQueue(
+        client(tables({}), { "responses:select": { message: "boom" } }) as never,
+        PROJECT,
+        Promise.reject(new Error("sem identidade")),
+        ALL_QUEUE,
+      ),
     ).rejects.toThrow("sem identidade");
   });
 });
@@ -587,5 +645,144 @@ describe("loadCompareQueue: vereditos e reviewedCount", () => {
         expect(props.staleReviews?.doc1.a).toEqual({ verdict, chosenResponseId: "doc1-r1", comment: "antes", invalidReason: reason });
       },
     );
+  });
+});
+
+describe("loadCompareQueue: leituras completas, acima do teto do PostgREST", () => {
+  // 600 documentos divergentes, todos na fila pessoal de "me": 1200 respostas,
+  // 1800 atribuições, 1100 vereditos de "me" (500 em documentos fora da fila)
+  // e 600 de outro revisor, 1100 comentários, sugestões e entradas de log.
+  // Cada fonte passa das 1000 linhas que o PostgREST devolve por leitura.
+  const docIds = Array.from({ length: 600 }, (_, i) => `doc${String(i).padStart(4, "0")}`);
+  const big: Seed = {
+    responses: docIds.flatMap((id) => divergentPair(id)),
+    assignments: docIds.flatMap((document_id) => [
+      { document_id, user_id: "me", type: "comparacao", status: "em_andamento" },
+      { document_id, user_id: "u1", type: "codificacao", status: "concluido" },
+      { document_id, user_id: "u2", type: "codificacao", status: "concluido" },
+    ]),
+    reviews: [
+      ...docIds.flatMap((document_id) => [
+        review({ document_id, chosen_response_id: `${document_id}-r1`, reviewer_id: "outro" }),
+        review({ document_id, chosen_response_id: `${document_id}-r1` }),
+      ]),
+      ...Array.from({ length: 500 }, (_, i) => review({ document_id: `fora${i}` })),
+    ],
+    comments: Array.from({ length: 1100 }, (_, i) => ({ id: `c${i}`, document_id: "doc0000", field_name: "a", resolved_at: null })),
+    suggestions: Array.from({ length: 1100 }, (_, i) => ({ id: `s${i}`, field_name: "a", status: "pending" })),
+    versionLog: [
+      ...Array.from({ length: 1099 }, () => ({ version_major: 0, version_minor: 1, version_patch: 0 })),
+      { version_major: 3, version_minor: 0, version_patch: 0 },
+    ],
+  };
+  const MINE = { version: "all" };
+
+  it("nada é cortado: fila, cobertura, vereditos, contagens e versões vêm inteiros", async () => {
+    const props = await loadProps(big, { searchParams: MINE });
+    expect(ids(props).toSorted()).toEqual(docIds);
+    expect(Object.keys(props.responses)).toHaveLength(600);
+    expect(Object.values(props.coverageByDoc).every((c) => c.reviewedCount === 1 && c.assignmentStatus === "em_andamento")).toBe(true);
+    expect(Object.keys(props.existingReviews).toSorted()).toEqual(docIds);
+    expect(props.commentCountsByKey).toEqual({ "doc0000|a": 1100 });
+    expect(props.suggestionCountsByField).toEqual({ a: 1100 });
+    expect(props.availableVersions).toEqual(["3.0.0", "0.1.0"]);
+  });
+
+  it("textos vêm em lotes de até 100 documentos, cobrindo toda a fila", async () => {
+    const readCalls: ReadCall[] = [];
+    await loadProps(big, { searchParams: MINE, readCalls });
+    const batches = readCalls
+      .filter((c) => c.table === "documents")
+      .map((c) => c.filters.find(([kind]) => kind === "in")?.[2] as string[]);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.every((batch) => batch.length <= 100)).toBe(true);
+    expect(batches.flat().toSorted()).toEqual(docIds);
+  });
+
+  it.each([
+    ["a segunda página das respostas", "responses", secondPage],
+    ["a segunda página das atribuições", "assignments", secondPage],
+    ["a segunda página dos vereditos", "reviews", secondPage],
+    ["a segunda página dos comentários", "project_comments", secondPage],
+    ["um lote do meio dos textos", "documents", batchWith("doc0250")],
+  ])("falha n%s: erro, e não uma fila parcial", async (_label, table, when) => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await load(big, { searchParams: MINE, wrap: failingRead(table, when) });
+    expect(result.ok).toBe(false);
+  });
+
+  it("nada qualificado: não busca texto, não leva veredito, e a fila sai vazia", async () => {
+    const readCalls: ReadCall[] = [];
+    const props = await loadProps({ responses: [response({ id: "r1" })], reviews: [review()] }, { readCalls });
+    expect(props.documents).toEqual([]);
+    expect(props.existingReviews).toEqual({});
+    expect(readCalls.filter((c) => c.table === "documents")).toEqual([]);
+  });
+});
+
+describe("loadCompareQueue: falha de qualquer fonte vira erro, não fila vazia", () => {
+  it.each([
+    "projects",
+    "responses",
+    "schema_change_log",
+    "assignments",
+    "value_equivalences",
+    "documents",
+    "reviews",
+    "project_comments",
+    "schema_suggestions",
+  ])("%s: erro com código para o log, sem a mensagem do banco", async (table) => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await load(
+      { responses: divergentPair("doc1") },
+      { queryErrors: { [`${table}:select`]: { message: "detalhe interno do banco", code: "XX000" } } },
+    );
+    // A copy não traz a mensagem do banco, que vai só para o log.
+    expect(result).toEqual({ ok: false, error: copyWithRef("Erro ao carregar a fila de comparação. Tente novamente.") });
+    expect(logged).toHaveBeenCalledOnce();
+    expect(logged).toHaveBeenCalledWith(loggedLine(`[compare-queue] leitura de ${table} falhou`, { code: "XX000" }));
+  });
+});
+
+describe("loadCompareQueue: vereditos só dos documentos da fila", () => {
+  const fields = [field({ name: "a", type: "single", options: ["alpha", "beta"], hash: "novo00000000" })];
+
+  it("documento fora da fila não leva veredito, válido ou obsoleto, ao cliente", async () => {
+    const props = await loadProps({
+      fields,
+      responses: [
+        ...divergentPair("naFila"),
+        // sem divergência: fora da fila
+        ...divergentPair("semDivergencia", { a: "alpha" }, { a: "alpha" }),
+      ],
+      reviews: [
+        review({ document_id: "naFila", field_hash: "novo00000000" }),
+        review({ document_id: "naFila", field_name: "b", field_hash: "velho0000000" }),
+        review({ document_id: "semDivergencia", field_hash: "novo00000000" }),
+        review({ document_id: "semDivergencia", field_name: "b", field_hash: "velho0000000" }),
+        // documento sem resposta nenhuma
+        review({ document_id: "outroDoc", field_hash: "novo00000000" }),
+      ],
+    });
+    expect(ids(props)).toEqual(["naFila"]);
+    expect(Object.keys(props.existingReviews)).toEqual(["naFila"]);
+    expect(Object.keys(props.staleReviews ?? {})).toEqual(["naFila"]);
+    expect(props.coverageByDoc.naFila.reviewedCount).toBe(1);
+  });
+
+  it("na aba \"Meus\", o veredito de documento atribuído a outra pessoa fica de fora", async () => {
+    const props = await loadProps(
+      {
+        responses: [...divergentPair("meu"), ...divergentPair("deOutro")],
+        assignments: [
+          { document_id: "meu", user_id: "me", type: "comparacao", status: "pendente" },
+          { document_id: "deOutro", user_id: "outro", type: "comparacao", status: "pendente" },
+        ],
+        reviews: [review({ document_id: "meu" }), review({ document_id: "deOutro" })],
+      },
+      { searchParams: { version: "all" } },
+    );
+    expect(ids(props)).toEqual(["meu"]);
+    expect(Object.keys(props.existingReviews)).toEqual(["meu"]);
   });
 });
