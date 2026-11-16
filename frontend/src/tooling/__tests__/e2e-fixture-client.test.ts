@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { fixtureEnvironment } from "../../../scripts/e2e-fixtures/fixture-client";
+import { LOCAL_SUPABASE_HOST } from "../../../scripts/e2e-fixtures/local-supabase";
 
 // O começo comum dos geradores de fixture E2E: a precedência do ambiente
 // (E2E_ENV_PATH, senão .env.e2e, por cima do .env.local) e as recusas.
@@ -54,10 +55,10 @@ describe("fixtureEnvironment", () => {
     expect(() => fixtureEnvironment({ localOnly: true }, {}, dir)).toThrow(
       /aponta para e2e\.example\.test: esta fixture só é criada no Supabase local/,
     );
-    const local = envFile("local.env", complete("http://localhost:54321"));
-    expect(fixtureEnvironment({ localOnly: true }, { E2E_ENV_PATH: local }, dir).url).toBe(
-      "http://localhost:54321",
-    );
+    for (const url of ["http://localhost:54321", "http://127.0.0.1:54321"]) {
+      const local = envFile("local.env", complete(url));
+      expect(fixtureEnvironment({ localOnly: true }, { E2E_ENV_PATH: local }, dir).url).toBe(url);
+    }
   });
 
   it("recusa ambiente sem chave ou sem os e-mails E2E", () => {
@@ -71,5 +72,33 @@ describe("fixtureEnvironment", () => {
     expect(() => fixtureEnvironment({}, { E2E_ENV_PATH: noEmail }, dir)).toThrow(
       /E2E_COORDINATOR_EMAIL \/ E2E_MEMBER_EMAIL ausentes/,
     );
+  });
+});
+
+// A regra de host local que o gerador de llm-decisions e o spec que consome a
+// fixture aplicam: uma só, em `local-supabase.ts`.
+describe("LOCAL_SUPABASE_HOST", () => {
+  it("aceita localhost e 127.0.0.1, e recusa host remoto ou parecido", () => {
+    const local = (url: string) => LOCAL_SUPABASE_HOST.test(new URL(url).hostname);
+    expect(local("http://localhost:54321")).toBe(true);
+    expect(local("http://127.0.0.1:54321")).toBe(true);
+    for (const url of [
+      "https://projeto.supabase.co",
+      "http://e2e.example.test",
+      "http://localhost.example.test:54321",
+      "http://127.0.0.1.nip.io:54321",
+      "http://127.0.0.2:54321",
+    ]) {
+      expect(local(url), url).toBe(false);
+    }
+  });
+
+  it("o spec de llm-decisions usa a mesma regra, sem cópia própria", () => {
+    const spec = fs.readFileSync(
+      path.join(__dirname, "../../../e2e/llm-decisions.smoke.spec.ts"),
+      "utf8",
+    );
+    expect(spec).toMatch(/import \{[^}]*\bLOCAL_SUPABASE_HOST\b[^}]*\} from "[^"]*\/local-supabase"/);
+    expect(spec).not.toMatch(/localhost|127\\?\.0\\?\.0\\?\.1/);
   });
 });
