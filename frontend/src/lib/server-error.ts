@@ -5,6 +5,12 @@ import { errorMessage } from "@/lib/utils";
 // também não pode sumir. Vai para o log do servidor, e o toast recebe a copy
 // do fluxo (#502).
 //
+// Erro capturado não passa pelo `onRequestError` e não tem digest do Next
+// (ver `errorCode`): o código que liga o toast à linha do log é sorteado aqui,
+// no mesmo formato — base 36, 6 ou 7 caracteres — e a linha do log começa por
+// `[erro <código>]`, como a do `src/instrumentation.ts`. Assim
+// `fly logs | grep <código>` acha os dois tipos de erro do mesmo jeito.
+//
 // `byCode` mapeia os códigos que descrevem uma condição real que o usuário
 // pode entender (registro já resolvido, sem permissão): esses ganham copy
 // própria e não vão ao log, porque são estado esperado e não falha.
@@ -25,8 +31,28 @@ export function serverErrorCopy(
 ): string {
   const specific = error.code ? copy.byCode?.[error.code] : undefined;
   if (specific) return specific;
-  console.error(scope, { code: error.code, message: error.message });
-  return copy.generic;
+  // No navegador (o `fetchFastAPI` dos componentes cliente), o log fica no
+  // console de quem usa: um código ali não acharia nada no `fly logs`.
+  const detail = { code: error.code, message: error.message };
+  if (typeof window !== "undefined") {
+    console.error(scope, detail);
+    return copy.generic;
+  }
+  // Uma linha só, com o JSON no fim, como a do `instrumentation.ts`: o objeto
+  // passado à parte o Node quebra em várias linhas, e o grep pelo código
+  // traria só o escopo.
+  const ref = formatErrorCode(crypto.getRandomValues(new Uint32Array(1))[0]);
+  console.error(`[erro ${ref}] ${scope} ${JSON.stringify(detail)}`);
+  return appendErrorCode(copy.generic, ref);
+}
+
+// Um formato só para o código sorteado e o do digest, que o grep acha igual.
+function formatErrorCode(n: number): string {
+  return n.toString(36).padStart(6, "0");
+}
+
+function appendErrorCode(copy: string, code: string): string {
+  return `${copy} — código ${code}`;
 }
 
 // O mesmo para o módulo de actions que loga vários passos: o escopo do log sai
@@ -65,7 +91,7 @@ export function errorCode(error: unknown): string | null {
       ? error.digest
       : undefined;
   if (typeof digest !== "string" || !/^\d+$/.test(digest)) return null;
-  return Number(digest).toString(36).padStart(6, "0");
+  return formatErrorCode(Number(digest));
 }
 
 // Server Action que o servidor não reconhece: a página foi aberta antes de um
@@ -100,7 +126,7 @@ export function actionErrorMessage(error: unknown, fallback: string): string {
 export function withErrorCode(error: unknown, copy: string): string {
   if (isStaleActionError(error)) return STALE_PAGE_ERROR;
   const code = errorCode(error);
-  return code ? `${copy} — código ${code}` : copy;
+  return code ? appendErrorCode(copy, code) : copy;
 }
 
 // Detalhe que as telas de erro (`error.tsx`, `global-error.tsx`) mostram: o

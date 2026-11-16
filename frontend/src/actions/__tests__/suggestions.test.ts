@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
 import {
   makeSupabaseMock,
   type RpcCall,
@@ -94,10 +95,9 @@ describe("erros do Postgres não chegam crus ao toast", () => {
 
     const r = await createSchemaSuggestion("p1", "q1", { description: "Nova" }, "Ajuste");
 
-    expect(r.error).toBe("Não foi possível enviar a sugestão. Tente novamente.");
+    expect(r.error).toEqual(copyWithRef("Não foi possível enviar a sugestão. Tente novamente."));
     expect(consoleError).toHaveBeenCalledWith(
-      "[suggestions] criação da sugestão falhou",
-      expect.objectContaining({ code: "57014" }),
+      loggedLine("[suggestions] criação da sugestão falhou", { code: "57014" }),
     );
     consoleError.mockRestore();
   });
@@ -125,10 +125,9 @@ describe("erros do Postgres não chegam crus ao toast", () => {
 
     const r = await rejectSchemaSuggestion("s1", "p1");
 
-    expect(r.error).toBe("Não foi possível rejeitar a sugestão. Tente novamente.");
+    expect(r.error).toEqual(copyWithRef("Não foi possível rejeitar a sugestão. Tente novamente."));
     expect(consoleError).toHaveBeenCalledWith(
-      "[suggestions] rejeição da sugestão falhou",
-      expect.objectContaining({ code: "57014" }),
+      loggedLine("[suggestions] rejeição da sugestão falhou", { code: "57014" }),
     );
     consoleError.mockRestore();
   });
@@ -150,7 +149,7 @@ describe("approveSchemaSuggestionWithEdits", () => {
       [FIELD],
       EMPTY_BASELINE,
     );
-    expect(r.error).toBe("Não foi possível aplicar a sugestão. Tente novamente.");
+    expect(r.error).toEqual(copyWithRef("Não foi possível aplicar a sugestão. Tente novamente."));
     expect(
       supabaseState.writeCalls.some(
         (call) => call.table === "schema_suggestions" && call.op === "update",

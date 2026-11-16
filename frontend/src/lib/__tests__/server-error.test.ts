@@ -11,23 +11,52 @@ import {
   serverErrorCopy,
   serverErrorScope,
 } from "@/lib/server-error";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
 import { maskedServerError } from "@/test-utils/masked-server-error";
 
 describe("serverErrorCopy", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("código fora do mapa loga {code, message} e devolve a copy genérica", () => {
+  it("código fora do mapa loga {code, message} e devolve a copy genérica com o código", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const copy = serverErrorCopy(
       "[x] falhou",
       { code: "57014", message: "statement timeout" },
       { generic: "Tente novamente.", byCode: { P0001: "Já resolvida." } },
     );
-    expect(copy).toBe("Tente novamente.");
-    expect(consoleError).toHaveBeenCalledWith("[x] falhou", {
-      code: "57014",
-      message: "statement timeout",
-    });
+    expect(copy).toEqual(copyWithRef("Tente novamente."));
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[x] falhou", { code: "57014", message: "statement timeout" }),
+    );
+  });
+
+  // Sem digest do Next, o código é sorteado: o mesmo no toast e na linha do
+  // log, e outro no erro seguinte.
+  it("o código do toast é o da linha do log, e cada erro ganha o seu", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const error = { code: "57014", message: "statement timeout" };
+    const first = serverErrorCopy("[x] falhou", error, { generic: "Tente novamente." });
+    const second = serverErrorCopy("[x] falhou", error, { generic: "Tente novamente." });
+    const ref = (copy: string) => copy.split(" — código ")[1];
+    // Uma linha só: o grep pelo código traz também o code e a mensagem.
+    expect(consoleError.mock.calls[0]).toEqual([
+      `[erro ${ref(first)}] [x] falhou {"code":"57014","message":"statement timeout"}`,
+    ]);
+    expect(consoleError.mock.calls[1][0]).toMatch(new RegExp(`^\\[erro ${ref(second)}\\] `));
+    expect(ref(first)).not.toBe(ref(second));
+  });
+
+  // No navegador (fetchFastAPI de componente cliente) o log vai para o console
+  // de quem usa, e um código ali não acharia nada no log do servidor.
+  it("no navegador devolve a copy sem código", () => {
+    vi.stubGlobal("window", {});
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const error = { code: "502", message: "Bad Gateway" };
+    expect(serverErrorCopy("[api] /x falhou", error, { generic: "Tente novamente." })).toBe(
+      "Tente novamente.",
+    );
+    expect(consoleError).toHaveBeenCalledWith("[api] /x falhou", error);
+    vi.unstubAllGlobals();
   });
 
   it("código mapeado ganha copy própria e não vai ao log", () => {
@@ -52,11 +81,10 @@ describe("serverErrorScope", () => {
       { code: "57014", message: "statement timeout" },
       "Tente novamente.",
     );
-    expect(copy).toBe("Tente novamente.");
-    expect(consoleError).toHaveBeenCalledWith("[members] leitura do e-mail falhou", {
-      code: "57014",
-      message: "statement timeout",
-    });
+    expect(copy).toEqual(copyWithRef("Tente novamente."));
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[members] leitura do e-mail falhou", { code: "57014", message: "statement timeout" }),
+    );
   });
 });
 
@@ -66,22 +94,28 @@ describe("caughtErrorCopy", () => {
   it("loga o code string do erro capturado, quando há", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const coded = Object.assign(new Error("statement timeout"), { code: "57014" });
-    expect(caughtErrorCopy("[x] falhou", coded, "Tente novamente.")).toBe("Tente novamente.");
-    expect(consoleError).toHaveBeenCalledWith("[x] falhou", {
-      code: "57014",
-      message: "statement timeout",
-    });
+    expect(caughtErrorCopy("[x] falhou", coded, "Tente novamente.")).toEqual(
+      copyWithRef("Tente novamente."),
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      loggedLine("[x] falhou", { code: "57014", message: "statement timeout" }),
+    );
   });
 
   it("code não string (status do ApiError) e erro sem code saem com code undefined", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     caughtErrorCopy("[x] falhou", Object.assign(new Error("boom"), { code: 502 }), "g");
     caughtErrorCopy("[x] falhou", new TypeError("fetch failed"), "g");
-    expect(consoleError).toHaveBeenNthCalledWith(1, "[x] falhou", { code: undefined, message: "boom" });
-    expect(consoleError).toHaveBeenNthCalledWith(2, "[x] falhou", {
-      code: undefined,
-      message: "fetch failed",
-    });
+    expect(consoleError).toHaveBeenNthCalledWith(
+      1,
+      loggedLine("[x] falhou", { message: "boom" }),
+    );
+    expect(consoleError).toHaveBeenNthCalledWith(
+      2,
+      loggedLine("[x] falhou", { message: "fetch failed" }),
+    );
+    // Sem code string, a linha não leva a chave.
+    expect(consoleError.mock.calls.flat().join()).not.toContain('"code"');
   });
 });
 

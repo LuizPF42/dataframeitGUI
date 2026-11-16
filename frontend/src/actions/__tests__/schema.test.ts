@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { copyWithRef, loggedLine } from "@/test-utils/error-ref";
 import {
   makeSupabaseMock,
   type FilterCall,
@@ -280,11 +281,10 @@ describe("saveSchemaFromGUI", () => {
 
     expect(result).toEqual({
       status: "error",
-      message: "Não foi possível salvar o schema. Tente novamente.",
+      message: copyWithRef("Não foi possível salvar o schema. Tente novamente."),
     });
     expect(consoleError).toHaveBeenCalledWith(
-      "[schema] commit_project_schema falhou",
-      expect.objectContaining({ code: "22023" }),
+      loggedLine("[schema] commit_project_schema falhou", { code: "22023" }),
     );
     consoleError.mockRestore();
   });
@@ -610,7 +610,7 @@ describe("backfillSchemaVersionHistory", () => {
 
     expect(result).toEqual({
       status: "error",
-      message: "Não foi possível reconstruir o histórico. Tente novamente.",
+      message: copyWithRef("Não foi possível reconstruir o histórico. Tente novamente."),
     });
     expect(state.rpcs).toHaveLength(0);
   });
@@ -631,11 +631,10 @@ describe("backfillSchemaVersionHistory", () => {
 
     expect(result).toEqual({
       status: "error",
-      message: "Não foi possível ler o schema do projeto. Tente novamente.",
+      message: copyWithRef("Não foi possível ler o schema do projeto. Tente novamente."),
     });
     expect(consoleError).toHaveBeenCalledWith(
-      "[schema] leitura do projeto falhou",
-      expect.objectContaining({ code: "57014" }),
+      loggedLine("[schema] leitura do projeto falhou", { code: "57014" }),
     );
     expect(state.rpcs).toHaveLength(0);
     consoleError.mockRestore();
@@ -656,7 +655,7 @@ describe("backfillSchemaVersionHistory", () => {
 
     expect(result).toEqual({
       status: "error",
-      message: "Não foi possível ler o schema do projeto. Tente novamente.",
+      message: copyWithRef("Não foi possível ler o schema do projeto. Tente novamente."),
     });
     expect(pagedTables()).toEqual([]);
     consoleError.mockRestore();
@@ -685,11 +684,10 @@ describe("backfillSchemaVersionHistory", () => {
 
     expect(result).toEqual({
       status: "error",
-      message: "Não foi possível reconstruir o histórico. Tente novamente.",
+      message: copyWithRef("Não foi possível reconstruir o histórico. Tente novamente."),
     });
     expect(consoleError).toHaveBeenCalledWith(
-      "[schema] backfill falhou",
-      expect.objectContaining({ message: expect.stringMatching(/null/) }),
+      loggedLine("[schema] backfill falhou", { message: expect.stringMatching(/null/) }),
     );
     expect(state.rpcs).toHaveLength(0);
     consoleError.mockRestore();
@@ -788,12 +786,11 @@ describe("erro de servidor não chega cru ao toast", () => {
 
     const result = await run();
 
-    expect(result).toEqual({ error: copy });
+    expect(result).toEqual({ error: copyWithRef(copy) });
     expect(consoleError).toHaveBeenCalledWith(
-      expect.stringContaining("falhou"),
       // O `code` do Postgres é o que diferencia timeout de violação no log:
       // `updateOrThrow` o descartava, e o log saía com `code: undefined`.
-      expect.objectContaining({ code: postgresError.code, message: postgresError.message }),
+      loggedLine(/\[schema\] save d[oa] (?:prompt|configuração do LLM) falhou/, { code: postgresError.code, message: postgresError.message }),
     );
     consoleError.mockRestore();
   });
@@ -817,28 +814,25 @@ describe("erro de servidor não chega cru ao toast", () => {
     const result = await recoverFieldsFromStoredCode("p1");
 
     expect(result).toEqual({
-      error: "Não foi possível recuperar os campos do código armazenado. Tente novamente.",
+      error: copyWithRef("Não foi possível recuperar os campos do código armazenado. Tente novamente."),
     });
     expect(consoleError).toHaveBeenCalledWith(
-      "[schema] recuperação dos campos falhou",
-      expect.objectContaining({ message: failure.message }),
+      loggedLine("[schema] recuperação dos campos falhou", { message: failure.message }),
     );
     consoleError.mockRestore();
   });
 
   // O 5xx já foi para o log no fetchFastAPI, com o status e o detail; a
-  // mensagem do ApiError aqui é a copy dele, e logá-la de novo só duplica.
-  it("recoverFieldsFromStoredCode com 5xx devolve copy pt-BR sem logar de novo", async () => {
+  // mensagem do ApiError aqui é a copy dele, com o código daquela linha do log,
+  // e vai ao toast como está. Logá-la de novo só duplicaria.
+  it("recoverFieldsFromStoredCode com 5xx devolve a copy do fetchFastAPI, com o código, sem logar de novo", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    fetchMock.mockRejectedValueOnce(
-      new ApiError("Erro no servidor (HTTP 502). Tente novamente.", 502),
-    );
+    const copy = "Erro no servidor (HTTP 502). Tente novamente. — código 0f3k2a";
+    fetchMock.mockRejectedValueOnce(new ApiError(copy, 502));
 
     const result = await recoverFieldsFromStoredCode("p1");
 
-    expect(result).toEqual({
-      error: "Não foi possível recuperar os campos do código armazenado. Tente novamente.",
-    });
+    expect(result).toEqual({ error: copy });
     expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
