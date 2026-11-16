@@ -8,7 +8,7 @@ import {
   resolveProjectMemberActor,
 } from "@/lib/auth";
 import { revalidatePath, revalidateTag } from "next/cache";
-import { createHash } from "crypto";
+import { md5 } from "@/lib/hash";
 import { sanitizeStoredAnswers } from "@/lib/response-snapshot";
 import type { DocumentMetadata, PydanticField } from "@/lib/types";
 
@@ -26,10 +26,6 @@ export type UploadDoc = Pick<
   DocumentRow,
   "text" | "title" | "external_id" | "metadata"
 >;
-
-function md5(text: string): string {
-  return createHash("md5").update(text).digest("hex");
-}
 
 export interface DuplicateMatch {
   csvIndex: number;

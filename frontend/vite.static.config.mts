@@ -10,6 +10,7 @@
 // `scripts/static/privileged-actions.mjs`).
 
 import { copyFileSync, existsSync } from "node:fs";
+import { builtinModules } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
@@ -83,6 +84,27 @@ function clientRoutePlugin(): Plugin {
   };
 }
 
+/**
+ * Módulo do Node importado por `src` vira um stub vazio no navegador e só
+ * quebra quando é chamado (ex.: `createHash` do `crypto` na importação de
+ * documentos). Falha o build em vez disso. `pre`: o resolvedor do Vite troca o
+ * módulo pelo stub antes dos plugins normais.
+ */
+function nodeBuiltinGuardPlugin(): Plugin {
+  const nodeBuiltins = new Set(builtinModules.filter((name) => !name.startsWith("_")));
+  return {
+    name: "dataframeit-node-builtin-guard",
+    enforce: "pre",
+    resolveId(source, importer) {
+      const name = source.replace(/^node:/, "").split("/")[0];
+      if (importer && toPosix(importer).startsWith(toPosix(srcDir)) && nodeBuiltins.has(name)) {
+        this.error(`Módulo do Node "${source}" importado por ${importer} no bundle do navegador.`);
+      }
+      return null;
+    },
+  };
+}
+
 /** Falha o build se a service role ou o Clerk entrarem no grafo do navegador. */
 function boundaryGuardPlugin(): Plugin {
   const forbidden = [
@@ -124,7 +146,7 @@ export default defineConfig(({ mode }) => ({
   base: process.env.STATIC_BASE_PATH ?? "/",
   envDir: frontendDir,
   publicDir: path.join(frontendDir, "static/public"),
-  plugins: [edgeActionsPlugin(), requestCachePlugin(), clientRoutePlugin(), boundaryGuardPlugin(), spaFallbackPlugin()],
+  plugins: [edgeActionsPlugin(), requestCachePlugin(), clientRoutePlugin(), nodeBuiltinGuardPlugin(), boundaryGuardPlugin(), spaFallbackPlugin()],
   resolve: {
     alias: [
       ...exactAliases,
