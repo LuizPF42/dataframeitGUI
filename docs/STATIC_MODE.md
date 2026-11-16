@@ -38,6 +38,7 @@ A identidade foi separada de `lib/auth.ts` em `lib/identity/{types,server,client
 | Migration | O quê | Efeito no modo hospedado |
 |---|---|---|
 | `20261115170000_native_supabase_auth` | `instance_settings.native_supabase_auth`; ramo nativo em `clerk_uid()` (`sub` do JWT do Supabase Auth); `app_uid()`; ativação do perfil no primeiro login; prova de identidade nativa em `assert_identity_write_proof` (`native_email_owner`) | nenhum: o flag nasce desligado e, desligado, `clerk_uid()` executa a consulta anterior |
+| `20261116120000_native_no_password_login` | instância nativa não guarda senha em `auth.users` (trigger) | nenhum: o trigger só age com o modo nativo ligado |
 | `20261115180000_native_llm_in_browser` | coordenador grava `llm_runs` e publica respostas do LLM (`publish_llm_response_from_browser`) | nenhum: as policies e a RPC exigem o modo nativo |
 
 As policies existentes não mudam: todas resolvem a identidade por `clerk_uid()`. Uma instância tem **um** emissor de identidade; no modo nativo o token do Clerk não vale, e no hospedado o JWT nativo não vale (o contrário abriria um segundo login, por OTP com a chave anônima pública, contornando os estados que o Clerk controla).
@@ -96,7 +97,7 @@ Banco sem Docker: `scripts/db-embedded/README.md` (Postgres 17 por pacote npm; r
 - **Link para a equipe.** O link nunca conecta sozinho: mostra o endereço da nuvem e pede confirmação, e as chaves de LLM ficam presas à nuvem em que foram informadas.
 - **Validade do token.** No modo nativo a identidade vale enquanto o JWT vale (o banco não consulta a sessão). O assistente reduz o `jwt_exp` para 15 minutos; o padrão do Supabase é 1 hora.
 - **Dreno da auto-revisão.** Na Edge Function, só coordenador ou master o aciona, e as contagens (que somam todos os projetos) não voltam ao navegador.
-- **A conferir no Supabase real.** Com "só entra quem o coordenador cadastrar" desligado, o cadastro por senha do GoTrue continua aberto. Falta confirmar se um cadastro por senha não confirmado, feito por terceiro com o e-mail de outra pessoa, perde a senha quando o dono confirma por código.
+- **Sem login por senha.** O GoTrue mantém o cadastro por senha aberto sempre que o cadastro está aberto, e no Supabase real (nov/2026) a senha de um terceiro que se cadastrou com o e-mail de outra pessoa passava a valer quando o dono confirmava por código. A migration `20261116120000_native_no_password_login` apaga toda senha gravada em `auth.users` numa instância nativa (cadastro, troca, recuperação ou API admin), e o login por senha falha como credencial inválida. O modo hospedado não muda.
 
 ## Login: código ou link
 

@@ -9,6 +9,9 @@
 --   3. A RLS existente isola projetos entre usuários nativos sem mudança nas
 --      policies, e o primeiro login ativa o perfil só no modo nativo.
 --
+-- E o contrato da migration 20261116120000: instância nativa não guarda senha
+-- (cadastro por senha de terceiro não sobrevive à confirmação do dono).
+--
 -- Como rodar: igual às demais suítes (`npm run test:db:psql -- <arquivo>`).
 
 BEGIN;
@@ -332,6 +335,45 @@ BEGIN
 END
 $$;
 RESET ROLE;
+
+-- ========== 6. Instância nativa não guarda senha ==========
+-- Cadastro por senha de terceiro com o e-mail de outra pessoa: no modo nativo a
+-- senha nunca chega a valer, nem no INSERT nem numa troca posterior.
+INSERT INTO auth.users (id, email, encrypted_password)
+VALUES ('5a700000-0000-0000-0000-000000000006', 'native-pw@example.test', '$2a$10$senhadoterceiro');
+DO $$
+BEGIN
+  IF (SELECT encrypted_password FROM auth.users
+      WHERE id = '5a700000-0000-0000-0000-000000000006') <> '' THEN
+    RAISE EXCEPTION 'FALHOU: instância nativa gravou senha no cadastro';
+  END IF;
+END
+$$;
+
+UPDATE auth.users SET encrypted_password = '$2a$10$outrasenha', email_confirmed_at = now()
+WHERE id = '5a700000-0000-0000-0000-000000000006';
+DO $$
+BEGIN
+  IF (SELECT encrypted_password FROM auth.users
+      WHERE id = '5a700000-0000-0000-0000-000000000006') <> '' THEN
+    RAISE EXCEPTION 'FALHOU: instância nativa gravou senha na troca';
+  END IF;
+END
+$$;
+
+-- Modo hospedado: auth.users segue como antes.
+UPDATE public.instance_settings SET native_supabase_auth = false;
+UPDATE auth.users SET encrypted_password = '$2a$10$hospedado'
+WHERE id = '5a700000-0000-0000-0000-000000000006';
+DO $$
+BEGIN
+  IF (SELECT encrypted_password FROM auth.users
+      WHERE id = '5a700000-0000-0000-0000-000000000006') <> '$2a$10$hospedado' THEN
+    RAISE EXCEPTION 'FALHOU: o modo hospedado perdeu a senha gravada';
+  END IF;
+END
+$$;
+UPDATE public.instance_settings SET native_supabase_auth = true;
 
 ROLLBACK;
 
