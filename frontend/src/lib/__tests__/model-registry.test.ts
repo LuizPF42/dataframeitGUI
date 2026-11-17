@@ -5,6 +5,7 @@ import {
   buildKwargsForCapabilities,
   DEFAULT_PARALLEL_REQUESTS,
   defaultModelForProvider,
+  formatModelLabel,
   getModelCapabilities,
   getModelsForProvider,
   isProvider,
@@ -262,5 +263,55 @@ describe("buildKwargsForCapabilities", () => {
         caps({ supportsTemperature: false, supportsThinkingLevel: false }),
       ),
     ).toEqual({ include_justifications: true, parallel_requests: 8 });
+  });
+});
+
+describe("formatModelLabel", () => {
+  it("rotula o respondente de provider sem barra no modelo", () => {
+    expect(formatModelLabel("google_genai/gemini-3.8-flash")).toBe(
+      "Gemini 3.8 Flash",
+    );
+  });
+
+  it("rotula o respondente do OpenRouter, cujo modelo tem barra", () => {
+    // O llm_runner grava `${provider}/${model}`, e o ID do OpenRouter é
+    // `<laboratório>/<modelo>`: o respondente tem duas barras. O corte em
+    // todas as barras devolvia o nome cru em vez do rótulo.
+    expect(formatModelLabel("openrouter/google/gemini-3.8-flash")).toBe(
+      "Gemini 3.8 Flash (OpenRouter)",
+    );
+  });
+
+  it("modelo fora do registry cai no ID do modelo, com a barra dele", () => {
+    expect(formatModelLabel("openrouter/foo/bar-1")).toBe("foo/bar-1");
+    expect(formatModelLabel("openai/gpt-x")).toBe("gpt-x");
+  });
+
+  it("nome que não é provider/modelo passa intacto", () => {
+    for (const name of ["Fulano", "/gpt", "openai/", ""]) {
+      expect(formatModelLabel(name)).toBe(name);
+    }
+  });
+});
+
+describe("openrouter", () => {
+  it("nenhum modelo declara thinking_level, que o ChatOpenRouter não aceita", () => {
+    // O ChatOpenRouter não tem campo `thinking_level` (o raciocínio vai em
+    // `reasoning`): o kwarg desconhecido iria cru no corpo da requisição.
+    // Declarar `true` faria a UI e o saveLlmConfig injetarem o kwarg.
+    for (const model of getModelsForProvider("openrouter")) {
+      expect({ model: model.model, thinking: model.supportsThinkingLevel }).toEqual(
+        { model: model.model, thinking: false },
+      );
+      expect(
+        buildKwargsForCapabilities({ thinking_level: "high" }, model),
+      ).not.toHaveProperty("thinking_level");
+    }
+  });
+
+  it("todo ID de modelo tem a forma <laboratório>/<modelo>", () => {
+    for (const model of getModelsForProvider("openrouter")) {
+      expect(model.model).toMatch(/^[a-z0-9-]+\/[a-z0-9.-]+$/);
+    }
   });
 });

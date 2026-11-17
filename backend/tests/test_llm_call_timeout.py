@@ -36,6 +36,7 @@ _FAKE_KEYS = {
     "GOOGLE_API_KEY": "fake-google-key",
     "OPENAI_API_KEY": "sk-fake-openai-key",
     "ANTHROPIC_API_KEY": "sk-ant-fake-anthropic-key",
+    "OPENROUTER_API_KEY": "sk-or-fake-openrouter-key",
 }
 
 
