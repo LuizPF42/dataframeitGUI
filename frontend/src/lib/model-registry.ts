@@ -8,6 +8,7 @@ export const PROVIDERS = [
   { provider: "google_genai", label: "Google GenAI" },
   { provider: "openai", label: "OpenAI" },
   { provider: "anthropic", label: "Anthropic" },
+  { provider: "openrouter", label: "OpenRouter" },
 ] as const;
 
 export type Provider = (typeof PROVIDERS)[number]["provider"];
@@ -68,6 +69,19 @@ export interface ModelCapabilities {
  * Fly estava sem crédito. Existência e `thinking_level` seguem a linha 3.x, que
  * já tinha quatro modelos medidos; a rodada externa de 2026-10-14 nas notas
  * nacionais (223 documentos) confirma que o ID existe.
+ *
+ * As entradas de `openrouter` entraram em 2026-11-17 a partir do catálogo
+ * público (`GET https://openrouter.ai/api/v1/models`), sem chamada real: todas
+ * declaram `structured_outputs`, de que o dataframeit depende, e
+ * `supportsTemperature` copia o `temperature` de `supported_parameters`. O ID
+ * do OpenRouter é `<laboratório>/<modelo>`, com barra — por isso
+ * `formatModelLabel` corta o respondente só na primeira barra.
+ *
+ * `supportsThinkingLevel` é `false` em todas de propósito: o `ChatOpenRouter`
+ * não declara `thinking_level` (o raciocínio dele vai no campo `reasoning`), e
+ * o kwarg desconhecido seguiria no corpo da requisição em vez de ser
+ * descartado. Expor o nível de raciocínio no OpenRouter pede mapear para
+ * `reasoning`, e fica para quando houver medição.
  */
 const MODEL_REGISTRY: ModelCapabilities[] = [
   // --- Google GenAI ---
@@ -214,6 +228,72 @@ const MODEL_REGISTRY: ModelCapabilities[] = [
     supportsThinkingLevel: true,
     category: "reasoning",
   },
+
+  // --- OpenRouter ---
+  {
+    provider: "openrouter",
+    model: "google/gemini-3.8-flash",
+    label: "Gemini 3.8 Flash (OpenRouter)",
+    supportsTemperature: true,
+    supportsThinkingLevel: false,
+    category: "reasoning",
+  },
+  {
+    provider: "openrouter",
+    model: "openai/gpt-6.1-terra",
+    label: "GPT-6.1 Terra (OpenRouter)",
+    supportsTemperature: false,
+    supportsThinkingLevel: false,
+    category: "reasoning",
+  },
+  {
+    provider: "openrouter",
+    model: "anthropic/claude-sonnet-5.5",
+    label: "Claude Sonnet 5.5 (OpenRouter)",
+    supportsTemperature: false,
+    supportsThinkingLevel: false,
+    category: "reasoning",
+  },
+  {
+    provider: "openrouter",
+    model: "x-ai/grok-4.7",
+    label: "Grok 4.7 (OpenRouter)",
+    supportsTemperature: true,
+    supportsThinkingLevel: false,
+    category: "reasoning",
+  },
+  {
+    provider: "openrouter",
+    model: "anthropic/claude-haiku-5.5",
+    label: "Claude Haiku 5.5 (OpenRouter)",
+    supportsTemperature: false,
+    supportsThinkingLevel: false,
+    category: "standard",
+  },
+  {
+    provider: "openrouter",
+    model: "openai/gpt-6-luna",
+    label: "GPT-6 Luna (OpenRouter)",
+    supportsTemperature: false,
+    supportsThinkingLevel: false,
+    category: "standard",
+  },
+  {
+    provider: "openrouter",
+    model: "deepseek/deepseek-v4.1-flash",
+    label: "DeepSeek V4.1 Flash (OpenRouter)",
+    supportsTemperature: true,
+    supportsThinkingLevel: false,
+    category: "standard",
+  },
+  {
+    provider: "openrouter",
+    model: "qwen/qwen3.8-flash",
+    label: "Qwen 3.8 Flash (OpenRouter)",
+    supportsTemperature: true,
+    supportsThinkingLevel: false,
+    category: "standard",
+  },
 ];
 
 export function getModelsForProvider(provider: Provider): ModelCapabilities[] {
@@ -308,11 +388,16 @@ export function buildKwargsForCapabilities(
 /**
  * Converts "google_genai/gemini-2.5-flash" → "Gemini 2.5 Flash"
  * Falls back to the raw model name if not found in registry.
+ *
+ * O respondente é `${provider}/${model}` (`llm_runner`), e o provider nunca
+ * tem barra, mas o modelo pode ter: no OpenRouter o ID é
+ * `google/gemini-3.8-flash`. Por isso o corte é só na primeira barra.
  */
 export function formatModelLabel(respondentName: string): string {
-  const parts = respondentName.split("/");
-  if (parts.length !== 2) return respondentName;
-  const [provider, model] = parts;
+  const slash = respondentName.indexOf("/");
+  if (slash <= 0 || slash === respondentName.length - 1) return respondentName;
+  const provider = respondentName.slice(0, slash);
+  const model = respondentName.slice(slash + 1);
   const found = MODEL_REGISTRY.find(
     (m) => m.provider === provider && m.model === model
   );
